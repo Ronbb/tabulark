@@ -78,20 +78,15 @@ jobs:
         env:
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          status="$(curl --silent --output /dev/null --write-out '%{http_code}' "https://crates.io/api/v1/crates/tabulark/${VERSION}")"
-          case "$status" in
-            200)
-              echo "publish=false" >> "$GITHUB_OUTPUT"
-              echo "tabulark ${VERSION} already exists on crates.io; skipping."
-              ;;
-            404)
-              echo "publish=true" >> "$GITHUB_OUTPUT"
-              ;;
-            *)
-              echo "Unexpected crates.io response: HTTP ${status}" >&2
-              exit 1
-              ;;
-          esac
+          if curl --fail --silent --show-error \
+            --retry 5 --retry-all-errors --retry-delay 2 \
+            "https://index.crates.io/ta/bu/tabulark" \
+            | grep "\"vers\":\"${VERSION}\"" > /dev/null; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "tabulark ${VERSION} already exists on crates.io; skipping."
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Authenticate to crates.io
         if: steps.availability.outputs.publish == 'true'
