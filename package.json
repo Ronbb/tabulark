@@ -1,0 +1,50 @@
+{
+  "name": "tabulark",
+  "version": "0.0.1",
+  "description": "A WebAssembly-first engine for format-agnostic tabular data preview",
+  "type": "module",
+  "main": "./js/index.js",
+  "types": "./js/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./js/index.d.ts",
+      "import": "./js/index.js",
+      "default": "./js/index.js"
+    }
+  },
+  "files": [
+    "js",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "check": "npm run check:versions && npm test && npm run package:check",
+    "check:versions": "node scripts/check-versions.mjs",
+    "package:check": "npm pack --dry-run --cache target/npm-cache",
+    "test": "node test/index.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ronbb/tabulark.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Ronbb/tabulark/issues"
+  },
+  "homepage": "https://github.com/Ronbb/tabulark#readme",
+  "keywords": [
+    "table",
+    "tabular",
+    "preview",
+    "webassembly",
+    "canvas"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

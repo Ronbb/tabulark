@@ -1,0 +1,20 @@
+[package]
+name = "tabulark"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+description = "A WebAssembly-first engine for format-agnostic tabular data preview"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Ronbb/tabulark"
+homepage = "https://github.com/Ronbb/tabulark"
+documentation = "https://docs.rs/tabulark"
+readme = "README.md"
+keywords = ["table", "preview", "wasm", "data", "canvas"]
+include = ["src/**", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[workspace]
+resolver = "3"
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"

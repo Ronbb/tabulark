@@ -1,0 +1,154 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate release version
+        id: version
+        shell: bash
+        run: echo "version=$(node scripts/check-versions.mjs \"$GITHUB_REF_NAME\")" >> "$GITHUB_OUTPUT"
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --workspace --all-features --locked
+
+      - name: Run JavaScript tests
+        run: npm test
+
+      - name: Check registry packages
+        run: |
+          cargo package --locked
+          npm pack --dry-run
+
+  publish-crate:
+    name: Publish crate
+    needs: verify
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check crates.io version
+        id: availability
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          status="$(curl --silent --output /dev/null --write-out '%{http_code}' "https://crates.io/api/v1/crates/tabulark/${VERSION}")"
+          case "$status" in
+            200)
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              echo "tabulark ${VERSION} already exists on crates.io; skipping."
+              ;;
+            404)
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unexpected crates.io response: HTTP ${status}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Authenticate to crates.io
+        if: steps.availability.outputs.publish == 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish to crates.io
+        if: steps.availability.outputs.publish == 'true'
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  publish-npm:
+    name: Publish npm package
+    needs: verify
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check npm version
+        id: availability
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          status="$(curl --silent --output /dev/null --write-out '%{http_code}' "https://registry.npmjs.org/tabulark/${VERSION}")"
+          case "$status" in
+            200)
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              echo "tabulark ${VERSION} already exists on npm; skipping."
+              ;;
+            404)
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unexpected npm response: HTTP ${status}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Install Node.js
+        if: steps.availability.outputs.publish == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: Install an OIDC-capable npm CLI
+        if: steps.availability.outputs.publish == 'true'
+        run: npm install --global npm@11
+
+      - name: Install dependencies
+        if: steps.availability.outputs.publish == 'true'
+        run: npm ci
+
+      - name: Publish to npm
+        if: steps.availability.outputs.publish == 'true'
+        run: npm publish
