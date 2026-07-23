@@ -1,6 +1,6 @@
 {
   "name": "tabulark",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "A WebAssembly-first engine for format-agnostic tabular data preview",
   "type": "module",
   "main": "./js/index.js",
