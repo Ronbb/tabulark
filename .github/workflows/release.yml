@@ -38,7 +38,9 @@ jobs:
       - name: Validate release version
         id: version
         shell: bash
-        run: echo "version=$(node scripts/check-versions.mjs \"$GITHUB_REF_NAME\")" >> "$GITHUB_OUTPUT"
+        run: |
+          version="$(node scripts/check-versions.mjs "$GITHUB_REF_NAME")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Check formatting
         run: cargo fmt --all --check
