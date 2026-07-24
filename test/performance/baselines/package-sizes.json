@@ -1,0 +1,78 @@
+{
+  "sizeSchemaVersion": 1,
+  "compression": {
+    "algorithm": "brotli",
+    "quality": 11
+  },
+  "runtime": {
+    "rawBytes": 417586,
+    "brotliBytes": 104580,
+    "files": [
+      {
+        "path": "dist/index.js",
+        "rawBytes": 129278,
+        "brotliBytes": 22641
+      },
+      {
+        "path": "dist/worker.js",
+        "rawBytes": 41775,
+        "brotliBytes": 8182
+      },
+      {
+        "path": "dist/wasm/tabulark.js",
+        "rawBytes": 22174,
+        "brotliBytes": 4258
+      },
+      {
+        "path": "dist/wasm/tabulark_bg.wasm",
+        "rawBytes": 224359,
+        "brotliBytes": 69499
+      }
+    ]
+  },
+  "npm": {
+    "packedBytes": 220529,
+    "unpackedBytes": 842670,
+    "files": 29
+  },
+  "pages": {
+    "rawBytes": 887166,
+    "brotliBytes": 194848,
+    "files": 31
+  },
+  "budget": {
+    "schemaVersion": 1,
+    "comparisons": {
+      "runtimeRaw": {
+        "bytes": 417586,
+        "maximumBytes": 524288,
+        "remainingBytes": 106702
+      },
+      "runtimeBrotli": {
+        "bytes": 104580,
+        "maximumBytes": 147456,
+        "remainingBytes": 42876
+      },
+      "npmPacked": {
+        "bytes": 220529,
+        "maximumBytes": 294912,
+        "remainingBytes": 74383
+      },
+      "npmUnpacked": {
+        "bytes": 842670,
+        "maximumBytes": 1048576,
+        "remainingBytes": 205906
+      },
+      "pagesRaw": {
+        "bytes": 887166,
+        "maximumBytes": 1114112,
+        "remainingBytes": 226946
+      },
+      "pagesBrotli": {
+        "bytes": 194848,
+        "maximumBytes": 262144,
+        "remainingBytes": 67296
+      }
+    }
+  }
+}

@@ -1,14 +1,12 @@
 # Architecture
 
-> Status: M0 through M2 remain an experimental local CSV/TSV vertical slice.
-> The M3.1 lifecycle/protocol slice, M3.2 CSV compatibility and parser-fuzzing
-> baseline, M3.3 Linux-Chromium visual/axe baseline, and M3.4 CJK
-> corpus/Canvas/copy regression slice are implemented. M3 hardening and
-> measurement and M4 second-adapter validation remain unfinished, and no
-> interface is stable yet.
+> Status: M3 is complete for the bounded experimental local CSV/TSV vertical
+> slice, including lifecycle/resource recovery, compatibility and fuzz evidence,
+> inclusive interaction, and reproducible measurement. M4 second-adapter
+> validation remains unfinished, and no interface is stable yet.
 
 This document records the implemented prototype boundaries and the intended
-architecture they are validating. M0-M2 descriptions apply to the current
+architecture they are validating. M0-M3 descriptions apply to the current
 CSV/TSV path unless a section is marked as a future extension. A general
 adapter registry, remote byte sources, additional formats, and package splitting
 remain design targets rather than shipped features.
@@ -75,7 +73,7 @@ Worker runtime                                               |
         source bytes / externally supplied row batches
 ```
 
-The overview shows the intended component boundary. The M0-M2 prototype uses
+The overview shows the intended component boundary. The M0-M3 prototype uses
 one built-in CSV/TSV scanner selected by an explicit format option; it does not
 yet expose an independently installable adapter registry.
 
@@ -401,11 +399,12 @@ Table metadata
 
 ### TableController
 
-The controller is an explicit state machine rather than a framework store. The
-M2 snapshot currently exposes `loading`, `ready`, `error`, and `closed`; error
-values preserve structured cancellation, unsupported-input, malformed-input,
-and runtime failures. Dedicated presentation states and retry UX remain M3
-hardening work. The controller owns:
+The controller is an explicit state machine rather than a framework store. Its
+snapshot exposes `loading`, `ready`, `error`, and `closed`; error values preserve
+structured cancellation, unsupported-input, malformed-input, resource-limit,
+and runtime failures. The example maps those states to progress, empty, error,
+cancel, and same-source retry presentation, including fresh-Worker recovery
+after terminal runtime failure. The controller owns:
 
 - Source and view lifecycle.
 - Selected table and current metadata.
@@ -460,9 +459,13 @@ must provide or integrate with a bounded virtual DOM grid that:
 Selection cannot be communicated by color alone, focus must remain visible, and
 reduced-motion and high-contrast preferences must be respected.
 
-The current column-resize affordance and its browser tests are pointer-only.
-Keyboard-operated resizing and a forced-colors-specific visual and semantic
-contract remain M3 follow-up work.
+Column boundaries are stable focusable ARIA `separator` elements whose value,
+bounds, controlled grid, and key instructions remain synchronized with the
+controller. Arrow/Shift+Arrow, Home/End, and Enter-to-fit complement pointer
+drag/double-click; separator focus survives updates and the viewport keeps the
+operated boundary visible. In forced-colors mode the Canvas switches dynamically
+to system colors and uses distinct outline geometry for selection and the active
+cell, while resize and error controls retain visible non-color focus cues.
 
 ## 8. Security and resilience
 
@@ -486,7 +489,7 @@ reopening is deferred until source replay and side effects are well defined.
 
 ## 9. Package and repository evolution
 
-The M0-M2 implementation stays in one root Rust crate and one npm package so
+The M0-M3 implementation stays in one root Rust crate and one npm package so
 the experimental contracts can change quickly:
 
 ```text
@@ -560,8 +563,8 @@ Each boundary needs its own evidence:
 - Performance: reproducible local-file datasets, first-paint timing, scroll
   frame time, peak memory, transferred bytes, and package size.
 
-The existing contract, Node, and Chromium suites provide M0-M2 prototype
-evidence plus the M3.1 lifecycle/protocol slice: delayed scan fatal cleanup,
+The contract, Node, and Chromium suites provide vertical-slice evidence through
+M3.1: delayed scan fatal cleanup,
 bounded close timeouts, malformed-message termination, initial diagnostic
 delivery with row context, source-name propagation, and browser-example
 cancel/retry recovery.
@@ -574,8 +577,7 @@ and range-decoder lifecycles to arbitrary bytes and starts from a small seed
 corpus. Its stable executable is deterministic smoke coverage, including on
 Windows; this repository currently supports sanitizer-backed libFuzzer
 execution through Linux or WSL with nightly Rust and `cargo-fuzz`. The scheduled
-Linux workflow is configured to run that real campaign for 10 minutes each week
-after it reaches the default branch.
+Linux workflow runs that real campaign for 10 minutes each week.
 
 The M3.3 baseline adds strict Canvas snapshots for ready, keyboard-selection,
 and horizontal-scroll states. CI and release verification validate those
@@ -596,6 +598,27 @@ data, semantic-grid content, Canvas `fillText` paint and `measureText` autosize
 inputs, and keyboard-driven TSV copy. This locks Tabulark's Unicode data path
 without claiming that platform fonts shape or rasterize glyphs identically.
 
+The M3.5 closure pins a license-preserving subset of the external
+`BurntSushi/rust-csv` corpus by revision and digest, then applies the same
+multi-chunk scanner/range matrix to unusual quotes, empty fields versus the
+literal `NULL`, and strict/lenient Latin-1 behavior. Real Worker/WASM browser
+tests cover an in-flight range cancellation, recoverable input and field limits,
+strict malformed-quote offsets, and a header-only table. View tests lock the
+keyboard separator contract and focus continuity. Forced-colors tests inspect
+Canvas system-color paint commands, distinct focus/selection geometry, resize focus,
+and textual retryable errors; axe also scans ready/error forced-colors states.
+
+The M3.6 harness generates and digest-checks deterministic 2 MiB smoke and
+16 MiB-target canonical CSV scenarios; the latter is 16,777,218 bytes so it ends
+on a complete row. It measures Worker/WASM startup, first usable Canvas paint,
+completed scan throughput, non-adjacent range reads, scroll frames, exact binary
+batch transfer, and implementation-dependent benchmark-page memory deltas under
+cross-origin isolation. The committed canonical report contains the source
+revision, browser/OS/hardware, one warm-up, five samples, and summary
+statistics. Runtime, npm, and Pages raw/compressed sizes are separately enforced
+against committed budgets. Exact commands, metric definitions, results, and
+limitations are documented in `docs/testing.md`.
+
 The repository-root introduction and playground are also the static GitHub
 Pages entry point. `scripts/build-pages.mjs` assembles a minimal site under
 `target/pages` from the built ESM, module Worker, WebAssembly runtime, and
@@ -604,17 +627,15 @@ artifact works at a project subpath such as `/tabulark/`. The Pages workflow is
 a publication boundary only; it does not introduce a hosted data service, and
 the playground continues to open and process sources locally in the browser.
 
-External and broader compatibility cases, continuous corpus evolution,
-keyboard-operated resize, forced-colors-specific validation, platform-font
-conformance, and reproducible performance measurements remain unfinished M3
-work. The current corpus, fuzz, CJK, Linux-Chromium visual, and axe baselines do
-not establish broad or cross-browser compatibility, identical font rendering,
-or complete accessibility conformance. Performance numbers remain engineering
-targets until benchmark hardware, datasets, and harnesses are committed.
+M3 is complete against these bounded criteria. Continuing corpus/fuzz evolution
+is maintenance rather than an unbounded milestone gate. The evidence does not
+establish broad-format or cross-browser compatibility, identical platform-font
+rendering, complete accessibility conformance, or performance guarantees on
+other machines; those remain explicit boundaries, not missing M3 deliverables.
 
 ## 11. Architectural decisions for the first prototype
 
-The M0-M2 prototype follows these decisions:
+The M0-M3 prototype follows these decisions:
 
 1. A source opens a dataset session; a dataset contains one or more tables.
 2. Tables are immutable snapshots with progressively discovered metadata.

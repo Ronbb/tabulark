@@ -54,6 +54,38 @@ test("performance server opts into cross-origin isolation explicitly", async () 
   }
 });
 
+test("committed M3 performance baseline records required memory evidence", async () => {
+  const [manifest, baseline] = await Promise.all([
+    readJson("./performance/scenarios.json"),
+    readJson("./performance/baselines/windows-chromium-16mib.json"),
+  ]);
+  const canonical = manifest.scenarios.canonical;
+
+  assert.equal(baseline.benchmarkSchemaVersion, 1);
+  assert.equal(baseline.scenario, "canonical");
+  assert.equal(baseline.source.workingTreeDirty, false);
+  assert.equal(baseline.environment.crossOriginIsolated, true);
+  assert.equal(baseline.environment.forcedGcBeforeMemorySample, true);
+  assert.equal(baseline.dataset.requestedBytes, canonical.requestedBytes);
+  assert.equal(baseline.dataset.generatedBytes, canonical.generatedBytes);
+  assert.equal(baseline.dataset.rows, canonical.rows);
+  assert.equal(baseline.dataset.sha256, canonical.sha256);
+  assert.equal(baseline.iterations.warmup, canonical.warmupIterations);
+  assert.equal(baseline.iterations.measured, canonical.measuredIterations);
+  assert.equal(baseline.samples.length, canonical.measuredIterations);
+  for (const sample of baseline.samples) {
+    assert.equal(sample.memory.api, "measureUserAgentSpecificMemory");
+    assert.equal(sample.memory.forcedGcBeforeSample, true);
+    assert.deepEqual(sample.memory.samples.map(({ phase }) => phase), [
+      "idle",
+      "engine-ready",
+      "scan-complete",
+      "scroll-complete",
+      "closed",
+    ]);
+  }
+});
+
 async function readJson(relativePath) {
   return JSON.parse(await readFile(new URL(relativePath, import.meta.url), "utf8"));
 }

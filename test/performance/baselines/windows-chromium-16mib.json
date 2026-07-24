@@ -1,0 +1,419 @@
+{
+  "benchmarkSchemaVersion": 1,
+  "scenario": "canonical",
+  "recordedAt": "2026-07-24T12:57:36.023Z",
+  "source": {
+    "gitCommit": "4775150dad6a80523f651b2ad4124f4c1a287725",
+    "workingTreeDirty": false
+  },
+  "environment": {
+    "os": {
+      "platform": "win32",
+      "release": "10.0.26100",
+      "arch": "x64"
+    },
+    "cpu": {
+      "model": "Intel(R) Core(TM) i5-14500",
+      "logicalCores": 20
+    },
+    "totalMemoryBytes": 34031316992,
+    "node": "v24.1.0",
+    "chromium": "149.0.7827.55",
+    "headless": true,
+    "viewport": {
+      "width": 1024,
+      "height": 640,
+      "deviceScaleFactor": 1
+    },
+    "crossOriginIsolated": true,
+    "forcedGcBeforeMemorySample": true
+  },
+  "dataset": {
+    "generator": "test/performance/generate-csv.mjs",
+    "requestedBytes": 16777216,
+    "generatedBytes": 16777218,
+    "rows": 326259,
+    "sha256": "00fe6c5174c3bc5f607dc3aaf54eb73cdfee615588dd126dd692e57759ad42a8"
+  },
+  "iterations": {
+    "warmup": 1,
+    "measured": 5
+  },
+  "summary": {
+    "workerWasmStartupMs": {
+      "median": 13.78999999165535,
+      "p95": 15.665000006556511,
+      "min": 12.945000007748604,
+      "max": 15.665000006556511
+    },
+    "firstUsablePaintMs": {
+      "median": 69.60499999165535,
+      "p95": 148.10999999582765,
+      "min": 58.39000000476838,
+      "max": 148.10999999582765
+    },
+    "completedScanMiBPerSecond": {
+      "median": 90.47472027739822,
+      "p95": 96.65922737409174,
+      "min": 81.06602780038547,
+      "max": 96.65922737409174
+    },
+    "rangeReadMedianMs": {
+      "median": 4.729999989271164,
+      "p95": 5.575000002980232,
+      "min": 4.4849999994039536,
+      "max": 5.575000002980232
+    },
+    "scrollP95Ms": {
+      "median": 18.215000000000146,
+      "p95": 18.234999999999673,
+      "min": 18.12000000000012,
+      "max": 18.234999999999673
+    },
+    "scrollLongFramesOver33ms": {
+      "median": 0,
+      "p95": 0,
+      "min": 0,
+      "max": 0
+    },
+    "transferBatchPayloadBytes": {
+      "median": 166538,
+      "p95": 167291,
+      "min": 162060,
+      "max": 167291
+    },
+    "memoryPeakDeltaBytes": {
+      "median": 7252786,
+      "p95": 7284054,
+      "min": 6872401,
+      "max": 7284054
+    }
+  },
+  "samples": [
+    {
+      "workerWasmStartupMs": 13.015000000596046,
+      "firstUsablePaintMs": 60.655000003576276,
+      "completedScan": {
+        "durationMs": 165.5300000011921,
+        "bytesScanned": 16777218,
+        "rowsDiscovered": 326259,
+        "mibPerSecond": 96.65922737409174
+      },
+      "rangeRead": {
+        "samples": [
+          5.604999989271164,
+          4.625,
+          4.5150000005960464
+        ],
+        "medianMs": 4.625,
+        "p95Ms": 5.604999989271164,
+        "maxMs": 5.604999989271164
+      },
+      "rangeBatchBytes": [
+        8653,
+        9166,
+        9173
+      ],
+      "scroll": {
+        "frames": 120,
+        "longFramesOver33ms": 0,
+        "medianMs": 17.610000000000127,
+        "p95Ms": 18.230000000000018,
+        "maxMs": 18.629999999999995
+      },
+      "transfer": {
+        "batchPayloadBytes": 166538,
+        "batchResponses": 91,
+        "protocolMessages": 175,
+        "sourceRatio": 0.009926437148280483
+      },
+      "memory": {
+        "api": "measureUserAgentSpecificMemory",
+        "forcedGcBeforeSample": true,
+        "peakDeltaBytes": 7255157,
+        "samples": [
+          {
+            "phase": "idle",
+            "bytes": 1264364
+          },
+          {
+            "phase": "engine-ready",
+            "bytes": 2969317
+          },
+          {
+            "phase": "scan-complete",
+            "bytes": 7817338
+          },
+          {
+            "phase": "scroll-complete",
+            "bytes": 8519521
+          },
+          {
+            "phase": "closed",
+            "bytes": 3703003
+          }
+        ]
+      }
+    },
+    {
+      "workerWasmStartupMs": 12.945000007748604,
+      "firstUsablePaintMs": 69.60499999165535,
+      "completedScan": {
+        "durationMs": 178.26499998569489,
+        "bytesScanned": 16777218,
+        "rowsDiscovered": 326259,
+        "mibPerSecond": 89.75402860142245
+      },
+      "rangeRead": {
+        "samples": [
+          5.209999993443489,
+          4.4849999994039536,
+          4.379999995231628
+        ],
+        "medianMs": 4.4849999994039536,
+        "p95Ms": 5.209999993443489,
+        "maxMs": 5.209999993443489
+      },
+      "rangeBatchBytes": [
+        8653,
+        9166,
+        9173
+      ],
+      "scroll": {
+        "frames": 120,
+        "longFramesOver33ms": 0,
+        "medianMs": 17.575000000000045,
+        "p95Ms": 18.12000000000012,
+        "maxMs": 18.625
+      },
+      "transfer": {
+        "batchPayloadBytes": 166538,
+        "batchResponses": 91,
+        "protocolMessages": 207,
+        "sourceRatio": 0.009926437148280483
+      },
+      "memory": {
+        "api": "measureUserAgentSpecificMemory",
+        "forcedGcBeforeSample": true,
+        "peakDeltaBytes": 6872401,
+        "samples": [
+          {
+            "phase": "idle",
+            "bytes": 1651490
+          },
+          {
+            "phase": "engine-ready",
+            "bytes": 2946400
+          },
+          {
+            "phase": "scan-complete",
+            "bytes": 7814875
+          },
+          {
+            "phase": "scroll-complete",
+            "bytes": 8523891
+          },
+          {
+            "phase": "closed",
+            "bytes": 3701120
+          }
+        ]
+      }
+    },
+    {
+      "workerWasmStartupMs": 13.78999999165535,
+      "firstUsablePaintMs": 58.39000000476838,
+      "completedScan": {
+        "durationMs": 166.39500001072884,
+        "bytesScanned": 16777218,
+        "rowsDiscovered": 326259,
+        "mibPerSecond": 96.1567469354066
+      },
+      "rangeRead": {
+        "samples": [
+          6.314999997615814,
+          4.844999998807907,
+          4.594999998807907
+        ],
+        "medianMs": 4.844999998807907,
+        "p95Ms": 6.314999997615814,
+        "maxMs": 6.314999997615814
+      },
+      "rangeBatchBytes": [
+        8653,
+        9166,
+        9173
+      ],
+      "scroll": {
+        "frames": 120,
+        "longFramesOver33ms": 0,
+        "medianMs": 17.50999999999999,
+        "p95Ms": 18.164999999999964,
+        "maxMs": 18.61500000000001
+      },
+      "transfer": {
+        "batchPayloadBytes": 166538,
+        "batchResponses": 91,
+        "protocolMessages": 183,
+        "sourceRatio": 0.009926437148280483
+      },
+      "memory": {
+        "api": "measureUserAgentSpecificMemory",
+        "forcedGcBeforeSample": true,
+        "peakDeltaBytes": 7252786,
+        "samples": [
+          {
+            "phase": "idle",
+            "bytes": 1264912
+          },
+          {
+            "phase": "engine-ready",
+            "bytes": 2939548
+          },
+          {
+            "phase": "scan-complete",
+            "bytes": 7824324
+          },
+          {
+            "phase": "scroll-complete",
+            "bytes": 8517698
+          },
+          {
+            "phase": "closed",
+            "bytes": 3718102
+          }
+        ]
+      }
+    },
+    {
+      "workerWasmStartupMs": 15.665000006556511,
+      "firstUsablePaintMs": 116.40000000596046,
+      "completedScan": {
+        "durationMs": 176.8449999988079,
+        "bytesScanned": 16777218,
+        "rowsDiscovered": 326259,
+        "mibPerSecond": 90.47472027739822
+      },
+      "rangeRead": {
+        "samples": [
+          5.115000009536743,
+          4.495000004768372,
+          4.729999989271164
+        ],
+        "medianMs": 4.729999989271164,
+        "p95Ms": 5.115000009536743,
+        "maxMs": 5.115000009536743
+      },
+      "rangeBatchBytes": [
+        8653,
+        9166,
+        9173
+      ],
+      "scroll": {
+        "frames": 120,
+        "longFramesOver33ms": 0,
+        "medianMs": 17.605000000000018,
+        "p95Ms": 18.215000000000146,
+        "maxMs": 18.829999999999927
+      },
+      "transfer": {
+        "batchPayloadBytes": 167291,
+        "batchResponses": 91,
+        "protocolMessages": 197,
+        "sourceRatio": 0.009971319440445967
+      },
+      "memory": {
+        "api": "measureUserAgentSpecificMemory",
+        "forcedGcBeforeSample": true,
+        "peakDeltaBytes": 7284054,
+        "samples": [
+          {
+            "phase": "idle",
+            "bytes": 1303148
+          },
+          {
+            "phase": "engine-ready",
+            "bytes": 2938764
+          },
+          {
+            "phase": "scan-complete",
+            "bytes": 7847156
+          },
+          {
+            "phase": "scroll-complete",
+            "bytes": 8587202
+          },
+          {
+            "phase": "closed",
+            "bytes": 3722740
+          }
+        ]
+      }
+    },
+    {
+      "workerWasmStartupMs": 14.349999994039536,
+      "firstUsablePaintMs": 148.10999999582765,
+      "completedScan": {
+        "durationMs": 197.37000000476837,
+        "bytesScanned": 16777218,
+        "rowsDiscovered": 326259,
+        "mibPerSecond": 81.06602780038547
+      },
+      "rangeRead": {
+        "samples": [
+          5.575000002980232,
+          6.834999993443489,
+          5.245000004768372
+        ],
+        "medianMs": 5.575000002980232,
+        "p95Ms": 6.834999993443489,
+        "maxMs": 6.834999993443489
+      },
+      "rangeBatchBytes": [
+        8653,
+        9166,
+        9173
+      ],
+      "scroll": {
+        "frames": 120,
+        "longFramesOver33ms": 0,
+        "medianMs": 17.58499999999981,
+        "p95Ms": 18.234999999999673,
+        "maxMs": 18.560000000000173
+      },
+      "transfer": {
+        "batchPayloadBytes": 162060,
+        "batchResponses": 87,
+        "protocolMessages": 207,
+        "sourceRatio": 0.009659527580794384
+      },
+      "memory": {
+        "api": "measureUserAgentSpecificMemory",
+        "forcedGcBeforeSample": true,
+        "peakDeltaBytes": 7242555,
+        "samples": [
+          {
+            "phase": "idle",
+            "bytes": 1294856
+          },
+          {
+            "phase": "engine-ready",
+            "bytes": 3331769
+          },
+          {
+            "phase": "scan-complete",
+            "bytes": 7821055
+          },
+          {
+            "phase": "scroll-complete",
+            "bytes": 8537411
+          },
+          {
+            "phase": "closed",
+            "bytes": 3716266
+          }
+        ]
+      }
+    }
+  ]
+}
