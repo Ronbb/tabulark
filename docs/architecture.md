@@ -2,9 +2,10 @@
 
 > Status: M0 through M2 remain an experimental local CSV/TSV vertical slice.
 > The M3.1 lifecycle/protocol slice and an M3.2 CSV compatibility and
-> parser-fuzzing baseline are implemented, but M3 hardening and measurement and
-> M4 second-adapter validation remain unfinished, and no interface is stable
-> yet.
+> parser-fuzzing baseline are implemented, together with an M3.3
+> Linux-Chromium visual-regression and axe automation baseline. M3 hardening and
+> measurement and M4 second-adapter validation remain unfinished, and no
+> interface is stable yet.
 
 This document records the implemented prototype boundaries and the intended
 architecture they are validating. M0-M2 descriptions apply to the current
@@ -459,6 +460,10 @@ must provide or integrate with a bounded virtual DOM grid that:
 Selection cannot be communicated by color alone, focus must remain visible, and
 reduced-motion and high-contrast preferences must be respected.
 
+The current column-resize affordance and its browser tests are pointer-only.
+Keyboard-operated resizing and a forced-colors-specific visual and semantic
+contract remain M3 follow-up work.
+
 ## 8. Security and resilience
 
 All source data is untrusted. Each runtime and adapter must support limits for:
@@ -572,12 +577,31 @@ execution through Linux or WSL with nightly Rust and `cargo-fuzz`. The scheduled
 Linux workflow is configured to run that real campaign for 10 minutes each week
 after it reaches the default branch.
 
+The M3.3 baseline adds strict Canvas snapshots for ready, keyboard-selection,
+and horizontal-scroll states. CI and release verification validate those
+snapshots with Playwright Chromium on Ubuntu 24.04; that runner is the
+canonical environment for intentional baseline generation and updates. The
+snapshots deliberately omit text pixels, locking layout, grid, selection, and
+scrolling without claiming stable glyph shaping.
+Automated axe scans cover WCAG 2.0/2.1 A and AA tagged rules for idle, ready,
+strict-error, and dark-ready example states through the semantic DOM layer.
+These scans are a bounded automated check, not a complete accessibility audit.
+
+The repository-root introduction and playground are also the static GitHub
+Pages entry point. `scripts/build-pages.mjs` assembles a minimal site under
+`target/pages` from the built ESM, module Worker, WebAssembly runtime, and
+playground assets. All internal runtime references remain relative so the same
+artifact works at a project subpath such as `/tabulark/`. The Pages workflow is
+a publication boundary only; it does not introduce a hosted data service, and
+the playground continues to open and process sources locally in the browser.
+
 External and broader compatibility cases, continuous corpus evolution,
-deterministic visual/screenshot and axe accessibility automation, and
-reproducible performance measurements remain unfinished M3 work. The current
-corpus and fuzz baseline do not establish broad or cross-browser compatibility.
-Performance numbers remain engineering targets until benchmark hardware,
-datasets, and harnesses are committed.
+CJK visual/copy regressions, keyboard-operated resize, forced-colors-specific
+validation, and reproducible performance measurements remain unfinished M3
+work. The current corpus, fuzz, Linux-Chromium visual, and axe baselines do not
+establish broad or cross-browser compatibility or complete accessibility
+conformance. Performance numbers remain engineering targets until benchmark
+hardware, datasets, and harnesses are committed.
 
 ## 11. Architectural decisions for the first prototype
 

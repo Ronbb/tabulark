@@ -2,8 +2,9 @@
 
 > Status: the M0-M2 local CSV/TSV path remains an experimental prototype. An
 > M3.1 lifecycle/protocol hardening and an M3.2 CSV compatibility and
-> parser-fuzzing baseline are implemented, but M3 and M4 are not complete and
-> the MVP is not a stable API promise.
+> parser-fuzzing baseline are implemented, together with an M3.3
+> Linux-Chromium visual-regression and axe automation baseline. M3 and M4 are
+> not complete and the MVP is not a stable API promise.
 
 ## Goal
 
@@ -180,11 +181,34 @@ The M3.2 baseline adds:
   each week, with manual dispatch support, once the workflow is on the default
   branch.
 
+The M3.3 baseline adds:
+
+- Strict-pixel Canvas snapshots for ready, keyboard-selection, and horizontal
+  scroll states, validated in CI and release verification with Playwright
+  Chromium on Ubuntu 24.04; that runner is the canonical environment for
+  intentional baseline updates.
+- A fixed layout and device-pixel ratio plus text-transparent snapshot colors,
+  which keep geometry deterministic while leaving glyph and CJK rendering for
+  separate browser coverage.
+- Automated axe checks for WCAG 2.0/2.1 A and AA tagged rules in idle, ready,
+  strict-error, and dark-ready example states, without rule or element
+  exclusions inside that tag set.
+- CI and release browser verification pinned to the Linux baseline runner, with
+  traces and screenshot diffs retained on failure.
+
+The repository also ships a responsive introduction and live local-file
+playground as the high-priority public demonstration surface. A deterministic
+static build is deployed from `main` to GitHub Pages and is covered at both the
+repository root and the assembled project-Pages path, including a 375-pixel
+mobile interaction check. This is a delivery surface for the prototype, not a
+claim that the package API or M3 as a whole is stable.
+
 M3 remains incomplete. External and broader compatibility cases, continuous
-corpus evolution, deterministic visual/screenshot and axe accessibility
-coverage, and a committed reproducible performance baseline are still pending.
-The current corpus and fuzz target are a foundation, not a broad compatibility
-or performance claim.
+corpus evolution, CJK rendering/copy regressions, keyboard-operable column
+resizing, forced-colors-specific validation, and a committed reproducible
+performance baseline are still pending. The current corpus, fuzz target,
+Linux-Chromium screenshots, and axe checks are foundations, not broad
+compatibility, complete accessibility, or performance claims.
 
 Deliver:
 
@@ -194,7 +218,10 @@ Deliver:
   including mixed Latin/CJK content, full-width punctuation, UTF-8 BOM/CRLF,
   one-byte scanner chunks, Canvas rendering, and TSV copy behavior.
 - Worker failure, cancellation, and malformed-input browser tests.
-- Deterministic layout, screenshot, keyboard, and accessibility tests.
+- Add a keyboard-operable column-resize contract; the current resize path and
+  its browser assertions are pointer-only.
+- Add forced-colors-specific visual and semantic coverage, and extend the M3.3
+  snapshot/axe state set as new interactions are added.
 - Benchmark harnesses for first paint, scroll frame time, memory, transfer
   volume, WASM startup, and package size.
 

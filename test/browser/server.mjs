@@ -32,7 +32,7 @@ function createTestServer() {
       const relativePath = decodeURIComponent(url.pathname).replace(/^\/+/, "");
       let requestedPath = resolve(
         repositoryRoot,
-        relativePath || "test/browser/harness.html",
+        relativePath || "index.html",
       );
       if (
         requestedPath !== repositoryRoot &&

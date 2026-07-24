@@ -1,0 +1,102 @@
+import AxeBuilder from "@axe-core/playwright";
+import { expect, test } from "@playwright/test";
+
+const WCAG_21_A_AA_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"];
+
+async function openExample(page, colorScheme) {
+  await page.emulateMedia({ colorScheme });
+  await page.goto("/examples/csv-preview/");
+  await expect(page.getByTestId("app")).toHaveAttribute("data-state", "idle");
+  await expect(page.getByTestId("workspace")).toHaveAttribute("aria-busy", "false");
+}
+
+async function openParsingOptions(page) {
+  const options = page.getByTestId("advanced-options");
+  if (await options.getAttribute("open") === null) {
+    await options.locator("summary").click();
+  }
+}
+
+async function expectReady(page) {
+  await expect(page.getByTestId("app")).toHaveAttribute("data-state", "ready", {
+    timeout: 15_000,
+  });
+  await expect(page.getByTestId("workspace")).toHaveAttribute("aria-busy", "false");
+  await expect(page.locator("[data-tabulark-a11y-grid]")).toHaveAttribute(
+    "aria-busy",
+    "false",
+    { timeout: 15_000 },
+  );
+}
+
+async function expectNoWcagViolations(page, testInfo) {
+  const results = await new AxeBuilder({ page })
+    .withTags(WCAG_21_A_AA_TAGS)
+    .analyze();
+
+  if (results.violations.length > 0) {
+    await testInfo.attach("axe-results", {
+      body: JSON.stringify(results, null, 2),
+      contentType: "application/json",
+    });
+  }
+
+  expect(results.violations).toEqual([]);
+}
+
+test.describe("CSV preview accessibility", () => {
+  test.afterEach(async ({ page }) => {
+    if (!page.isClosed()) {
+      await page.close();
+    }
+  });
+
+  test("idle light state has no WCAG 2.1 A or AA violations", async ({ page }, testInfo) => {
+    await openExample(page, "light");
+    await expect(page.getByTestId("state-label")).toHaveText("Idle");
+
+    await expectNoWcagViolations(page, testInfo);
+  });
+
+  test("ready light state has no WCAG 2.1 A or AA violations", async ({ page }, testInfo) => {
+    await openExample(page, "light");
+    await page.getByTestId("sample-button").click();
+    await expectReady(page);
+    await expect(page.getByTestId("state-label")).toHaveText("Ready");
+
+    await expectNoWcagViolations(page, testInfo);
+  });
+
+  test("strict parse error light state has no WCAG 2.1 A or AA violations", async (
+    { page },
+    testInfo,
+  ) => {
+    await openExample(page, "light");
+    await page.getByTestId("source-input").setInputFiles({
+      name: "ragged.csv",
+      mimeType: "text/csv",
+      buffer: Buffer.from("left,right\nonly-left\n"),
+    });
+    await openParsingOptions(page);
+    await page.getByTestId("parse-mode").selectOption("strict");
+    await page.getByTestId("open-button").click();
+    await expect(page.getByTestId("app")).toHaveAttribute("data-state", "error", {
+      timeout: 15_000,
+    });
+    await expect(page.getByTestId("workspace")).toHaveAttribute("aria-busy", "false");
+    await expect(page.getByTestId("state-label")).toHaveText("Error");
+    await expect(page.getByTestId("status")).toContainText("PARSE_FAILED");
+
+    await expectNoWcagViolations(page, testInfo);
+  });
+
+  test("ready dark state has no WCAG 2.1 A or AA violations", async ({ page }, testInfo) => {
+    await openExample(page, "dark");
+    await page.getByTestId("sample-button").click();
+    await expectReady(page);
+    await expect(page.getByTestId("state-label")).toHaveText("Ready");
+    expect(await page.evaluate(() => matchMedia("(prefers-color-scheme: dark)").matches)).toBe(true);
+
+    await expectNoWcagViolations(page, testInfo);
+  });
+});

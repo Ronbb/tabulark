@@ -95,8 +95,9 @@ jobs:
         run: npm pack --dry-run
 
   browser:
-    name: Chromium Worker integration
-    runs-on: ubuntu-latest
+    name: Chromium Worker, accessibility, and visual integration
+    # Screenshot baselines are maintained against Playwright Chromium on this image.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
 

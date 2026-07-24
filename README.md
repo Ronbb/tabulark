@@ -4,15 +4,19 @@
 
 **One table model for every tabular source.**
 
+[Open the introduction and live playground](https://ronbb.github.io/tabulark/)
+· [Browse the architecture notes](docs/architecture.md)
+
 **Status: pre-alpha; M0–M2 remain an experimental local CSV/TSV prototype.**
 
 > [!IMPORTANT]
 > Tabulark has an experimental CSV/TSV Worker, WebAssembly runtime, and
 > accessible Canvas viewport. There is no stable public API or production-ready
 > release yet. The M3.1 lifecycle/protocol slice and an M3.2 CSV compatibility
-> and parser-fuzzing baseline are implemented, but M3 as a whole, M4
-> second-adapter validation, and the broader format roadmap described below are
-> not complete.
+> and parser-fuzzing baseline are implemented, together with an M3.3
+> Linux-Chromium visual-regression and axe automation baseline. M3 as a whole,
+> M4 second-adapter validation, and the broader format roadmap described below
+> are not complete.
 
 ## Why Tabulark?
 
@@ -69,17 +73,27 @@ The repository currently contains:
   include row and byte-offset context.
 - An interactive Canvas browser example with parsing controls, cancel, retry,
   strict-to-lenient recovery, and a deterministic large-CSV generator.
+- A responsive introduction and local-file playground published as a static
+  GitHub Pages site from `main`.
 - A versioned, manifest-driven CSV/TSV compatibility corpus that checks each
   fixture across single-byte, tiny, and larger scanner/range chunk sizes.
 - A bounded `cargo-fuzz` `csv_lifecycle` target with checked-in seeds, a stable
   deterministic smoke path, and a scheduled 10-minute Linux campaign.
+- Strict-pixel Canvas snapshots for ready, keyboard-selection, and horizontal
+  scroll states, validated in CI with Playwright Chromium on Ubuntu 24.04; that
+  runner is the canonical environment for intentional baseline updates.
+- Automated axe WCAG 2.1 A/AA checks for the example's idle, ready, strict-error,
+  and dark-ready states.
 
 M3 is still incomplete. External and broader compatibility cases, ongoing
-corpus evolution, deterministic visual and axe accessibility coverage, and a
-reproducible performance baseline remain pending. The checked-in fuzz target is
-a baseline, not evidence of broad CSV compatibility. M4 extension validation
-with a second adapter, persistent caches, additional formats, and framework
-bindings also remain future milestones.
+corpus evolution, CJK rendering/copy regressions, keyboard-operable column
+resizing, forced-colors-specific validation, and a reproducible performance
+baseline remain pending. Column resize is currently pointer-only, and the
+visual/axe automation is a Chromium baseline rather than a cross-browser or
+complete accessibility audit. The checked-in fuzz target is a baseline, not
+evidence of broad CSV compatibility. M4 extension validation with a second
+adapter, persistent caches, additional formats, and framework bindings also
+remain future milestones.
 
 ## Experimental browser API
 
@@ -143,10 +157,12 @@ scrolling, and pointer column resizing are part of the experimental M2 surface.
 Advanced integrations can create a headless controller with
 `createTableController(table, options)` and pass it to the Canvas view.
 
-Run `npm run example`, then open
-`http://127.0.0.1:4173/examples/csv-preview/` to try a local file or the
-generated sample dataset. The example exposes header, parse-mode, and delimiter
-options and demonstrates cancellation and retry with the same local source.
+Run `npm run example`, then open `http://127.0.0.1:4173/` to view the same
+introduction and playground that are packaged for GitHub Pages. The playground
+exposes header, parse-mode, and delimiter options and demonstrates cancellation
+and retry with the same local source. `npm run build:pages` writes the reviewed
+static artifact to `target/pages`; all runtime URLs remain relative so project
+Pages works at `/tabulark/` without a hard-coded deployment base.
 
 ## Planned data sources
 
@@ -254,7 +270,8 @@ See the
 - [x] Complete the first M3.1 lifecycle, protocol, diagnostics, and
   example-hardening slice.
 - [x] Add the M3.2 versioned CSV/TSV corpus and parser-fuzzing baseline.
-- [ ] Complete the remaining M3 compatibility, visual/accessibility, and
+- [x] Add the M3.3 Linux-Chromium visual-regression and axe automation baseline.
+- [ ] Complete the remaining M3 compatibility, inclusive interaction, and
   measurement work.
 - [ ] Validate the extension boundary with an M4 second adapter.
 - [ ] Publish the first crates.io and npm packages.
