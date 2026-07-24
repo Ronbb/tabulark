@@ -9,9 +9,10 @@
 > [!IMPORTANT]
 > Tabulark has an experimental CSV/TSV Worker, WebAssembly runtime, and
 > accessible Canvas viewport. There is no stable public API or production-ready
-> release yet. One M3.1 lifecycle, protocol, diagnostics, and example-hardening
-> slice is implemented, but M3 as a whole, M4 second-adapter validation, and the
-> broader format roadmap described below are not complete.
+> release yet. The M3.1 lifecycle/protocol slice and an M3.2 CSV compatibility
+> and parser-fuzzing baseline are implemented, but M3 as a whole, M4
+> second-adapter validation, and the broader format roadmap described below are
+> not complete.
 
 ## Why Tabulark?
 
@@ -68,12 +69,17 @@ The repository currently contains:
   include row and byte-offset context.
 - An interactive Canvas browser example with parsing controls, cancel, retry,
   strict-to-lenient recovery, and a deterministic large-CSV generator.
+- A versioned, manifest-driven CSV/TSV compatibility corpus that checks each
+  fixture across single-byte, tiny, and larger scanner/range chunk sizes.
+- A bounded `cargo-fuzz` `csv_lifecycle` target with checked-in seeds, a stable
+  deterministic smoke path, and a scheduled 10-minute Linux campaign.
 
-M3 is still incomplete. A broader CSV compatibility corpus and parser fuzzing,
-deterministic visual and axe accessibility coverage, and a reproducible
-performance baseline remain pending. M4 extension validation with a second
-adapter, persistent caches, additional formats, and framework bindings also
-remain future milestones.
+M3 is still incomplete. External and broader compatibility cases, ongoing
+corpus evolution, deterministic visual and axe accessibility coverage, and a
+reproducible performance baseline remain pending. The checked-in fuzz target is
+a baseline, not evidence of broad CSV compatibility. M4 extension validation
+with a second adapter, persistent caches, additional formats, and framework
+bindings also remain future milestones.
 
 ## Experimental browser API
 
@@ -189,6 +195,19 @@ npm run check
 npm run test:browser
 ```
 
+Run the deterministic parser-lifecycle smoke path on stable Rust with:
+
+```bash
+cargo run --manifest-path fuzz/Cargo.toml --bin csv_lifecycle --locked
+```
+
+This repository's sanitizer-backed libFuzzer campaigns currently run on Linux
+or WSL with nightly Rust and `cargo-fuzz`. After
+[the scheduled Linux workflow](.github/workflows/fuzz.yml) lands on the default
+branch, it runs the checked-in corpus for 10 minutes each week and can also be
+started manually. See the [testing guide](docs/testing.md) for the exact local
+commands and platform boundary.
+
 Run the browser example acceptance spec on its own with:
 
 ```bash
@@ -211,6 +230,7 @@ tabulark/
 ├── js/                   # Browser facade, Worker, controller, and Canvas view
 ├── test/                 # Contract, browser, and performance test harnesses
 ├── examples/csv-preview/ # Browser Canvas-preview example
+├── fuzz/                 # csv_lifecycle target and checked-in seed corpus
 ├── scripts/              # Repository validation scripts
 ├── docs/                 # Vision and release documentation
 └── .github/workflows/    # CI and registry publication
@@ -233,6 +253,7 @@ See the
 - [x] Prototype viewport-driven accessible Canvas rendering.
 - [x] Complete the first M3.1 lifecycle, protocol, diagnostics, and
   example-hardening slice.
+- [x] Add the M3.2 versioned CSV/TSV corpus and parser-fuzzing baseline.
 - [ ] Complete the remaining M3 compatibility, visual/accessibility, and
   measurement work.
 - [ ] Validate the extension boundary with an M4 second adapter.

@@ -1,9 +1,9 @@
 # MVP Roadmap
 
 > Status: the M0-M2 local CSV/TSV path remains an experimental prototype. An
-> M3.1 lifecycle, protocol, diagnostics, and example-hardening slice is
-> implemented, but M3 and M4 are not complete and the MVP is not a stable API
-> promise.
+> M3.1 lifecycle/protocol hardening and an M3.2 CSV compatibility and
+> parser-fuzzing baseline are implemented, but M3 and M4 are not complete and
+> the MVP is not a stable API promise.
 
 ## Goal
 
@@ -149,7 +149,7 @@ Exit criteria:
 
 ### M3: Hardening and measurement
 
-Status: partially implemented. The M3.1 slice now provides:
+Status: partially implemented. The M3.1 slice provides:
 
 - Terminal handling for delayed/background scan failures: live child tables
   close, controllers enter a terminal error state, the dataset closes, and the
@@ -166,13 +166,33 @@ Status: partially implemented. The M3.1 slice now provides:
   recovery, and fresh-Worker recovery after terminal runtime failure, covered by
   `test/browser/example.spec.mjs`.
 
-M3 remains incomplete. The broader CSV compatibility corpus and parser fuzzing,
-deterministic visual/screenshot and axe accessibility coverage, and a committed
-reproducible performance baseline are still pending.
+The M3.2 baseline adds:
+
+- A versioned CSV/TSV corpus under `test/fixtures/csv/v1`, with expected
+  metadata, rows, warnings, and errors declared in a manifest.
+- Scanner and range-decoder checks for every manifest case across multiple
+  source chunk sizes, including one-byte and other tiny chunks.
+- A bounded `cargo-fuzz` `csv_lifecycle` target with checked-in seeds. Stable
+  Rust provides a deterministic smoke path on Windows; this repository's real
+  libFuzzer campaigns currently require Linux or WSL, nightly Rust, and
+  `cargo-fuzz`.
+- A scheduled `.github/workflows/fuzz.yml` campaign configured for 10 minutes
+  each week, with manual dispatch support, once the workflow is on the default
+  branch.
+
+M3 remains incomplete. External and broader compatibility cases, continuous
+corpus evolution, deterministic visual/screenshot and axe accessibility
+coverage, and a committed reproducible performance baseline are still pending.
+The current corpus and fuzz target are a foundation, not a broad compatibility
+or performance claim.
 
 Deliver:
 
-- CSV compatibility fixtures and parser fuzzing.
+- Continue expanding externally sourced compatibility fixtures and evolve the
+  parser fuzz corpus as failures are discovered.
+- Add CJK regressions for Chinese, Japanese, and Korean headers and cell text,
+  including mixed Latin/CJK content, full-width punctuation, UTF-8 BOM/CRLF,
+  one-byte scanner chunks, Canvas rendering, and TSV copy behavior.
 - Worker failure, cancellation, and malformed-input browser tests.
 - Deterministic layout, screenshot, keyboard, and accessibility tests.
 - Benchmark harnesses for first paint, scroll frame time, memory, transfer

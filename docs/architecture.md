@@ -1,9 +1,10 @@
 # Architecture
 
 > Status: M0 through M2 remain an experimental local CSV/TSV vertical slice.
-> One M3.1 lifecycle, protocol, diagnostics, and example-hardening slice is
-> implemented, but M3 hardening and measurement and M4 second-adapter validation
-> remain unfinished, and no interface is stable yet.
+> The M3.1 lifecycle/protocol slice and an M3.2 CSV compatibility and
+> parser-fuzzing baseline are implemented, but M3 hardening and measurement and
+> M4 second-adapter validation remain unfinished, and no interface is stable
+> yet.
 
 This document records the implemented prototype boundaries and the intended
 architecture they are validating. M0-M2 descriptions apply to the current
@@ -509,6 +510,10 @@ test/
   fixtures/
   browser/
   performance/
+
+fuzz/
+  corpus/csv_lifecycle/
+  fuzz_targets/csv_lifecycle.rs
 ```
 
 After the adapter and Worker contracts survive an end-to-end implementation
@@ -554,11 +559,25 @@ The existing contract, Node, and Chromium suites provide M0-M2 prototype
 evidence plus the M3.1 lifecycle/protocol slice: delayed scan fatal cleanup,
 bounded close timeouts, malformed-message termination, initial diagnostic
 delivery with row context, source-name propagation, and browser-example
-cancel/retry recovery. The broader CSV compatibility corpus and fuzzing,
+cancel/retry recovery.
+
+The M3.2 baseline adds a versioned, manifest-driven CSV/TSV corpus. Every case
+is scanned and range-decoded across multiple chunk sizes so chunk boundaries,
+expected metadata and rows, warnings, and structured failures stay reviewable.
+The checked-in `csv_lifecycle` fuzz target applies bounded, contiguous scanner
+and range-decoder lifecycles to arbitrary bytes and starts from a small seed
+corpus. Its stable executable is deterministic smoke coverage, including on
+Windows; this repository currently supports sanitizer-backed libFuzzer
+execution through Linux or WSL with nightly Rust and `cargo-fuzz`. The scheduled
+Linux workflow is configured to run that real campaign for 10 minutes each week
+after it reaches the default branch.
+
+External and broader compatibility cases, continuous corpus evolution,
 deterministic visual/screenshot and axe accessibility automation, and
-reproducible performance measurements remain unfinished M3 work. Performance
-numbers remain engineering targets until benchmark hardware, datasets, and
-harnesses are committed.
+reproducible performance measurements remain unfinished M3 work. The current
+corpus and fuzz baseline do not establish broad or cross-browser compatibility.
+Performance numbers remain engineering targets until benchmark hardware,
+datasets, and harnesses are committed.
 
 ## 11. Architectural decisions for the first prototype
 

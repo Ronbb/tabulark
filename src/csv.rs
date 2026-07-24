@@ -1462,10 +1462,103 @@ mod header_mode {
 #[cfg(test)]
 mod tests {
     use super::{
-        CsvDiagnosticKind, CsvScanner, DelimitedOptions, MemorySource, ParseMode, RangeDecodeStatus,
+        CsvDiagnosticKind, CsvScanner, DelimitedOptions, MemorySource, ParseMode,
+        RangeDecodeStatus, UTF8_BOM,
     };
     use crate::error::ErrorCode;
-    use crate::model::{AxisExtent, RangeRequest};
+    use crate::model::{AxisExtent, LogicalType, RandomAccess, RangeRequest, TableBatch};
+    use serde::Deserialize;
+    use std::collections::HashSet;
+    use std::fs;
+    use std::path::{Component, Path};
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct CorpusManifest {
+        version: u64,
+        chunk_sizes: Vec<usize>,
+        cases: Vec<CorpusCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CorpusCase {
+        id: String,
+        file: String,
+        options: CorpusOptions,
+        #[serde(default)]
+        source: CorpusSource,
+        expect: CorpusExpectation,
+    }
+
+    #[derive(Clone, Copy, Debug, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    enum CorpusFormat {
+        Csv,
+        Tsv,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CorpusOptions {
+        format: CorpusFormat,
+        header: bool,
+        mode: ParseMode,
+    }
+
+    #[derive(Clone, Copy, Debug, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    enum CorpusLineEndings {
+        Crlf,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct CorpusSource {
+        line_endings: Option<CorpusLineEndings>,
+        #[serde(default)]
+        utf8_bom: bool,
+        #[serde(default)]
+        strip_final_newline: bool,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, tag = "status", rename_all = "lowercase")]
+    enum CorpusExpectation {
+        Success {
+            metadata: CorpusMetadata,
+            rows: Vec<Vec<Option<String>>>,
+            #[serde(default)]
+            warnings: Vec<CorpusDiagnostic>,
+        },
+        Error {
+            code: ErrorCode,
+            kind: CsvDiagnosticKind,
+            #[serde(default)]
+            row: Option<u64>,
+            #[serde(rename = "byteOffset")]
+            byte_offset: u64,
+            #[serde(rename = "messageContains")]
+            message_contains: String,
+        },
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct CorpusMetadata {
+        rows: u64,
+        columns: Vec<String>,
+        schema_version: u64,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct CorpusDiagnostic {
+        kind: CsvDiagnosticKind,
+        row: Option<u64>,
+        byte_offset: u64,
+        message_contains: String,
+    }
 
     #[test]
     fn scans_bom_crlf_quotes_and_embedded_newlines_across_tiny_chunks() {
@@ -1620,5 +1713,448 @@ mod tests {
         assert_eq!(error.details()["kind"], "ragged-row");
         assert_eq!(error.details()["row"], 1);
         assert!(error.details().contains_key("byteOffset"));
+    }
+
+    #[test]
+    fn versioned_delimited_compatibility_corpus_is_stable_across_chunk_sizes() {
+        let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test")
+            .join("fixtures")
+            .join("csv")
+            .join("v1");
+        if !corpus_root.exists() {
+            // Repository-only compatibility fixtures are excluded from the
+            // published crate archive, just like the shared protocol fixtures.
+            return;
+        }
+        let manifest_source = fs::read_to_string(corpus_root.join("manifest.json"))
+            .expect("read CSV/TSV corpus manifest");
+        let manifest: CorpusManifest =
+            serde_json::from_str(&manifest_source).expect("parse CSV/TSV corpus manifest");
+        assert_eq!(
+            manifest.version, 1,
+            "update the fixture directory for a new corpus version"
+        );
+        assert!(!manifest.cases.is_empty(), "the corpus must contain cases");
+        assert!(
+            !manifest.chunk_sizes.is_empty(),
+            "the corpus must exercise chunking"
+        );
+
+        let mut case_ids = HashSet::new();
+        let mut chunk_sizes = HashSet::new();
+        for chunk_size in &manifest.chunk_sizes {
+            assert!(*chunk_size > 0, "chunk sizes must be positive");
+            assert!(chunk_sizes.insert(chunk_size), "chunk sizes must be unique");
+        }
+
+        for case in &manifest.cases {
+            assert!(
+                case_ids.insert(&case.id),
+                "case IDs must be unique: {}",
+                case.id
+            );
+            let bytes = corpus_bytes(&corpus_root, case);
+            for &chunk_size in &manifest.chunk_sizes {
+                match &case.expect {
+                    CorpusExpectation::Success {
+                        metadata,
+                        rows,
+                        warnings,
+                    } => assert_success_case(case, &bytes, chunk_size, metadata, rows, warnings),
+                    expected @ CorpusExpectation::Error { .. } => {
+                        assert_error_case(case, &bytes, chunk_size, expected)
+                    }
+                }
+            }
+        }
+    }
+
+    fn corpus_bytes(corpus_root: &Path, case: &CorpusCase) -> Vec<u8> {
+        let fixture_name = Path::new(&case.file);
+        let mut components = fixture_name.components();
+        assert!(
+            matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none(),
+            "fixture paths must stay within their corpus version: {}",
+            case.file
+        );
+        let path = corpus_root.join(fixture_name);
+        let mut bytes = fs::read(&path)
+            .unwrap_or_else(|error| panic!("read fixture {}: {error}", path.display()));
+        assert!(
+            !bytes.starts_with(UTF8_BOM),
+            "fixture {} must declare its BOM in the manifest",
+            case.file
+        );
+
+        if let Some(CorpusLineEndings::Crlf) = case.source.line_endings {
+            let text = std::str::from_utf8(&bytes).unwrap_or_else(|error| {
+                panic!("fixture {} must be UTF-8 text: {error}", case.file)
+            });
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            bytes = normalized.replace('\n', "\r\n").into_bytes();
+        }
+        if case.source.strip_final_newline {
+            if bytes.ends_with(b"\r\n") {
+                bytes.truncate(bytes.len() - 2);
+            } else if bytes.ends_with(b"\n") || bytes.ends_with(b"\r") {
+                bytes.truncate(bytes.len() - 1);
+            } else {
+                panic!(
+                    "fixture {} must end with a newline before stripFinalNewline",
+                    case.file
+                );
+            }
+        }
+        if case.source.utf8_bom {
+            let mut with_bom = Vec::with_capacity(UTF8_BOM.len() + bytes.len());
+            with_bom.extend_from_slice(UTF8_BOM);
+            with_bom.extend_from_slice(&bytes);
+            bytes = with_bom;
+        }
+        bytes
+    }
+
+    fn corpus_options(case: &CorpusCase) -> DelimitedOptions {
+        let mut options = match case.options.format {
+            CorpusFormat::Csv => DelimitedOptions::csv(),
+            CorpusFormat::Tsv => DelimitedOptions::tsv(),
+        };
+        options.header = case.options.header;
+        options.mode = case.options.mode;
+        options.checkpoint_interval = 1;
+        options.table_name = format!("corpus:{}", case.id);
+        options
+    }
+
+    fn assert_success_case(
+        case: &CorpusCase,
+        bytes: &[u8],
+        chunk_size: usize,
+        expected_metadata: &CorpusMetadata,
+        expected_rows: &[Vec<Option<String>>],
+        expected_warnings: &[CorpusDiagnostic],
+    ) {
+        let source =
+            MemorySource::open_with_chunk_size(bytes.to_vec(), corpus_options(case), chunk_size)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "case {} unexpectedly failed at chunk size {chunk_size}: {error:?}",
+                        case.id
+                    )
+                });
+        let metadata = source.metadata().unwrap_or_else(|error| {
+            panic!(
+                "case {} did not produce metadata at chunk size {chunk_size}: {error:?}",
+                case.id
+            )
+        });
+
+        assert_eq!(
+            metadata.table_id(),
+            "table-0",
+            "case {} chunk {chunk_size}",
+            case.id
+        );
+        assert_eq!(
+            metadata.name(),
+            format!("corpus:{}", case.id),
+            "case {} chunk {chunk_size}",
+            case.id
+        );
+        assert_eq!(
+            metadata.extent().rows(),
+            AxisExtent::Exact {
+                value: expected_metadata.rows
+            },
+            "case {} chunk {chunk_size}",
+            case.id
+        );
+        assert_eq!(
+            metadata.extent().columns(),
+            AxisExtent::Exact {
+                value: u64::try_from(expected_metadata.columns.len()).expect("column count")
+            },
+            "case {} chunk {chunk_size}",
+            case.id
+        );
+        assert_eq!(
+            metadata.schema().version(),
+            expected_metadata.schema_version,
+            "case {} chunk {chunk_size}",
+            case.id
+        );
+        assert_eq!(
+            metadata.capabilities().random_access(),
+            RandomAccess::Full,
+            "case {} chunk {chunk_size}",
+            case.id
+        );
+        assert_eq!(
+            metadata
+                .schema()
+                .columns()
+                .iter()
+                .map(|column| column.name())
+                .collect::<Vec<_>>(),
+            expected_metadata.columns,
+            "case {} chunk {chunk_size}",
+            case.id
+        );
+        for (index, column) in metadata.schema().columns().iter().enumerate() {
+            assert_eq!(
+                column.id(),
+                format!("c{index}"),
+                "case {} chunk {chunk_size}",
+                case.id
+            );
+            assert_eq!(
+                column.index(),
+                u64::try_from(index).expect("column index"),
+                "case {} chunk {chunk_size}",
+                case.id
+            );
+            assert_eq!(
+                column.logical_type(),
+                LogicalType::Utf8,
+                "case {} chunk {chunk_size}",
+                case.id
+            );
+            assert!(column.nullable(), "case {} chunk {chunk_size}", case.id);
+        }
+
+        assert_eq!(
+            expected_rows.len(),
+            usize::try_from(expected_metadata.rows).expect("row count"),
+            "case {} manifest metadata and batch rows disagree",
+            case.id
+        );
+        for row in expected_rows {
+            assert_eq!(
+                row.len(),
+                expected_metadata.columns.len(),
+                "case {} has a non-rectangular expected batch",
+                case.id
+            );
+        }
+
+        let warnings = source.scanner.diagnostics();
+        assert_eq!(
+            warnings.len(),
+            expected_warnings.len(),
+            "case {} chunk {chunk_size}",
+            case.id
+        );
+        for (actual, expected) in warnings.iter().zip(expected_warnings) {
+            assert_eq!(
+                actual.kind(),
+                expected.kind,
+                "case {} chunk {chunk_size}",
+                case.id
+            );
+            assert_eq!(
+                actual.row(),
+                expected.row,
+                "case {} chunk {chunk_size}",
+                case.id
+            );
+            assert_eq!(
+                actual.byte_offset(),
+                expected.byte_offset,
+                "case {} chunk {chunk_size}",
+                case.id
+            );
+            assert!(
+                actual.message().contains(&expected.message_contains),
+                "case {} chunk {chunk_size}: expected warning to contain {:?}, got {:?}",
+                case.id,
+                expected.message_contains,
+                actual.message()
+            );
+        }
+
+        let rows = expected_metadata.rows;
+        let columns = u64::try_from(expected_metadata.columns.len()).expect("column count");
+        let full_request = RangeRequest::new(0, rows, 0, columns).expect("full range");
+        let full_batch = source.read_range(full_request).unwrap_or_else(|error| {
+            panic!(
+                "case {} did not decode full batch at chunk size {chunk_size}: {error:?}",
+                case.id
+            )
+        });
+        assert_batch(
+            &full_batch,
+            full_request,
+            true,
+            expected_rows,
+            expected_metadata.schema_version,
+            &case.id,
+            chunk_size,
+        );
+
+        let overrun_request = RangeRequest::new(0, rows + 1, 0, columns).expect("overrun range");
+        let overrun_batch = source.read_range(overrun_request).unwrap_or_else(|error| {
+            panic!(
+                "case {} did not decode overrun batch at chunk size {chunk_size}: {error:?}",
+                case.id
+            )
+        });
+        let returned_overrun = RangeRequest::new(0, rows, 0, columns).expect("returned range");
+        assert_batch(
+            &overrun_batch,
+            returned_overrun,
+            false,
+            expected_rows,
+            expected_metadata.schema_version,
+            &case.id,
+            chunk_size,
+        );
+
+        if rows > 0 && columns > 0 {
+            let last_row = usize::try_from(rows - 1).expect("last row");
+            let last_column = usize::try_from(columns - 1).expect("last column");
+            let last_cell_request =
+                RangeRequest::new(rows - 1, 1, columns - 1, 1).expect("last-cell range");
+            let last_cell_batch = source.read_range(last_cell_request).unwrap_or_else(|error| {
+                panic!(
+                    "case {} did not decode checkpointed batch at chunk size {chunk_size}: {error:?}",
+                    case.id
+                )
+            });
+            assert_batch(
+                &last_cell_batch,
+                last_cell_request,
+                true,
+                &[vec![expected_rows[last_row][last_column].clone()]],
+                expected_metadata.schema_version,
+                &case.id,
+                chunk_size,
+            );
+        }
+    }
+
+    fn assert_error_case(
+        case: &CorpusCase,
+        bytes: &[u8],
+        chunk_size: usize,
+        expected: &CorpusExpectation,
+    ) {
+        let CorpusExpectation::Error {
+            code: expected_code,
+            kind: expected_kind,
+            row: expected_row,
+            byte_offset: expected_byte_offset,
+            message_contains: expected_message,
+        } = expected
+        else {
+            unreachable!("error assertion requires an error expectation");
+        };
+        let error =
+            MemorySource::open_with_chunk_size(bytes.to_vec(), corpus_options(case), chunk_size)
+                .expect_err("strict corpus case must fail");
+        assert_eq!(
+            error.code(),
+            *expected_code,
+            "case {} chunk {chunk_size}",
+            case.id
+        );
+        assert_eq!(
+            error
+                .details()
+                .get("kind")
+                .and_then(serde_json::Value::as_str),
+            Some(match expected_kind {
+                CsvDiagnosticKind::RaggedRow => "ragged-row",
+                CsvDiagnosticKind::InvalidUtf8 => "invalid-utf8",
+                CsvDiagnosticKind::MalformedQuote => "malformed-quote",
+            }),
+            "case {} chunk {chunk_size}",
+            case.id
+        );
+        assert_eq!(
+            error
+                .details()
+                .get("row")
+                .and_then(serde_json::Value::as_u64),
+            *expected_row,
+            "case {} chunk {chunk_size}",
+            case.id
+        );
+        assert_eq!(
+            error
+                .details()
+                .get("byteOffset")
+                .and_then(serde_json::Value::as_u64),
+            Some(*expected_byte_offset),
+            "case {} chunk {chunk_size}",
+            case.id
+        );
+        assert!(
+            error.message().contains(expected_message),
+            "case {} chunk {chunk_size}: expected error to contain {:?}, got {:?}",
+            case.id,
+            expected_message,
+            error.message()
+        );
+    }
+
+    fn assert_batch(
+        batch: &TableBatch,
+        expected_range: RangeRequest,
+        expected_complete: bool,
+        expected_rows: &[Vec<Option<String>>],
+        expected_schema_version: u64,
+        case_id: &str,
+        chunk_size: usize,
+    ) {
+        assert_eq!(
+            batch.table_id(),
+            "table-0",
+            "case {case_id} chunk {chunk_size}"
+        );
+        assert_eq!(batch.revision(), 0, "case {case_id} chunk {chunk_size}");
+        assert_eq!(
+            batch.schema_version(),
+            expected_schema_version,
+            "case {case_id} chunk {chunk_size}"
+        );
+        assert_eq!(
+            batch.range(),
+            expected_range,
+            "case {case_id} chunk {chunk_size}"
+        );
+        assert_eq!(
+            batch.complete(),
+            expected_complete,
+            "case {case_id} chunk {chunk_size}"
+        );
+        assert_eq!(
+            batch.columns().len(),
+            usize::try_from(expected_range.column_count()).expect("column count"),
+            "case {case_id} chunk {chunk_size}"
+        );
+        for (column_index, column) in batch.columns().iter().enumerate() {
+            assert_eq!(
+                column.column_id(),
+                format!(
+                    "c{}",
+                    expected_range.column_start()
+                        + u64::try_from(column_index).expect("column index")
+                ),
+                "case {case_id} chunk {chunk_size}"
+            );
+            assert_eq!(
+                column.len(),
+                expected_rows.len(),
+                "case {case_id} chunk {chunk_size}"
+            );
+            for (row_index, expected_row) in expected_rows.iter().enumerate() {
+                assert_eq!(
+                    column.value(row_index),
+                    Some(expected_row[column_index].as_deref()),
+                    "case {case_id} chunk {chunk_size}, row {row_index}, column {column_index}"
+                );
+            }
+        }
     }
 }

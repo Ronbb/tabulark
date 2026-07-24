@@ -1,0 +1,32 @@
+[package]
+name = "tabulark-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+tabulark = { path = ".." }
+
+# The production crate also emits a cdylib. Its cargo-fuzz linkage is currently
+# maintained on Linux/WSL; keeping libFuzzer Unix-scoped preserves the stable
+# deterministic smoke path on Windows.
+[target.'cfg(unix)'.dependencies]
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "csv_lifecycle"
+path = "fuzz_targets/csv_lifecycle.rs"
+test = false
+doc = false
+bench = false
+
+# This is deliberately an independent workspace. The production workspace
+# stays free of libFuzzer-only dependencies and continues to use its lockfile.
+[workspace]
+members = ["."]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

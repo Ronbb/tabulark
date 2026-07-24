@@ -1,0 +1,211 @@
+{
+  "version": 1,
+  "chunkSizes": [1, 2, 3, 5, 16, 4096],
+  "cases": [
+    {
+      "id": "rfc-quotes-crlf-bom",
+      "file": "rfc-quotes.csv",
+      "options": {
+        "format": "csv",
+        "header": true,
+        "mode": "strict"
+      },
+      "source": {
+        "lineEndings": "crlf",
+        "utf8Bom": true
+      },
+      "expect": {
+        "status": "success",
+        "metadata": {
+          "rows": 3,
+          "columns": ["name", "note"],
+          "schemaVersion": 1
+        },
+        "rows": [
+          ["Alice", "hello\r\nworld"],
+          ["Bob", "a \"quote\""],
+          ["Zoë", "上海,浦东"]
+        ],
+        "warnings": []
+      }
+    },
+    {
+      "id": "tsv-empty-fields",
+      "file": "empty-fields.tsv",
+      "options": {
+        "format": "tsv",
+        "header": true,
+        "mode": "strict"
+      },
+      "expect": {
+        "status": "success",
+        "metadata": {
+          "rows": 3,
+          "columns": ["id", "value", "note"],
+          "schemaVersion": 1
+        },
+        "rows": [
+          ["1", "", "alpha"],
+          ["2", "beta", ""],
+          ["3", "", ""]
+        ],
+        "warnings": []
+      }
+    },
+    {
+      "id": "csv-no-header-empty-fields",
+      "file": "no-header-empty.csv",
+      "options": {
+        "format": "csv",
+        "header": false,
+        "mode": "strict"
+      },
+      "expect": {
+        "status": "success",
+        "metadata": {
+          "rows": 2,
+          "columns": ["column_1", "column_2"],
+          "schemaVersion": 1
+        },
+        "rows": [
+          ["", "alpha"],
+          ["beta", ""]
+        ],
+        "warnings": []
+      }
+    },
+    {
+      "id": "csv-final-record-without-newline",
+      "file": "no-final-newline.csv",
+      "options": {
+        "format": "csv",
+        "header": true,
+        "mode": "strict"
+      },
+      "source": {
+        "stripFinalNewline": true
+      },
+      "expect": {
+        "status": "success",
+        "metadata": {
+          "rows": 1,
+          "columns": ["name", "value"],
+          "schemaVersion": 1
+        },
+        "rows": [
+          ["last", "record"]
+        ],
+        "warnings": []
+      }
+    },
+    {
+      "id": "csv-header-only",
+      "file": "header-only.csv",
+      "options": {
+        "format": "csv",
+        "header": true,
+        "mode": "strict"
+      },
+      "expect": {
+        "status": "success",
+        "metadata": {
+          "rows": 0,
+          "columns": ["name", "value"],
+          "schemaVersion": 1
+        },
+        "rows": [],
+        "warnings": []
+      }
+    },
+    {
+      "id": "csv-empty-source",
+      "file": "empty.csv",
+      "options": {
+        "format": "csv",
+        "header": true,
+        "mode": "strict"
+      },
+      "source": {
+        "stripFinalNewline": true
+      },
+      "expect": {
+        "status": "success",
+        "metadata": {
+          "rows": 0,
+          "columns": [],
+          "schemaVersion": 0
+        },
+        "rows": [],
+        "warnings": []
+      }
+    },
+    {
+      "id": "csv-ragged-lenient",
+      "file": "ragged.csv",
+      "options": {
+        "format": "csv",
+        "header": true,
+        "mode": "lenient"
+      },
+      "expect": {
+        "status": "success",
+        "metadata": {
+          "rows": 2,
+          "columns": ["a", "b", "column_3"],
+          "schemaVersion": 2
+        },
+        "rows": [
+          ["1", null, null],
+          ["2", "", "3"]
+        ],
+        "warnings": [
+          {
+            "kind": "ragged-row",
+            "row": 0,
+            "byteOffset": 4,
+            "messageContains": "row has 1 fields"
+          },
+          {
+            "kind": "ragged-row",
+            "row": 1,
+            "byteOffset": 6,
+            "messageContains": "row has 3 fields"
+          }
+        ]
+      }
+    },
+    {
+      "id": "csv-ragged-strict",
+      "file": "ragged.csv",
+      "options": {
+        "format": "csv",
+        "header": true,
+        "mode": "strict"
+      },
+      "expect": {
+        "status": "error",
+        "code": "PARSE_FAILED",
+        "kind": "ragged-row",
+        "row": 0,
+        "byteOffset": 4,
+        "messageContains": "row has 1 fields"
+      }
+    },
+    {
+      "id": "csv-malformed-quote-strict",
+      "file": "malformed-quote.csv",
+      "options": {
+        "format": "csv",
+        "header": true,
+        "mode": "strict"
+      },
+      "expect": {
+        "status": "error",
+        "code": "PARSE_FAILED",
+        "kind": "malformed-quote",
+        "byteOffset": 8,
+        "messageContains": "quote appears inside an unquoted field"
+      }
+    }
+  ]
+}

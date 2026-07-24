@@ -1,0 +1,67 @@
+name: Parser fuzzing
+
+on:
+  schedule:
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  csv-lifecycle:
+    name: CSV lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_FUZZ_VERSION: "0.12.0"
+      FUZZ_TIME_SECONDS: "600"
+      FUZZ_MAX_INPUT_BYTES: "65536"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo-fuzz
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.tool_cache }}/cargo-fuzz
+          key: cargo-fuzz-${{ runner.os }}-${{ env.CARGO_FUZZ_VERSION }}
+
+      - name: Add cargo-fuzz to PATH
+        shell: bash
+        run: echo "${{ runner.tool_cache }}/cargo-fuzz/bin" >> "$GITHUB_PATH"
+
+      - name: Install cargo-fuzz
+        shell: bash
+        run: |
+          if [[ ! -x "${{ runner.tool_cache }}/cargo-fuzz/bin/cargo-fuzz" ]]; then
+            cargo install \
+              --root "${{ runner.tool_cache }}/cargo-fuzz" \
+              --version "$CARGO_FUZZ_VERSION" \
+              cargo-fuzz \
+              --locked
+          fi
+
+      - name: Build fuzz target
+        run: cargo fuzz build csv_lifecycle
+
+      - name: Run bounded fuzz campaign
+        run: >-
+          cargo fuzz run csv_lifecycle --
+          -max_total_time="$FUZZ_TIME_SECONDS"
+          -max_len="$FUZZ_MAX_INPUT_BYTES"
+
+      - name: Upload fuzzing artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csv-lifecycle-fuzz-artifacts-${{ github.sha }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 7

@@ -38,6 +38,12 @@ jobs:
       - name: Run Rust tests
         run: cargo test --workspace --all-features --locked
 
+      - name: Check fuzz harness
+        run: cargo test --manifest-path fuzz/Cargo.toml --locked
+
+      - name: Replay fuzz seeds
+        run: cargo run --manifest-path fuzz/Cargo.toml --bin csv_lifecycle --locked
+
       - name: Check WebAssembly target
         run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm --locked
 

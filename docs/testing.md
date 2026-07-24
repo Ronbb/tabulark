@@ -46,6 +46,60 @@ is not compatible.
 fatals close live tables and datasets exactly once, release the Worker source,
 bound unresponsive close waits, and terminate on malformed protocol messages.
 
+## CSV/TSV compatibility corpus
+
+The versioned delimited-text corpus lives under `test/fixtures/csv`. Its
+`v1/manifest.json` records parser options, optional byte-level source
+transformations, expected metadata and rows, warnings, and structured errors.
+The source fixtures remain ordinary reviewable UTF-8 files; the manifest can
+apply a UTF-8 BOM, CRLF line endings, or removal of the final newline.
+
+The Rust corpus test runs every manifest case with chunk sizes of 1, 2, 3, 5,
+16, and 4096 bytes. It verifies complete scans and range decoding, including
+checkpointed and overrun reads, so success does not depend on one convenient
+source boundary. Add compatible cases to the current version; create a new
+version directory when expected behavior intentionally changes.
+
+This is an initial repository-owned corpus. It does not yet represent broad
+external compatibility evidence, and it should continue to grow from
+real-world files, minimized regressions, and fuzz findings.
+
+The next planned corpus extension is CJK coverage: Chinese, Japanese, and
+Korean headers and cells with mixed Latin text, full-width punctuation, and
+UTF-8 BOM/CRLF inputs. Those cases should retain the current one-byte chunk
+checks and gain browser assertions for Canvas rendering and copied TSV text.
+
+## Parser fuzzing
+
+`fuzz/fuzz_targets/csv_lifecycle.rs` is the `cargo-fuzz` entry point. It feeds
+arbitrary inputs up to 64 KiB through both lenient and derived parser options,
+variable contiguous scan chunks, metadata invariants, range planning and
+decoding, invalid-offset recovery, and terminal lifecycle checks. Checked-in
+seeds live under `fuzz/corpus/csv_lifecycle`.
+
+On Windows, run the deterministic stable-Rust smoke executable:
+
+```bash
+cargo run --manifest-path fuzz/Cargo.toml --bin csv_lifecycle --locked
+```
+
+This smoke path exercises the same invariant function over checked-in seeds,
+but it is not a libFuzzer campaign. For this repository, real sanitizer-backed
+fuzzing is currently supported on Linux or WSL with nightly Rust and
+`cargo-fuzz`:
+
+```bash
+cargo +nightly install cargo-fuzz --version 0.12.0 --locked
+cargo +nightly fuzz build csv_lifecycle
+cargo +nightly fuzz run csv_lifecycle -- -max_total_time=600 -max_len=65536
+```
+
+After `.github/workflows/fuzz.yml` is present on the default branch, it runs a
+bounded 10-minute campaign weekly and supports manual dispatch. Failures upload
+the contents of `fuzz/artifacts` for seven days. Minimized regressions should be
+reviewed and promoted into the versioned compatibility corpus or the fuzz seed
+corpus as appropriate.
+
 ## Chromium integration tests
 
 `npm run test:browser` builds the ESM, Worker, and WebAssembly artifacts before
@@ -89,7 +143,8 @@ hardware, time to first usable range, completed scan throughput, range-read
 latency, and peak engine-owned memory. A generated file is test input, not a
 published performance guarantee.
 
-M3 does not yet have a committed performance baseline. The broader CSV corpus
-and parser fuzzing, deterministic visual/screenshot checks, and axe
-accessibility automation also remain pending; do not infer cross-browser or
-performance guarantees from the current Chromium suite.
+M3 does not yet have a committed performance baseline. External and broader
+CSV/TSV corpus coverage, continuous corpus evolution, deterministic
+visual/screenshot checks, and axe accessibility automation also remain pending.
+The current corpus and fuzz target are a baseline only; do not infer broad,
+cross-browser, or performance guarantees from them or from the Chromium suite.
