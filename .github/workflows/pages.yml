@@ -32,7 +32,19 @@ jobs:
         run: |
           version="$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version' | head -n 1)"
           if ! command -v wasm-bindgen > /dev/null || ! wasm-bindgen --version | grep -Fx "wasm-bindgen $version" > /dev/null; then
-            cargo install wasm-bindgen-cli --version "$version" --locked --force
+            target="x86_64-unknown-linux-musl"
+            archive="wasm-bindgen-${version}-${target}.tar.gz"
+            checksum="${archive}.sha256sum"
+            curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
+              --output "$RUNNER_TEMP/$archive" \
+              "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/${archive}"
+            curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
+              --output "$RUNNER_TEMP/$checksum" \
+              "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/${checksum}"
+            expected="$(awk '{ print $1 }' "$RUNNER_TEMP/$checksum")"
+            printf '%s  %s\n' "$expected" "$RUNNER_TEMP/$archive" | sha256sum --check
+            tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+            echo "$RUNNER_TEMP/wasm-bindgen-${version}-${target}" >> "$GITHUB_PATH"
           fi
 
       - name: Install Node.js
