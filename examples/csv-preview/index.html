@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Tabulark CSV Canvas preview</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+        color: #172033;
+        background: #f4f6fb;
+        font-synthesis: none;
+      }
+
+      * { box-sizing: border-box; }
+
+      body { margin: 0; min-width: 20rem; }
+
+      button, input, select { font: inherit; }
+
+      button, select, .file-label {
+        min-height: 2.75rem;
+        border: 1px solid #b7c0d1;
+        border-radius: 0.625rem;
+        background: #fff;
+        color: #172033;
+      }
+
+      button, .file-label {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0.625rem 1rem;
+        font-weight: 650;
+        cursor: pointer;
+      }
+
+      button:hover, .file-label:hover { background: #eef2ff; }
+      button:disabled { cursor: wait; opacity: 0.65; }
+
+      button:focus-visible, select:focus-visible, .file-label:focus-within {
+        outline: 3px solid #7c3aed;
+        outline-offset: 2px;
+      }
+
+      .primary {
+        border-color: #4338ca;
+        background: #4338ca;
+        color: #fff;
+      }
+
+      .primary:hover { background: #3730a3; }
+
+      .app-header {
+        border-bottom: 1px solid #d7ddea;
+        background: rgb(255 255 255 / 92%);
+      }
+
+      .header-inner, main {
+        width: min(100% - 2rem, 84rem);
+        margin-inline: auto;
+      }
+
+      .header-inner {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        min-height: 4.25rem;
+        gap: 1rem;
+      }
+
+      .brand { display: flex; align-items: baseline; gap: 0.75rem; }
+      .brand strong { font-size: 1.125rem; letter-spacing: -0.02em; }
+      .badge {
+        border: 1px solid #c4b5fd;
+        border-radius: 999px;
+        padding: 0.15rem 0.5rem;
+        color: #5b21b6;
+        font-size: 0.75rem;
+        font-weight: 750;
+        letter-spacing: 0.04em;
+      }
+
+      main { padding-block: clamp(1.25rem, 3vw, 2.5rem); }
+      h1 { margin: 0; font-size: clamp(1.65rem, 4vw, 2.5rem); letter-spacing: -0.04em; }
+      .lede { max-width: 48rem; margin: 0.65rem 0 1.5rem; color: #536078; line-height: 1.6; }
+
+      .toolbar {
+        display: flex;
+        align-items: end;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        padding: 1rem;
+        border: 1px solid #d7ddea;
+        border-radius: 0.875rem 0.875rem 0 0;
+        background: #fff;
+      }
+
+      .field { display: grid; gap: 0.35rem; }
+      .field > span { color: #536078; font-size: 0.78rem; font-weight: 700; }
+      select { min-width: 7rem; padding: 0.55rem 2rem 0.55rem 0.75rem; }
+      input[type="file"] { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+      .file-name { max-width: 18rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+      .workspace {
+        position: relative;
+        min-height: min(66vh, 42rem);
+        overflow: hidden;
+        border: 1px solid #d7ddea;
+        border-top: 0;
+        border-radius: 0 0 0.875rem 0.875rem;
+        background: #fff;
+      }
+
+      #preview { width: 100%; height: min(66vh, 42rem); min-height: 26rem; }
+      #preview:empty { display: none; }
+
+      .empty-state {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-content: center;
+        justify-items: center;
+        gap: 0.6rem;
+        padding: 2rem;
+        text-align: center;
+      }
+
+      .empty-state[hidden] { display: none; }
+      .empty-mark { font-size: 2.25rem; line-height: 1; }
+      .empty-state strong { font-size: 1.05rem; }
+      .empty-state p { max-width: 30rem; margin: 0; color: #536078; line-height: 1.5; }
+
+      .status-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        margin-top: 0.75rem;
+        color: #536078;
+        font-size: 0.875rem;
+      }
+
+      #status[data-kind="error"] { color: #b42318; font-weight: 650; }
+      kbd {
+        border: 1px solid #b7c0d1;
+        border-bottom-width: 2px;
+        border-radius: 0.3rem;
+        padding: 0.05rem 0.35rem;
+        background: #fff;
+        color: #344054;
+        font: 0.78rem ui-monospace, monospace;
+      }
+
+      @media (max-width: 42rem) {
+        .header-inner { min-height: 3.75rem; }
+        .badge, .shortcuts { display: none; }
+        .toolbar > * { flex: 1 1 auto; }
+        .file-label, button { width: 100%; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after { scroll-behavior: auto !important; }
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root { color: #edf0f7; background: #111827; }
+        .app-header, .toolbar, .workspace { background: #182235; border-color: #34415a; }
+        button, select, .file-label, kbd { color: #edf0f7; background: #202c42; border-color: #526079; }
+        button:hover, .file-label:hover { background: #293750; }
+        .primary { background: #7c3aed; border-color: #8b5cf6; }
+        .primary:hover { background: #6d28d9; }
+        .lede, .field > span, .empty-state p, .status-row { color: #b5c0d4; }
+        .badge { color: #ddd6fe; }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="header-inner">
+        <div class="brand"><strong>Tabulark</strong><span class="badge">M2 PREVIEW</span></div>
+        <span class="shortcuts"><kbd>↑</kbd> <kbd>↓</kbd> navigate · <kbd>Ctrl</kbd> <kbd>C</kbd> copy</span>
+      </div>
+    </header>
+    <main>
+      <h1>Explore a local table instantly.</h1>
+      <p class="lede">
+        Your file stays in this browser. Tabulark parses CSV or TSV in a Worker and paints only
+        the visible viewport.
+      </p>
+      <form id="open-form" class="toolbar">
+        <label class="file-label">
+          <span class="file-name" id="file-name">Choose a file</span>
+          <input id="source" type="file" accept=".csv,.tsv,text/csv,text/tab-separated-values" />
+        </label>
+        <label class="field">
+          <span>Format</span>
+          <select id="format" aria-label="File format">
+            <option value="csv">CSV</option>
+            <option value="tsv">TSV</option>
+          </select>
+        </label>
+        <button id="open" class="primary" type="submit">Open preview</button>
+        <button id="sample" type="button">Try sample data</button>
+      </form>
+      <section class="workspace" aria-label="Table preview">
+        <div id="preview"></div>
+        <div id="empty-state" class="empty-state">
+          <span class="empty-mark" aria-hidden="true">▦</span>
+          <strong>No table open</strong>
+          <p>Choose a local CSV or TSV, or load the generated sample. Nothing is uploaded.</p>
+        </div>
+      </section>
+      <div class="status-row">
+        <span id="status" role="status" aria-live="polite">Ready.</span>
+        <span class="shortcuts">Drag a column boundary to resize · Shift + arrows selects a range</span>
+      </div>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

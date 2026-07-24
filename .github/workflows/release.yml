@@ -25,6 +25,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+
+      - name: Install matching wasm-bindgen CLI
+        shell: bash
+        run: |
+          version="$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version' | head -n 1)"
+          cargo install wasm-bindgen-cli --version "$version" --locked
 
       - name: Install Node.js
         uses: actions/setup-node@v6
@@ -51,8 +58,23 @@ jobs:
       - name: Run Rust tests
         run: cargo test --workspace --all-features --locked
 
+      - name: Check WebAssembly target
+        run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm --locked
+
+      - name: Build JavaScript and WebAssembly
+        run: npm run build
+
+      - name: Check TypeScript
+        run: npm run typecheck
+
       - name: Run JavaScript tests
         run: npm test
+
+      - name: Install Chromium
+        run: npx --no-install playwright install --with-deps chromium
+
+      - name: Run browser integration tests
+        run: npm run test:browser
 
       - name: Check registry packages
         run: |
@@ -138,6 +160,19 @@ jobs:
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
 
+      - name: Install Rust for WebAssembly build
+        if: steps.availability.outputs.publish == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install matching wasm-bindgen CLI
+        if: steps.availability.outputs.publish == 'true'
+        shell: bash
+        run: |
+          version="$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version' | head -n 1)"
+          cargo install wasm-bindgen-cli --version "$version" --locked
+
       - name: Install an OIDC-capable npm CLI
         if: steps.availability.outputs.publish == 'true'
         run: npm install --global npm@11
@@ -145,6 +180,10 @@ jobs:
       - name: Install dependencies
         if: steps.availability.outputs.publish == 'true'
         run: npm ci
+
+      - name: Build JavaScript and WebAssembly
+        if: steps.availability.outputs.publish == 'true'
+        run: npm run build
 
       - name: Publish to npm
         if: steps.availability.outputs.publish == 'true'

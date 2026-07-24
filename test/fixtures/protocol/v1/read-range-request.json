@@ -1,0 +1,14 @@
+{
+  "protocolVersion": 1,
+  "requestId": "request-read-range-001",
+  "op": "readRange",
+  "payload": {
+    "tableHandle": "table-001",
+    "range": {
+      "rowStart": 1024,
+      "rowCount": 256,
+      "columnStart": 0,
+      "columnCount": 32
+    }
+  }
+}

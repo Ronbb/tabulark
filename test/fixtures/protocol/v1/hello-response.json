@@ -1,0 +1,12 @@
+{
+  "protocolVersion": 1,
+  "requestId": "request-hello-001",
+  "status": "success",
+  "result": {
+    "kind": "hello",
+    "data": {
+      "protocolVersion": 1,
+      "transferableBatches": true
+    }
+  }
+}

@@ -16,9 +16,11 @@ cargo publish --locked
 npm publish
 ```
 
-The initial `0.0.1` release is an installable, explicitly pre-alpha scaffold. It
-establishes package ownership while validating package contents and the release
-chain. Run the complete verification suite locally before publishing it.
+The first registry release is an installable, explicitly pre-alpha M0-M2
+prototype. It establishes package ownership while validating package contents
+and the release chain; it does not imply M3 hardening, M4 extension validation,
+or API stability. Run the complete verification suite locally before publishing
+it.
 
 ## Configure Trusted Publishing
 
@@ -51,11 +53,15 @@ publishing secret is required after bootstrap.
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
+cargo check --target wasm32-unknown-unknown --no-default-features --features wasm --locked
 cargo package --allow-dirty --locked
 npm ci
+npm run build
 npm run check
+npm run test:browser
 
-git tag -a v0.0.2 -m "v0.0.2"
+VERSION=0.1.0 # replace with the synchronized Cargo/npm version
+git tag -a "v$VERSION" -m "v$VERSION"
 git push origin main --follow-tags
 ```
 

@@ -1,9 +1,33 @@
 //! Core types for Tabulark.
 //!
-//! The crate is an early scaffold. Its public API is experimental and will
-//! change while the unified table model is being validated.
+//! This crate supplies the model, version-one Worker protocol, CSV/TSV runtime,
+//! and WebAssembly bridge for the M0-M2 local CSV/TSV prototype. Its public API
+//! is experimental and may change while M3 hardening and M4 adapter validation
+//! are completed.
 
-/// The current maturity of the published API.
+pub mod error;
+pub mod model;
+pub mod protocol;
+
+#[cfg(feature = "csv")]
+pub mod csv;
+
+#[cfg(feature = "csv")]
+pub mod runtime;
+
+#[cfg(feature = "wasm")]
+mod wasm;
+
+pub use error::{ErrorCode, Result, TabularkError};
+pub use model::{
+    AxisExtent, Capabilities, ColumnSchema, LogicalType, RandomAccess, RangeRequest, ReturnedRange,
+    Schema, StringColumnBatch, TableBatch, TableExtent, TableMetadata,
+};
+
+#[cfg(feature = "wasm")]
+pub use wasm::WasmRuntime;
+
+/// The current maturity of the experimental M0-M2 API.
 pub const PROJECT_STATUS: &str = "prototype";
 
 /// The number of rows and columns exposed by a table.

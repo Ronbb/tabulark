@@ -1,0 +1,8 @@
+{
+  "protocolVersion": 1,
+  "requestId": "request-close-001",
+  "status": "success",
+  "result": {
+    "kind": "acknowledged"
+  }
+}

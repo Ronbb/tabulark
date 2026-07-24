@@ -1,0 +1,8 @@
+{
+  "protocolVersion": 1,
+  "requestId": "request-hello-001",
+  "op": "hello",
+  "payload": {
+    "clientName": "tabulark-js"
+  }
+}

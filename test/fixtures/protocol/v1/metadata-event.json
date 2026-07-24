@@ -1,0 +1,40 @@
+{
+  "protocolVersion": 1,
+  "requestId": "request-open-source-001",
+  "event": "metadata",
+  "payload": {
+    "tableId": "csv:table:0",
+    "name": "table",
+    "revision": 0,
+    "extent": {
+      "rows": {
+        "kind": "at-least",
+        "value": 1024
+      },
+      "columns": {
+        "kind": "exact",
+        "value": 1
+      }
+    },
+    "schema": {
+      "version": 1,
+      "columns": [
+        {
+          "id": "c0",
+          "name": "value",
+          "index": 0,
+          "logicalType": "utf8",
+          "nullable": true
+        }
+      ]
+    },
+    "capabilities": {
+      "randomAccess": "indexed-prefix",
+      "typedValues": false,
+      "search": false,
+      "sort": false,
+      "filter": false,
+      "multiTable": false
+    }
+  }
+}

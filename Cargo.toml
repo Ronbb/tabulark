@@ -1,6 +1,6 @@
 [package]
 name = "tabulark"
-version = "0.0.4"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A WebAssembly-first engine for format-agnostic tabular data preview"
@@ -10,7 +10,31 @@ homepage = "https://github.com/Ronbb/tabulark"
 documentation = "https://docs.rs/tabulark"
 readme = "README.md"
 keywords = ["table", "preview", "wasm", "data", "canvas"]
-include = ["src/**", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+# Anchor package paths at the repository root.  An unanchored `README.md`
+# pattern also matches dependency documentation such as `node_modules/**/README.md`.
+include = [
+    "/src/**",
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["csv"]
+csv = ["dep:csv-core"]
+wasm = ["csv", "dep:js-sys", "dep:serde-wasm-bindgen", "dep:wasm-bindgen"]
+
+[dependencies]
+csv-core = { version = "0.1.13", optional = true }
+js-sys = { version = "=0.3.77", optional = true }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+serde-wasm-bindgen = { version = "0.6.5", optional = true }
+wasm-bindgen = { version = "=0.2.100", optional = true }
 
 [workspace]
 resolver = "3"

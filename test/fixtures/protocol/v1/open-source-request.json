@@ -1,0 +1,12 @@
+{
+  "protocolVersion": 1,
+  "requestId": "request-open-source-001",
+  "op": "openSource",
+  "payload": {
+    "format": "csv",
+    "options": {
+      "header": "first-row",
+      "mode": "lenient"
+    }
+  }
+}

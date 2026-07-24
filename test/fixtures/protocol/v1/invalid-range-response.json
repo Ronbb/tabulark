@@ -1,0 +1,10 @@
+{
+  "protocolVersion": 1,
+  "requestId": "request-read-range-001",
+  "status": "failure",
+  "error": {
+    "code": "INVALID_RANGE",
+    "message": "row range end exceeds the JavaScript safe integer limit",
+    "retryable": false
+  }
+}
