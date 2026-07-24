@@ -72,10 +72,11 @@ This is an initial repository-owned corpus. It does not yet represent broad
 external compatibility evidence, and it should continue to grow from
 real-world files, minimized regressions, and fuzz findings.
 
-The next planned corpus extension is CJK coverage: Chinese, Japanese, and
-Korean headers and cells with mixed Latin text, full-width punctuation, and
-UTF-8 BOM/CRLF inputs. Those cases should retain the current one-byte chunk
-checks and gain browser assertions for Canvas rendering and copied TSV text.
+The M3.4 corpus extension adds `tsv-cjk-crlf-bom`, with Chinese, Japanese, and
+Korean headers and cells, mixed Latin text, and full-width punctuation. The
+manifest applies UTF-8 BOM and CRLF transformations. Like every other case, it
+runs through scanner and range decoding at chunk sizes 1, 2, 3, 5, 16, and
+4096 bytes.
 
 ## Parser fuzzing
 
@@ -121,6 +122,15 @@ the M2 Canvas view, bounded semantic grid, keyboard selection, clipboard
 output, horizontal and vertical scrolling, and column resize.
 Chromium is the current compatibility target; Firefox and WebKit are
 intentionally deferred.
+
+`test/browser/cjk.spec.mjs` reads the same versioned CJK fixture and manifest,
+applies its BOM/CRLF source transforms, and opens it through the real module
+Worker and WebAssembly parser. It asserts exact schema, range rows, semantic
+grid text, Canvas `fillText` paint and `measureText` autosize inputs, and a
+six-cell keyboard selection copied as TSV. The test rejects Unicode replacement
+characters. It intentionally does not add a text-pixel screenshot: system fonts
+own glyph shaping and rasterization, while this regression locks the strings
+Tabulark passes to the Canvas API.
 
 `test/browser/example.spec.mjs` opens the real CSV preview example and checks
 advanced parse options, cancellation followed by retry of the same `File`,
@@ -194,8 +204,8 @@ grid. It does not inspect the `aria-hidden` Canvas pixels, replace manual screen
 reader testing, validate every focus/announcement sequence, or establish a
 complete WCAG conformance claim. Column resizing is still exercised only by
 pointer drag/double-click, with no keyboard resize contract, and there is no
-committed forced-colors-specific visual baseline. CJK Canvas rendering and TSV
-copy remain the next corpus/browser extension described above.
+committed forced-colors-specific visual baseline. CJK Canvas input and TSV copy
+are covered separately by the M3.4 regression described above.
 
 ## Large-file data
 
@@ -217,9 +227,9 @@ latency, and peak engine-owned memory. A generated file is test input, not a
 published performance guarantee.
 
 M3 does not yet have a committed performance baseline. External and broader
-CSV/TSV corpus coverage, continuous corpus evolution, CJK visual/copy cases,
-keyboard-operable resizing, and forced-colors-specific validation also remain
-pending. The current corpus, fuzz target, Linux-Chromium screenshots, and axe
-checks are bounded baselines only; do not infer broad compatibility,
-cross-browser behavior, complete accessibility conformance, or performance
-guarantees from them.
+CSV/TSV corpus coverage, continuous corpus evolution, keyboard-operable
+resizing, forced-colors-specific validation, and platform-font conformance also
+remain pending. The current corpus, fuzz target, CJK regression,
+Linux-Chromium screenshots, and axe checks are bounded baselines only; do not
+infer broad compatibility, cross-browser behavior, complete accessibility
+conformance, font-rendering equivalence, or performance guarantees from them.

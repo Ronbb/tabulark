@@ -1,9 +1,9 @@
 # Architecture
 
 > Status: M0 through M2 remain an experimental local CSV/TSV vertical slice.
-> The M3.1 lifecycle/protocol slice and an M3.2 CSV compatibility and
-> parser-fuzzing baseline are implemented, together with an M3.3
-> Linux-Chromium visual-regression and axe automation baseline. M3 hardening and
+> The M3.1 lifecycle/protocol slice, M3.2 CSV compatibility and parser-fuzzing
+> baseline, M3.3 Linux-Chromium visual/axe baseline, and M3.4 CJK
+> corpus/Canvas/copy regression slice are implemented. M3 hardening and
 > measurement and M4 second-adapter validation remain unfinished, and no
 > interface is stable yet.
 
@@ -587,6 +587,15 @@ Automated axe scans cover WCAG 2.0/2.1 A and AA tagged rules for idle, ready,
 strict-error, and dark-ready example states through the semantic DOM layer.
 These scans are a bounded automated check, not a complete accessibility audit.
 
+The M3.4 CJK regression adds one manifest-driven TSV source with UTF-8 BOM and
+CRLF transforms, Chinese/Japanese/Korean headers and cells, mixed Latin/CJK
+content, and full-width punctuation. The parser corpus applies the full chunk
+matrix, including one-byte scanner and range-decoder input. Chromium then opens
+the same case through the Worker/WebAssembly runtime and verifies exact table
+data, semantic-grid content, Canvas `fillText` paint and `measureText` autosize
+inputs, and keyboard-driven TSV copy. This locks Tabulark's Unicode data path
+without claiming that platform fonts shape or rasterize glyphs identically.
+
 The repository-root introduction and playground are also the static GitHub
 Pages entry point. `scripts/build-pages.mjs` assembles a minimal site under
 `target/pages` from the built ESM, module Worker, WebAssembly runtime, and
@@ -596,12 +605,12 @@ a publication boundary only; it does not introduce a hosted data service, and
 the playground continues to open and process sources locally in the browser.
 
 External and broader compatibility cases, continuous corpus evolution,
-CJK visual/copy regressions, keyboard-operated resize, forced-colors-specific
-validation, and reproducible performance measurements remain unfinished M3
-work. The current corpus, fuzz, Linux-Chromium visual, and axe baselines do not
-establish broad or cross-browser compatibility or complete accessibility
-conformance. Performance numbers remain engineering targets until benchmark
-hardware, datasets, and harnesses are committed.
+keyboard-operated resize, forced-colors-specific validation, platform-font
+conformance, and reproducible performance measurements remain unfinished M3
+work. The current corpus, fuzz, CJK, Linux-Chromium visual, and axe baselines do
+not establish broad or cross-browser compatibility, identical font rendering,
+or complete accessibility conformance. Performance numbers remain engineering
+targets until benchmark hardware, datasets, and harnesses are committed.
 
 ## 11. Architectural decisions for the first prototype
 

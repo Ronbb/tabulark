@@ -1,10 +1,10 @@
 # MVP Roadmap
 
 > Status: the M0-M2 local CSV/TSV path remains an experimental prototype. An
-> M3.1 lifecycle/protocol hardening and an M3.2 CSV compatibility and
-> parser-fuzzing baseline are implemented, together with an M3.3
-> Linux-Chromium visual-regression and axe automation baseline. M3 and M4 are
-> not complete and the MVP is not a stable API promise.
+> M3.1 lifecycle/protocol hardening, an M3.2 CSV compatibility and parser-fuzzing
+> baseline, an M3.3 Linux-Chromium visual/axe baseline, and an M3.4 CJK
+> corpus/Canvas/copy regression slice are implemented. M3 and M4 are not
+> complete and the MVP is not a stable API promise.
 
 ## Goal
 
@@ -196,6 +196,23 @@ The M3.3 baseline adds:
 - CI and release browser verification pinned to the Linux baseline runner, with
   traces and screenshot diffs retained on failure.
 
+The M3.4 CJK slice adds:
+
+- A versioned TSV fixture with Chinese, Japanese, and Korean headers and cells,
+  mixed Latin/CJK content, and full-width punctuation. Its manifest applies
+  UTF-8 BOM and CRLF transformations before the existing scanner and range
+  matrix runs with chunk sizes of 1, 2, 3, 5, 16, and 4096 bytes.
+- A Chromium regression that opens the same transformed fixture through the
+  real Worker/WebAssembly runtime and checks exact schema, rows, and bounded
+  semantic-grid text without Unicode replacement characters.
+- Exact assertions that every expected CJK string reaches the Canvas
+  `fillText` paint and `measureText` autosize paths, and that keyboard selection
+  copies the six-cell range as TSV without character or full-width-punctuation
+  loss.
+- A deliberate boundary around font behavior: the test verifies Canvas input,
+  while glyph shaping and rasterization remain platform-owned and are not added
+  to the strict Linux-Chromium pixel baseline.
+
 The repository also ships a responsive introduction and live local-file
 playground as the high-priority public demonstration surface. A deterministic
 static build is deployed from `main` to GitHub Pages and is covered at both the
@@ -204,19 +221,16 @@ mobile interaction check. This is a delivery surface for the prototype, not a
 claim that the package API or M3 as a whole is stable.
 
 M3 remains incomplete. External and broader compatibility cases, continuous
-corpus evolution, CJK rendering/copy regressions, keyboard-operable column
-resizing, forced-colors-specific validation, and a committed reproducible
-performance baseline are still pending. The current corpus, fuzz target,
-Linux-Chromium screenshots, and axe checks are foundations, not broad
-compatibility, complete accessibility, or performance claims.
+corpus evolution, keyboard-operable column resizing, forced-colors-specific
+validation, and a committed reproducible performance baseline are still
+pending. The current corpus, fuzz target, CJK regression, Linux-Chromium
+screenshots, and axe checks are foundations, not broad compatibility, complete
+accessibility, platform-font conformance, or performance claims.
 
 Deliver:
 
 - Continue expanding externally sourced compatibility fixtures and evolve the
   parser fuzz corpus as failures are discovered.
-- Add CJK regressions for Chinese, Japanese, and Korean headers and cell text,
-  including mixed Latin/CJK content, full-width punctuation, UTF-8 BOM/CRLF,
-  one-byte scanner chunks, Canvas rendering, and TSV copy behavior.
 - Worker failure, cancellation, and malformed-input browser tests.
 - Add a keyboard-operable column-resize contract; the current resize path and
   its browser assertions are pointer-only.
@@ -227,6 +241,13 @@ Deliver:
 
 Exit criteria:
 
+- A versioned CJK case preserves exact headers and cells through single-byte
+  parsing, Worker/WebAssembly decoding, the semantic grid, Canvas paint/autosize
+  inputs, and keyboard-driven TSV copy without replacement characters.
+- Column resizing has a keyboard-operable semantic contract, not only pointer
+  drag and double-click behavior.
+- Forced-colors mode preserves visible focus, selection, resize affordances,
+  and error state meaning through explicit semantic and browser coverage.
 - Performance claims are tied to committed datasets and documented hardware.
 - Memory and input limits fail predictably instead of crashing the page.
 - The example app covers empty, progress, error, cancel, and retry states.

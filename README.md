@@ -12,11 +12,11 @@
 > [!IMPORTANT]
 > Tabulark has an experimental CSV/TSV Worker, WebAssembly runtime, and
 > accessible Canvas viewport. There is no stable public API or production-ready
-> release yet. The M3.1 lifecycle/protocol slice and an M3.2 CSV compatibility
-> and parser-fuzzing baseline are implemented, together with an M3.3
-> Linux-Chromium visual-regression and axe automation baseline. M3 as a whole,
-> M4 second-adapter validation, and the broader format roadmap described below
-> are not complete.
+> release yet. The M3.1 lifecycle/protocol slice, M3.2 CSV compatibility and
+> parser-fuzzing baseline, M3.3 Linux-Chromium visual/axe baseline, and M3.4 CJK
+> corpus/Canvas/copy regression slice are implemented. M3 as a whole, M4
+> second-adapter validation, and the broader format roadmap described below are
+> not complete.
 
 ## Why Tabulark?
 
@@ -84,16 +84,21 @@ The repository currently contains:
   runner is the canonical environment for intentional baseline updates.
 - Automated axe WCAG 2.1 A/AA checks for the example's idle, ready, strict-error,
   and dark-ready states.
+- A Chinese/Japanese/Korean TSV regression that crosses the versioned parser
+  corpus, single-byte scanner chunks, real Worker/WebAssembly decoding, the
+  semantic grid, Canvas paint/autosize text calls, keyboard selection, and
+  exact clipboard output.
 
 M3 is still incomplete. External and broader compatibility cases, ongoing
-corpus evolution, CJK rendering/copy regressions, keyboard-operable column
-resizing, forced-colors-specific validation, and a reproducible performance
-baseline remain pending. Column resize is currently pointer-only, and the
-visual/axe automation is a Chromium baseline rather than a cross-browser or
-complete accessibility audit. The checked-in fuzz target is a baseline, not
-evidence of broad CSV compatibility. M4 extension validation with a second
-adapter, persistent caches, additional formats, and framework bindings also
-remain future milestones.
+corpus evolution, keyboard-operable column resizing, forced-colors-specific
+validation, and a reproducible performance baseline remain pending. The CJK
+Canvas check locks the exact strings sent to the browser drawing API, not
+platform font shaping or glyph rasterization. Column resize is currently
+pointer-only, and the visual/axe automation is a Chromium baseline rather than
+a cross-browser or complete accessibility audit. The checked-in fuzz target is
+a baseline, not evidence of broad CSV compatibility. M4 extension validation
+with a second adapter, persistent caches, additional formats, and framework
+bindings also remain future milestones.
 
 ## Experimental browser API
 
@@ -271,6 +276,7 @@ See the
   example-hardening slice.
 - [x] Add the M3.2 versioned CSV/TSV corpus and parser-fuzzing baseline.
 - [x] Add the M3.3 Linux-Chromium visual-regression and axe automation baseline.
+- [x] Add the M3.4 CJK corpus, Canvas, semantic-grid, and TSV-copy regressions.
 - [ ] Complete the remaining M3 compatibility, inclusive interaction, and
   measurement work.
 - [ ] Validate the extension boundary with an M4 second adapter.

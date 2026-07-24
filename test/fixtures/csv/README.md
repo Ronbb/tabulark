@@ -8,3 +8,7 @@ review.
 
 Add compatible cases to the current version. Create a new version directory
 when an existing expected result must change intentionally.
+
+The `tsv-cjk-crlf-bom` case is also consumed by the Chromium CJK regression. It
+keeps Chinese, Japanese, Korean, mixed Latin/CJK text, and full-width punctuation
+in one shared parser, Canvas, semantic-grid, and clipboard contract.

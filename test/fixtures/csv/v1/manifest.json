@@ -53,6 +53,32 @@
       }
     },
     {
+      "id": "tsv-cjk-crlf-bom",
+      "file": "cjk-mixed.tsv",
+      "options": {
+        "format": "tsv",
+        "header": true,
+        "mode": "strict"
+      },
+      "source": {
+        "lineEndings": "crlf",
+        "utf8Bom": true
+      },
+      "expect": {
+        "status": "success",
+        "metadata": {
+          "rows": 2,
+          "columns": ["中文标题", "日本語ヘッダー", "한국어 헤더"],
+          "schemaVersion": 1
+        },
+        "rows": [
+          ["上海（浦东）", "東京・新宿", "서울，강남"],
+          ["Mixed 中文 42", "全角：ＡＢＣ！", "한글/Latin"]
+        ],
+        "warnings": []
+      }
+    },
+    {
       "id": "csv-no-header-empty-fields",
       "file": "no-header-empty.csv",
       "options": {
