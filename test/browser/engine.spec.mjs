@@ -138,6 +138,220 @@ test("cancels a range read with AbortSignal", async ({ page }) => {
   expect(errorCode).toBe("CANCELLED");
 });
 
+test("cancels a range read after it has been sent to the Worker", async ({ page }) => {
+  await page.goto("/test/browser/harness.html");
+
+  const result = await page.evaluate(async () => {
+    const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+    const NativeWorker = globalThis.Worker;
+    const requests = [];
+    let resolveReadPosted;
+    const readPosted = new Promise((resolve) => {
+      resolveReadPosted = resolve;
+    });
+    class ObservedWorker extends NativeWorker {
+      postMessage(message, transfer) {
+        requests.push({
+          op: message?.op,
+          requestId: message?.requestId,
+          targetRequestId: message?.payload?.targetRequestId,
+        });
+        super.postMessage(message, transfer);
+        if (message?.op === "readRange") {
+          resolveReadPosted(message.requestId);
+        }
+      }
+    }
+    Object.defineProperty(globalThis, "Worker", {
+      configurable: true,
+      writable: true,
+      value: ObservedWorker,
+    });
+
+    let engine;
+    let dataset;
+    let table;
+    try {
+      const { createEngine } = await import("/dist/index.js");
+      engine = await createEngine();
+      const row = "0123456789abcdef\n";
+      dataset = await engine.open(new Blob(["value\n", row.repeat(1_000_000)]), {
+        format: "csv",
+        header: "first-row",
+        mode: "lenient",
+      });
+      table = await dataset.openTable(dataset.tables[0].id);
+
+      const abort = new AbortController();
+      const pending = table.readRange(
+        {
+          rowStart: 900_000,
+          rowCount: 1,
+          columnStart: 0,
+          columnCount: 1,
+        },
+        { signal: abort.signal },
+      );
+      const readRequestId = await readPosted;
+      abort.abort();
+
+      let errorCode;
+      try {
+        await pending;
+        errorCode = "resolved";
+      } catch (error) {
+        errorCode = error?.code ?? error?.name ?? "unknown";
+      }
+
+      const recovered = await table.readRange({
+        rowStart: 0,
+        rowCount: 1,
+        columnStart: 0,
+        columnCount: 1,
+      });
+      const cancelRequest = requests.find(
+        (request) => request.op === "cancel" && request.targetRequestId === readRequestId,
+      );
+      return {
+        cancelTarget: cancelRequest?.targetRequestId,
+        errorCode,
+        readRequestId,
+        recovered: recovered.toRows(),
+      };
+    } finally {
+      await table?.close();
+      await dataset?.close();
+      await engine?.close();
+      if (originalWorker) {
+        Object.defineProperty(globalThis, "Worker", originalWorker);
+      } else {
+        delete globalThis.Worker;
+      }
+    }
+  });
+
+  expect(result.errorCode).toBe("CANCELLED");
+  expect(result.cancelTarget).toBe(result.readRequestId);
+  expect(result.recovered).toEqual([["0123456789abcdef"]]);
+});
+
+test("enforces low-budget input limits and keeps the same engine reusable", async ({ page }) => {
+  await page.goto("/test/browser/harness.html");
+
+  const result = await page.evaluate(async () => {
+    const memoryBudgetBytes = 8 * 1024 * 1024;
+    const maxArrayBufferBytes = memoryBudgetBytes / 2;
+    const maxFieldBytes = memoryBudgetBytes / 32;
+    const { createEngine } = await import("/dist/index.js");
+    const engine = await createEngine({ memoryBudgetBytes });
+    const oversizedBuffer = new ArrayBuffer(maxArrayBufferBytes + 1);
+
+    const captureOpenFailure = async (source) => {
+      try {
+        const unexpected = await engine.open(source, {
+          format: "csv",
+          header: "first-row",
+          mode: "strict",
+        });
+        await unexpected.close();
+        return { code: "RESOLVED", details: null, message: "" };
+      } catch (error) {
+        return {
+          code: error?.code ?? error?.name ?? "UNKNOWN",
+          details: error?.details ?? null,
+          message: error?.message ?? String(error),
+        };
+      }
+    };
+    const readOne = async (value) => {
+      const dataset = await engine.open(new Blob([`value\n${value}\n`]), {
+        format: "csv",
+        header: "first-row",
+        mode: "strict",
+      });
+      const table = await dataset.openTable(dataset.tables[0].id);
+      try {
+        return (await table.readRange({
+          rowStart: 0,
+          rowCount: 1,
+          columnStart: 0,
+          columnCount: 1,
+        })).toRows();
+      } finally {
+        await table.close();
+        await dataset.close();
+      }
+    };
+
+    try {
+      const arrayBufferFailure = await captureOpenFailure(oversizedBuffer);
+      const afterArrayBuffer = await readOne("after-buffer-limit");
+      const fieldFailure = await captureOpenFailure(
+        new Blob(["value\n", "x".repeat(maxFieldBytes + 1), "\n"]),
+      );
+      const afterField = await readOne("after-field-limit");
+      return {
+        afterArrayBuffer,
+        afterField,
+        arrayBufferByteLength: oversizedBuffer.byteLength,
+        arrayBufferFailure,
+        fieldFailure,
+        maxArrayBufferBytes,
+        maxFieldBytes,
+      };
+    } finally {
+      await engine.close();
+    }
+  });
+
+  expect(result.arrayBufferFailure).toMatchObject({
+    code: "RESOURCE_LIMIT",
+    details: {
+      byteLength: result.maxArrayBufferBytes + 1,
+      limit: result.maxArrayBufferBytes,
+    },
+  });
+  expect(result.arrayBufferByteLength).toBe(result.maxArrayBufferBytes + 1);
+  expect(result.afterArrayBuffer).toEqual([["after-buffer-limit"]]);
+  expect(result.fieldFailure).toMatchObject({
+    code: "RESOURCE_LIMIT",
+    details: { maxFieldBytes: result.maxFieldBytes },
+  });
+  expect(result.fieldFailure.message).toContain("CSV field exceeds the configured byte limit");
+  expect(result.afterField).toEqual([["after-field-limit"]]);
+});
+
+test("reports an unterminated quoted field through the real Worker and Wasm path", async ({ page }) => {
+  await page.goto("/test/browser/harness.html");
+
+  const failure = await page.evaluate(async () => {
+    const { createEngine } = await import("/dist/index.js");
+    const engine = await createEngine();
+    try {
+      await engine.open(new Blob(["left,right\n\"unterminated,right\n"]), {
+        format: "csv",
+        header: "first-row",
+        mode: "strict",
+      });
+      return { code: "RESOLVED", details: null, message: "" };
+    } catch (error) {
+      return {
+        code: error?.code ?? error?.name ?? "UNKNOWN",
+        details: error?.details ?? null,
+        message: error?.message ?? String(error),
+      };
+    } finally {
+      await engine.close();
+    }
+  });
+
+  expect(failure).toMatchObject({
+    code: "PARSE_FAILED",
+    details: { byteOffset: 11, kind: "malformed-quote" },
+  });
+  expect(failure.message).toContain("quoted field is not terminated");
+});
+
 test("cancels a large source open without consuming a Worker source slot", async ({ page }) => {
   await page.goto("/test/browser/harness.html");
 

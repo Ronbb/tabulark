@@ -71,7 +71,13 @@
       input:focus-visible,
       select:focus-visible,
       summary:focus-visible,
+      #status:focus-visible,
       .file-label:focus-within {
+        outline: 3px solid #7c3aed;
+        outline-offset: 2px;
+      }
+
+      #status:focus {
         outline: 3px solid #7c3aed;
         outline-offset: 2px;
       }
@@ -708,6 +714,45 @@
         }
       }
 
+      @media (forced-colors: active) {
+        body { background: Canvas; }
+        .badge,
+        .state-badge,
+        .playground-label,
+        .toolbar,
+        .operation-panel,
+        .workspace,
+        .principle-card,
+        .flow-step,
+        .capability-list li,
+        button,
+        .file-label,
+        select,
+        input {
+          border-color: CanvasText;
+        }
+        .badge,
+        .state-badge,
+        .playground-label {
+          background: Canvas;
+          color: CanvasText;
+        }
+        progress { border: 1px solid CanvasText; }
+        button:focus-visible,
+        input:focus-visible,
+        select:focus-visible,
+        summary:focus-visible,
+        #status:focus,
+        #status:focus-visible,
+        .file-label:focus-within,
+        .header-nav a:focus-visible,
+        .header-github:focus-visible,
+        .hero-actions a:focus-visible,
+        .footer-link:focus-visible {
+          outline-color: Highlight;
+        }
+      }
+
       @media (prefers-color-scheme: dark) {
         :root { color: #edf0f7; background: #111827; }
         .app-header, .toolbar, .operation-panel, .workspace {
@@ -998,7 +1043,7 @@
             </section>
             <div class="status-row">
               <span class="privacy-note">Local-only preview · no file upload</span>
-              <span class="shortcuts">Drag a column boundary to resize · Shift + arrows selects a range</span>
+              <span class="shortcuts">Tab to a column boundary · arrows resize · Enter fits visible content</span>
             </div>
           </section>
         </div>

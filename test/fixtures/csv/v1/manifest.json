@@ -232,6 +232,120 @@
         "byteOffset": 8,
         "messageContains": "quote appears inside an unquoted field"
       }
+    },
+    {
+      "id": "rust-csv-strange-strict",
+      "file": "rust-csv-strange.csv",
+      "options": {
+        "format": "csv",
+        "header": false,
+        "mode": "strict"
+      },
+      "expect": {
+        "status": "error",
+        "code": "PARSE_FAILED",
+        "kind": "malformed-quote",
+        "byteOffset": 3,
+        "messageContains": "unexpected data follows a closing quote"
+      }
+    },
+    {
+      "id": "rust-csv-uspop-null-strict",
+      "file": "rust-csv-uspop-null.csv",
+      "options": {
+        "format": "csv",
+        "header": true,
+        "mode": "strict"
+      },
+      "expect": {
+        "status": "success",
+        "metadata": {
+          "rows": 100,
+          "columns": ["City", "State", "Population", "Latitude", "Longitude"],
+          "schemaVersion": 1
+        },
+        "samples": [
+          {
+            "row": 0,
+            "values": ["Davidsons Landing", "AK", "", "65.2419444", "-165.2716667"]
+          },
+          {
+            "row": 2,
+            "values": ["Oakman", "AL", "", "33.7133333", "-87.3886111"]
+          },
+          {
+            "row": 41,
+            "values": ["Flint Springs", "KY", "NULL", "37.3433333", "-86.7136111"]
+          },
+          {
+            "row": 99,
+            "values": ["Cody", "WY", "9161", "44.5263889", "-109.0558333"]
+          }
+        ],
+        "warnings": []
+      }
+    },
+    {
+      "id": "rust-csv-uspop-latin1-strict",
+      "file": "rust-csv-uspop-latin1.csv",
+      "options": {
+        "format": "csv",
+        "header": true,
+        "mode": "strict"
+      },
+      "source": {
+        "encoding": "latin1"
+      },
+      "expect": {
+        "status": "error",
+        "code": "PARSE_FAILED",
+        "kind": "invalid-utf8",
+        "row": 2,
+        "byteOffset": 125,
+        "messageContains": "field contains invalid UTF-8"
+      }
+    },
+    {
+      "id": "rust-csv-uspop-latin1-lenient",
+      "file": "rust-csv-uspop-latin1.csv",
+      "options": {
+        "format": "csv",
+        "header": true,
+        "mode": "lenient"
+      },
+      "source": {
+        "encoding": "latin1"
+      },
+      "expect": {
+        "status": "success",
+        "metadata": {
+          "rows": 100,
+          "columns": ["City", "State", "Population", "Latitude", "Longitude"],
+          "schemaVersion": 1
+        },
+        "samples": [
+          {
+            "row": 0,
+            "values": ["Davidsons Landing", "AK", "", "65.2419444", "-165.2716667"]
+          },
+          {
+            "row": 2,
+            "values": ["�akman", "AL", "", "33.7133333", "-87.3886111"]
+          },
+          {
+            "row": 99,
+            "values": ["Cody", "WY", "9161", "44.5263889", "-109.0558333"]
+          }
+        ],
+        "warnings": [
+          {
+            "kind": "invalid-utf8",
+            "row": 2,
+            "byteOffset": 125,
+            "messageContains": "field contains invalid UTF-8"
+          }
+        ]
+      }
     }
   ]
 }

@@ -77,12 +77,33 @@ export const DEFAULT_CANVAS_TABLE_THEME: Readonly<CanvasTableTheme> = Object.fre
   headerFont: '600 13px ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif',
 });
 
+/** Resolves author-independent system colors for Windows High Contrast and other forced palettes. */
+export function forcedColorsCanvasTableTheme(
+  base: Readonly<CanvasTableTheme> = DEFAULT_CANVAS_TABLE_THEME,
+): Readonly<CanvasTableTheme> {
+  return Object.freeze({
+    ...base,
+    background: "Canvas",
+    foreground: "CanvasText",
+    mutedForeground: "GrayText",
+    headerBackground: "Canvas",
+    headerForeground: "CanvasText",
+    alternateRowBackground: "Canvas",
+    gridLine: "CanvasText",
+    selectionBackground: "Highlight",
+    selectionBorder: "Highlight",
+    activeCellBorder: "CanvasText",
+    loadingBackground: "GrayText",
+  });
+}
+
 /** Paints one viewport frame and keeps the backing store device-pixel aware. */
 export class CanvasTablePainter {
   readonly canvas: HTMLCanvasElement;
   readonly #context: CanvasRenderingContext2D;
-  readonly #theme: Readonly<CanvasTableTheme>;
+  #theme: Readonly<CanvasTableTheme>;
   readonly #maxDevicePixelRatio: number;
+  #forcedColors: boolean;
 
   #cssWidth = 0;
   #cssHeight = 0;
@@ -93,6 +114,7 @@ export class CanvasTablePainter {
     options: {
       readonly theme?: Partial<CanvasTableTheme>;
       readonly maxDevicePixelRatio?: number;
+      readonly forcedColors?: boolean;
     } = {},
   ) {
     const context = canvas.getContext("2d", { alpha: false });
@@ -103,6 +125,12 @@ export class CanvasTablePainter {
     this.#context = context;
     this.#theme = Object.freeze({ ...DEFAULT_CANVAS_TABLE_THEME, ...options.theme });
     this.#maxDevicePixelRatio = positive(options.maxDevicePixelRatio, Number.POSITIVE_INFINITY);
+    this.#forcedColors = options.forcedColors ?? false;
+  }
+
+  setTheme(theme: Readonly<CanvasTableTheme>, options: { readonly forcedColors?: boolean } = {}): void {
+    this.#theme = Object.freeze({ ...theme });
+    this.#forcedColors = options.forcedColors ?? false;
   }
 
   paint(snapshot: CanvasPaintSnapshot): void {
@@ -303,16 +331,23 @@ export class CanvasTablePainter {
         const right = Math.min(snapshot.width, lastColumn.x + lastColumn.width);
         const bottom = Math.min(snapshot.height, lastRow.y + lastRow.height);
         if (right > x && bottom > y) {
+          context.save();
           context.fillStyle = theme.selectionBackground;
+          if (this.#forcedColors) {
+            context.globalAlpha = 0.28;
+          }
           context.fillRect(x, y, right - x, bottom - y);
+          context.restore();
           context.strokeStyle = theme.selectionBorder;
-          context.lineWidth = 1;
+          context.lineWidth = this.#forcedColors ? 2 : 1;
+          context.setLineDash(this.#forcedColors ? [4, 2] : []);
           context.strokeRect(
-            x + 0.5,
-            y + 0.5,
-            Math.max(0, right - x - 1),
-            Math.max(0, bottom - y - 1),
+            x + context.lineWidth / 2,
+            y + context.lineWidth / 2,
+            Math.max(0, right - x - context.lineWidth),
+            Math.max(0, bottom - y - context.lineWidth),
           );
+          context.setLineDash([]);
         }
       }
     }
@@ -329,12 +364,13 @@ export class CanvasTablePainter {
       const activeRight = Math.min(snapshot.width, activeColumn.x + activeColumn.width);
       const activeBottom = Math.min(snapshot.height, activeRow.y + activeRow.height);
       context.strokeStyle = theme.activeCellBorder;
-      context.lineWidth = 2;
+      context.lineWidth = this.#forcedColors ? 3 : 2;
+      context.setLineDash([]);
       context.strokeRect(
-        activeX + 1,
-        activeY + 1,
-        Math.max(0, activeRight - activeX - 2),
-        Math.max(0, activeBottom - activeY - 2),
+        activeX + context.lineWidth / 2,
+        activeY + context.lineWidth / 2,
+        Math.max(0, activeRight - activeX - context.lineWidth),
+        Math.max(0, activeBottom - activeY - context.lineWidth),
       );
     }
   }

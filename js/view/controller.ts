@@ -48,6 +48,8 @@ interface NormalizedOptions extends LayoutOptions {
 export interface TableViewController {
   readonly metadata: TableHandle["metadata"];
   readonly columnWidths: readonly number[];
+  readonly minColumnWidth: number;
+  readonly maxColumnWidth: number;
   getSnapshot(): Readonly<TableViewSnapshot>;
   subscribe(listener: (snapshot: Readonly<TableViewSnapshot>) => void): Unsubscribe;
   updateViewport(viewport: ViewportUpdate): void;
@@ -57,6 +59,7 @@ export interface TableViewController {
   clearSelection(): void;
   moveActive(command: NavigationCommand, options?: MoveActiveCellOptions): void;
   ensureCellVisible(cell: CellPosition): void;
+  ensureColumnVisible(columnIndex: number): void;
   resizeColumn(columnIndex: number, width: number): void;
   autosizeColumn(columnIndex: number, measuredWidth: number): void;
   hitTest(x: number, y: number, resizeHandleWidth?: number): HitTestResult;
@@ -118,6 +121,14 @@ class Controller implements TableViewController {
 
   get columnWidths(): readonly number[] {
     return Object.freeze([...this.#columnWidths]);
+  }
+
+  get minColumnWidth(): number {
+    return this.#options.minColumnWidth;
+  }
+
+  get maxColumnWidth(): number {
+    return this.#options.maxColumnWidth;
   }
 
   getSnapshot(): Readonly<TableViewSnapshot> {
@@ -226,6 +237,14 @@ class Controller implements TableViewController {
       this.#snapshot.layout.columnCount,
     );
     if (next !== null && this.#scrollCellIntoView(next)) {
+      this.#advanceGeneration();
+    }
+  }
+
+  ensureColumnVisible(columnIndex: number): void {
+    this.#assertOpen();
+    assertColumnIndex(columnIndex, this.#columnWidths.length);
+    if (this.#scrollColumnIntoView(columnIndex)) {
       this.#advanceGeneration();
     }
   }
@@ -443,6 +462,24 @@ class Controller implements TableViewController {
       return false;
     }
     this.#viewport = Object.freeze({ ...this.#viewport, scrollLeft, scrollTop });
+    return true;
+  }
+
+  #scrollColumnIntoView(columnIndex: number): boolean {
+    const layout = this.#snapshot.layout;
+    const offsets = columnOffsets(this.#columnWidths);
+    const logicalLeft = revealOffset(
+      layout.horizontal.logicalOffset,
+      layout.bodyWidth,
+      offsets[columnIndex]!,
+      offsets[columnIndex + 1]!,
+      layout.horizontal.logicalMaxOffset,
+    );
+    const scrollLeft = logicalToPhysicalOffset(layout.horizontal, logicalLeft);
+    if (scrollLeft === this.#viewport.scrollLeft) {
+      return false;
+    }
+    this.#viewport = Object.freeze({ ...this.#viewport, scrollLeft });
     return true;
   }
 

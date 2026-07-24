@@ -5,6 +5,7 @@ import { AccessibleViewportGrid, type AccessibleGridRow } from "./accessible-gri
 import {
   CanvasTablePainter,
   DEFAULT_CANVAS_TABLE_THEME,
+  forcedColorsCanvasTableTheme,
   type CanvasPaintColumn,
   type CanvasPaintRow,
   type CanvasTableTheme,
@@ -18,7 +19,12 @@ import type {
 } from "./types.js";
 
 const RESIZE_HANDLE_WIDTH = 8;
+const RESIZE_TARGET_SIZE = 44;
+const KEYBOARD_RESIZE_STEP = 8;
+const KEYBOARD_RESIZE_COARSE_STEP = 32;
 const AUTOSIZE_HORIZONTAL_PADDING = 24;
+
+let nextViewId = 1;
 
 export interface CanvasTableViewOptions {
   readonly container: HTMLElement;
@@ -66,6 +72,7 @@ class View implements CanvasTableView {
   readonly #surface: HTMLDivElement;
   readonly #canvas: HTMLCanvasElement;
   readonly #resizeLayer: HTMLDivElement;
+  readonly #resizeInstructions: HTMLDivElement;
   readonly #message: HTMLDivElement;
   readonly #accessibleGrid: AccessibleViewportGrid;
   readonly #painter: CanvasTablePainter;
@@ -73,14 +80,19 @@ class View implements CanvasTableView {
   readonly #ownsController: boolean;
   readonly #writeClipboard: ((text: string) => Promise<void> | void) | undefined;
   readonly #onError: ((error: unknown) => void) | undefined;
-  readonly #theme: Readonly<CanvasTableTheme>;
+  readonly #baseTheme: Readonly<CanvasTableTheme>;
+  #theme: Readonly<CanvasTableTheme>;
+  readonly #forcedColorsQuery: MediaQueryList;
   readonly #unsubscribe: () => void;
   readonly #resizeObserver?: ResizeObserver;
+  readonly #resizeHandles = new Map<string, HTMLDivElement>();
 
   #snapshot: Readonly<TableViewSnapshot>;
   #frame = 0;
   #interaction: PointerInteraction | null = null;
   #copyAbort: AbortController | null = null;
+  #announcementFrame = 0;
+  #forcedColors = false;
   #destroyed = false;
 
   constructor(options: CanvasTableViewOptions) {
@@ -96,7 +108,12 @@ class View implements CanvasTableView {
     this.#snapshot = this.controller.getSnapshot();
     this.#writeClipboard = options.writeClipboard;
     this.#onError = options.onError;
-    this.#theme = Object.freeze({ ...DEFAULT_CANVAS_TABLE_THEME, ...options.theme });
+    this.#baseTheme = Object.freeze({ ...DEFAULT_CANVAS_TABLE_THEME, ...options.theme });
+    this.#forcedColorsQuery = ownerWindow.matchMedia("(forced-colors: active)");
+    this.#forcedColors = this.#forcedColorsQuery.matches;
+    this.#theme = this.#forcedColors
+      ? forcedColorsCanvasTableTheme(this.#baseTheme)
+      : this.#baseTheme;
 
     this.element = ownerDocument.createElement("div");
     this.element.className = "tabulark-view";
@@ -164,7 +181,6 @@ class View implements CanvasTableView {
 
     this.#resizeLayer = ownerDocument.createElement("div");
     this.#resizeLayer.className = "tabulark-resize-layer";
-    this.#resizeLayer.setAttribute("aria-hidden", "true");
     Object.assign(this.#resizeLayer.style, {
       left: "0",
       pointerEvents: "none",
@@ -172,6 +188,12 @@ class View implements CanvasTableView {
       top: "0",
       width: "100%",
     });
+
+    this.#resizeInstructions = ownerDocument.createElement("div");
+    this.#resizeInstructions.id = `tabulark-resize-instructions-${nextViewId}`;
+    nextViewId += 1;
+    this.#resizeInstructions.textContent = "Use Left and Right Arrow keys to resize. Hold Shift for larger steps. Home and End use the minimum and maximum widths. Enter fits the visible content.";
+    visuallyHide(this.#resizeInstructions);
 
     this.#message = ownerDocument.createElement("div");
     this.#message.className = "tabulark-message";
@@ -198,10 +220,12 @@ class View implements CanvasTableView {
     );
     this.#painter = new CanvasTablePainter(this.#canvas, {
       theme: this.#theme,
+      forcedColors: this.#forcedColors,
       ...(options.maxDevicePixelRatio === undefined
         ? {}
         : { maxDevicePixelRatio: options.maxDevicePixelRatio }),
     });
+    this.#applyThemeToElements();
 
     this.#surface.append(this.#canvas, this.#resizeLayer);
     this.#scrollHost.append(this.#spacer, this.#surface);
@@ -210,12 +234,16 @@ class View implements CanvasTableView {
       this.#message,
       this.#accessibleGrid.element,
       this.#accessibleGrid.statusElement,
+      this.#resizeInstructions,
     );
     options.container.append(this.element);
 
     this.#unsubscribe = this.controller.subscribe((snapshot) => {
       this.#snapshot = snapshot;
       if (this.#isTerminal()) {
+        if (this.#resizeLayer.contains(this.element.ownerDocument.activeElement)) {
+          this.#accessibleGrid.focus({ preventScroll: true });
+        }
         this.#cancelInteraction();
         this.#copyAbort?.abort();
         this.#copyAbort = null;
@@ -231,6 +259,7 @@ class View implements CanvasTableView {
     this.element.addEventListener("keydown", this.#onKeyDown);
     this.element.addEventListener("focusin", this.#onFocusIn);
     this.element.addEventListener("focusout", this.#onFocusOut);
+    this.#forcedColorsQuery.addEventListener("change", this.#onForcedColorsChange);
 
     if (typeof ownerWindow.ResizeObserver === "function") {
       this.#resizeObserver = new ownerWindow.ResizeObserver(() => this.#updateViewport());
@@ -259,6 +288,10 @@ class View implements CanvasTableView {
       this.#ownerWindow.cancelAnimationFrame(this.#frame);
       this.#frame = 0;
     }
+    if (this.#announcementFrame !== 0) {
+      this.#ownerWindow.cancelAnimationFrame(this.#announcementFrame);
+      this.#announcementFrame = 0;
+    }
     this.#resizeObserver?.disconnect();
     this.#ownerWindow.removeEventListener("resize", this.#onWindowResize);
     this.#unsubscribe();
@@ -271,6 +304,7 @@ class View implements CanvasTableView {
     this.element.removeEventListener("keydown", this.#onKeyDown);
     this.element.removeEventListener("focusin", this.#onFocusIn);
     this.element.removeEventListener("focusout", this.#onFocusOut);
+    this.#forcedColorsQuery.removeEventListener("change", this.#onForcedColorsChange);
     this.#accessibleGrid.destroy();
     this.element.remove();
     if (this.#ownsController) {
@@ -290,21 +324,46 @@ class View implements CanvasTableView {
     this.#updateViewport();
   };
 
-  readonly #onFocusIn = (): void => {
-    this.element.style.boxShadow = `inset 0 0 0 2px ${this.#theme.activeCellBorder}`;
+  readonly #onForcedColorsChange = (event: MediaQueryListEvent): void => {
+    if (this.#destroyed) {
+      return;
+    }
+    this.#forcedColors = event.matches;
+    this.#theme = this.#forcedColors
+      ? forcedColorsCanvasTableTheme(this.#baseTheme)
+      : this.#baseTheme;
+    this.#painter.setTheme(this.#theme, { forcedColors: this.#forcedColors });
+    this.#applyThemeToElements();
+    this.#scheduleFrame();
+  };
+
+  readonly #onFocusIn = (event: FocusEvent): void => {
+    this.element.style.outline = `2px solid ${this.#focusColor()}`;
+    this.element.style.outlineOffset = "-2px";
+    const resizeHandle = this.#resizeHandleFromTarget(event.target);
+    if (resizeHandle !== null) {
+      resizeHandle.style.outline = `2px solid ${this.#focusColor()}`;
+      resizeHandle.style.outlineOffset = "-2px";
+      return;
+    }
     if (
       !this.#isTerminal()
       && this.#snapshot.activeCell === null
       && this.#hasCells()
+      && event.target === this.#accessibleGrid.element
     ) {
       this.controller.setActiveCell({ rowIndex: 0, columnIndex: 0 });
     }
   };
 
-  readonly #onFocusOut = (): void => {
+  readonly #onFocusOut = (event: FocusEvent): void => {
+    const resizeHandle = this.#resizeHandleFromTarget(event.target);
+    if (resizeHandle !== null) {
+      resizeHandle.style.outline = "none";
+    }
     queueMicrotask(() => {
       if (!this.#destroyed && !this.element.contains(this.element.ownerDocument.activeElement)) {
-        this.element.style.boxShadow = "none";
+        this.element.style.outline = "none";
       }
     });
   };
@@ -388,11 +447,18 @@ class View implements CanvasTableView {
     if (this.#interaction?.pointerId !== event.pointerId) {
       return;
     }
+    const resizedColumn = this.#interaction.kind === "resize"
+      ? this.#interaction.columnIndex
+      : null;
     if (this.#surface.hasPointerCapture(event.pointerId)) {
       this.#surface.releasePointerCapture(event.pointerId);
     }
     this.#interaction = null;
     this.#surface.style.cursor = "default";
+    if (resizedColumn !== null) {
+      this.controller.ensureColumnVisible(resizedColumn);
+      this.#announceColumnWidth(resizedColumn, false);
+    }
   };
 
   readonly #onDoubleClick = (event: MouseEvent): void => {
@@ -409,9 +475,20 @@ class View implements CanvasTableView {
     }
     event.preventDefault();
     this.controller.autosizeColumn(hit.columnIndex, this.#measureColumn(hit.columnIndex));
+    this.controller.ensureColumnVisible(hit.columnIndex);
+    this.#announceColumnWidth(hit.columnIndex, true);
   };
 
   readonly #onKeyDown = (event: KeyboardEvent): void => {
+    const resizeColumn = this.#resizeColumnFromTarget(event.target);
+    if (resizeColumn !== null) {
+      if (this.#handleResizeKeyDown(event, resizeColumn)) {
+        return;
+      }
+      if (keyboardCommand(event) !== null) {
+        return;
+      }
+    }
     if (this.#isTerminal() || event.altKey) {
       return;
     }
@@ -435,6 +512,47 @@ class View implements CanvasTableView {
       scrollIntoView: true,
     });
   };
+
+  #handleResizeKeyDown(event: KeyboardEvent, columnIndex: number): boolean {
+    if (this.#isTerminal() || event.altKey || event.ctrlKey || event.metaKey) {
+      return false;
+    }
+    const width = this.controller.columnWidths[columnIndex];
+    if (width === undefined) {
+      return false;
+    }
+    const step = event.shiftKey ? KEYBOARD_RESIZE_COARSE_STEP : KEYBOARD_RESIZE_STEP;
+    let nextWidth: number | null = null;
+    switch (event.key) {
+      case "ArrowLeft":
+        nextWidth = width - step;
+        break;
+      case "ArrowRight":
+        nextWidth = width + step;
+        break;
+      case "Home":
+        nextWidth = this.controller.minColumnWidth;
+        break;
+      case "End":
+        nextWidth = this.controller.maxColumnWidth;
+        break;
+      case "Enter":
+        nextWidth = this.#measureColumn(columnIndex);
+        break;
+      default:
+        return false;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.key === "Enter") {
+      this.controller.autosizeColumn(columnIndex, nextWidth);
+    } else {
+      this.controller.resizeColumn(columnIndex, nextWidth);
+    }
+    this.controller.ensureColumnVisible(columnIndex);
+    this.#announceColumnWidth(columnIndex, event.key === "Enter");
+    return true;
+  }
 
   #updateViewport(): void {
     if (this.#isTerminal()) {
@@ -529,31 +647,85 @@ class View implements CanvasTableView {
   }
 
   #renderResizeHandles(snapshot: Readonly<TableViewSnapshot>): void {
-    const fragment = this.element.ownerDocument.createDocumentFragment();
+    const visibleIds = new Set<string>();
+    if (this.#isTerminal()) {
+      this.#removeStaleResizeHandles(visibleIds);
+      return;
+    }
     for (const column of snapshot.layout.visibleColumns) {
       const boundary = column.x + column.width;
       if (boundary < snapshot.layout.rowHeaderWidth || boundary > snapshot.layout.width) {
         continue;
       }
-      const handle = this.element.ownerDocument.createElement("div");
+      visibleIds.add(column.id);
+      let handle = this.#resizeHandles.get(column.id);
+      if (handle === undefined) {
+        handle = this.element.ownerDocument.createElement("div");
+        handle.setAttribute("role", "separator");
+        handle.setAttribute("aria-orientation", "vertical");
+        handle.setAttribute("aria-controls", this.#accessibleGrid.element.id);
+        handle.setAttribute("aria-describedby", this.#resizeInstructions.id);
+        handle.setAttribute("aria-keyshortcuts", "ArrowLeft ArrowRight Home End Enter");
+        handle.tabIndex = 0;
+        Object.assign(handle.style, {
+          background: "transparent",
+          boxSizing: "border-box",
+          cursor: "col-resize",
+          outline: "none",
+          pointerEvents: "auto",
+          position: "absolute",
+          top: "0",
+          touchAction: "none",
+          width: `${RESIZE_TARGET_SIZE}px`,
+        });
+        const line = this.element.ownerDocument.createElement("div");
+        line.dataset.tabularkResizeLine = "";
+        line.setAttribute("aria-hidden", "true");
+        Object.assign(line.style, {
+          pointerEvents: "none",
+          position: "absolute",
+          top: "0",
+        });
+        handle.append(line);
+        this.#resizeHandles.set(column.id, handle);
+        this.#resizeLayer.append(handle);
+      }
       handle.dataset.columnResize = String(column.index);
-      handle.setAttribute("role", "separator");
+      handle.dataset.columnId = column.id;
       handle.setAttribute("aria-label", `Resize ${column.name} column`);
-      handle.setAttribute("aria-orientation", "vertical");
-      handle.setAttribute("aria-valuenow", String(Math.round(column.width)));
+      handle.setAttribute("aria-valuemin", String(this.controller.minColumnWidth));
+      handle.setAttribute("aria-valuemax", String(this.controller.maxColumnWidth));
+      handle.setAttribute("aria-valuenow", String(column.width));
+      handle.setAttribute("aria-valuetext", `${formatWidth(column.width)} CSS pixels`);
       Object.assign(handle.style, {
-        cursor: "col-resize",
-        height: `${snapshot.layout.headerHeight}px`,
-        left: `${boundary - RESIZE_HANDLE_WIDTH / 2}px`,
-        pointerEvents: "auto",
-        position: "absolute",
-        top: "0",
-        width: `${RESIZE_HANDLE_WIDTH}px`,
+        height: `${Math.max(RESIZE_TARGET_SIZE, snapshot.layout.headerHeight)}px`,
+        left: `${boundary - RESIZE_TARGET_SIZE / 2}px`,
       });
-      fragment.append(handle);
+      const line = handle.firstElementChild as HTMLElement | null;
+      if (line !== null) {
+        Object.assign(line.style, {
+          background: this.#theme.gridLine,
+          height: `${snapshot.layout.headerHeight}px`,
+          left: `${(RESIZE_TARGET_SIZE - (this.#forcedColors ? 2 : 1)) / 2}px`,
+          width: `${this.#forcedColors ? 2 : 1}px`,
+        });
+      }
     }
-    this.#resizeLayer.style.height = `${snapshot.layout.headerHeight}px`;
-    this.#resizeLayer.replaceChildren(fragment);
+    this.#resizeLayer.style.height = `${Math.max(RESIZE_TARGET_SIZE, snapshot.layout.headerHeight)}px`;
+    this.#removeStaleResizeHandles(visibleIds);
+  }
+
+  #removeStaleResizeHandles(visibleIds: ReadonlySet<string>): void {
+    for (const [columnId, handle] of this.#resizeHandles) {
+      if (visibleIds.has(columnId)) {
+        continue;
+      }
+      if (handle.contains(this.element.ownerDocument.activeElement)) {
+        this.#accessibleGrid.focus({ preventScroll: true });
+      }
+      handle.remove();
+      this.#resizeHandles.delete(columnId);
+    }
   }
 
   #renderAccessibleGrid(snapshot: Readonly<TableViewSnapshot>): void {
@@ -646,15 +818,26 @@ class View implements CanvasTableView {
   }
 
   #resizeColumnFromTarget(target: EventTarget | null): number | null {
-    if (!(target instanceof this.#ownerWindow.HTMLElement)) {
+    const handle = this.#resizeHandleFromTarget(target);
+    if (handle === null) {
       return null;
     }
-    const value = target.dataset.columnResize;
+    const value = handle.dataset.columnResize;
     if (value === undefined) {
       return null;
     }
     const columnIndex = Number(value);
     return Number.isSafeInteger(columnIndex) ? columnIndex : null;
+  }
+
+  #resizeHandleFromTarget(target: EventTarget | null): HTMLDivElement | null {
+    if (!(target instanceof this.#ownerWindow.HTMLElement)) {
+      return null;
+    }
+    const handle = target.closest<HTMLElement>("[data-column-resize]");
+    return handle instanceof this.#ownerWindow.HTMLDivElement && this.#resizeLayer.contains(handle)
+      ? handle
+      : null;
   }
 
   #measureColumn(columnIndex: number): number {
@@ -723,6 +906,46 @@ class View implements CanvasTableView {
       return "Loading visible table cells.";
     }
     return `${snapshot.layout.rowCount} rows and ${snapshot.layout.columnCount} columns.`;
+  }
+
+  #announceColumnWidth(columnIndex: number, fitted: boolean): void {
+    const column = this.#snapshot.metadata.schema.columns[columnIndex];
+    const width = this.controller.columnWidths[columnIndex];
+    if (column === undefined || width === undefined) {
+      return;
+    }
+    if (this.#announcementFrame !== 0) {
+      this.#ownerWindow.cancelAnimationFrame(this.#announcementFrame);
+    }
+    const action = fitted ? "fit to" : "width";
+    const qualifier = fitted ? " using visible content" : "";
+    this.#announcementFrame = this.#ownerWindow.requestAnimationFrame(() => {
+      this.#announcementFrame = 0;
+      if (!this.#destroyed) {
+        this.#accessibleGrid.statusElement.textContent = `${column.name} column ${action} ${formatWidth(width)} CSS pixels${qualifier}.`;
+      }
+    });
+  }
+
+  #applyThemeToElements(): void {
+    this.element.dataset.tabularkForcedColors = this.#forcedColors ? "active" : "none";
+    this.element.style.background = this.#theme.background;
+    this.element.style.borderColor = this.#theme.gridLine;
+    this.element.style.color = this.#theme.foreground;
+    this.#message.style.background = this.#theme.background;
+    this.#message.style.color = this.#theme.mutedForeground;
+    this.#canvas.style.forcedColorAdjust = this.#forcedColors ? "none" : "auto";
+    if (this.element.contains(this.element.ownerDocument.activeElement)) {
+      this.element.style.outline = `2px solid ${this.#focusColor()}`;
+      const handle = this.#resizeHandleFromTarget(this.element.ownerDocument.activeElement);
+      if (handle !== null) {
+        handle.style.outline = `2px solid ${this.#focusColor()}`;
+      }
+    }
+  }
+
+  #focusColor(): string {
+    return this.#forcedColors ? "Highlight" : this.#theme.activeCellBorder;
   }
 
   #tableLabel(): string {
@@ -803,4 +1026,25 @@ function errorMessage(error: unknown): string {
     return error.message;
   }
   return typeof error === "string" ? error : "Unknown error";
+}
+
+function formatWidth(width: number): string {
+  return Number.isInteger(width)
+    ? String(width)
+    : width.toFixed(2).replace(/(?:\.0+|(?<decimal>\.\d*?)0+)$/, "$<decimal>");
+}
+
+function visuallyHide(element: HTMLElement): void {
+  Object.assign(element.style, {
+    border: "0",
+    clip: "rect(0 0 0 0)",
+    clipPath: "inset(50%)",
+    height: "1px",
+    margin: "-1px",
+    overflow: "hidden",
+    padding: "0",
+    position: "absolute",
+    whiteSpace: "nowrap",
+    width: "1px",
+  });
 }

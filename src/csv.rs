@@ -1512,10 +1512,17 @@ mod tests {
         Crlf,
     }
 
+    #[derive(Clone, Copy, Debug, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    enum CorpusEncoding {
+        Latin1,
+    }
+
     #[derive(Debug, Default, Deserialize)]
     #[serde(deny_unknown_fields, rename_all = "camelCase")]
     struct CorpusSource {
         line_endings: Option<CorpusLineEndings>,
+        encoding: Option<CorpusEncoding>,
         #[serde(default)]
         utf8_bom: bool,
         #[serde(default)]
@@ -1527,7 +1534,10 @@ mod tests {
     enum CorpusExpectation {
         Success {
             metadata: CorpusMetadata,
-            rows: Vec<Vec<Option<String>>>,
+            #[serde(default)]
+            rows: Option<Vec<Vec<Option<String>>>>,
+            #[serde(default)]
+            samples: Vec<CorpusSample>,
             #[serde(default)]
             warnings: Vec<CorpusDiagnostic>,
         },
@@ -1541,6 +1551,13 @@ mod tests {
             #[serde(rename = "messageContains")]
             message_contains: String,
         },
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CorpusSample {
+        row: u64,
+        values: Vec<Option<String>>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -1760,8 +1777,17 @@ mod tests {
                     CorpusExpectation::Success {
                         metadata,
                         rows,
+                        samples,
                         warnings,
-                    } => assert_success_case(case, &bytes, chunk_size, metadata, rows, warnings),
+                    } => assert_success_case(
+                        case,
+                        &bytes,
+                        chunk_size,
+                        metadata,
+                        rows.as_deref(),
+                        samples,
+                        warnings,
+                    ),
                     expected @ CorpusExpectation::Error { .. } => {
                         assert_error_case(case, &bytes, chunk_size, expected)
                     }
@@ -1806,6 +1832,22 @@ mod tests {
                 );
             }
         }
+        if let Some(CorpusEncoding::Latin1) = case.source.encoding {
+            let text = std::str::from_utf8(&bytes).unwrap_or_else(|error| {
+                panic!("fixture {} must be UTF-8 review text: {error}", case.file)
+            });
+            bytes = text
+                .chars()
+                .map(|character| {
+                    u8::try_from(u32::from(character)).unwrap_or_else(|_| {
+                        panic!(
+                            "fixture {} contains {:?}, which is outside Latin-1",
+                            case.file, character
+                        )
+                    })
+                })
+                .collect();
+        }
         if case.source.utf8_bom {
             let mut with_bom = Vec::with_capacity(UTF8_BOM.len() + bytes.len());
             with_bom.extend_from_slice(UTF8_BOM);
@@ -1832,7 +1874,8 @@ mod tests {
         bytes: &[u8],
         chunk_size: usize,
         expected_metadata: &CorpusMetadata,
-        expected_rows: &[Vec<Option<String>>],
+        expected_rows: Option<&[Vec<Option<String>>]>,
+        expected_samples: &[CorpusSample],
         expected_warnings: &[CorpusDiagnostic],
     ) {
         let source =
@@ -1923,18 +1966,47 @@ mod tests {
             assert!(column.nullable(), "case {} chunk {chunk_size}", case.id);
         }
 
-        assert_eq!(
-            expected_rows.len(),
-            usize::try_from(expected_metadata.rows).expect("row count"),
-            "case {} manifest metadata and batch rows disagree",
+        assert!(
+            expected_rows.is_some() || !expected_samples.is_empty(),
+            "case {} must declare full rows or sampled rows",
             case.id
         );
-        for row in expected_rows {
+        if let Some(expected_rows) = expected_rows {
+            assert_eq!(
+                expected_rows.len(),
+                usize::try_from(expected_metadata.rows).expect("row count"),
+                "case {} manifest metadata and batch rows disagree",
+                case.id
+            );
+        }
+        for row in expected_rows.into_iter().flatten() {
             assert_eq!(
                 row.len(),
                 expected_metadata.columns.len(),
                 "case {} has a non-rectangular expected batch",
                 case.id
+            );
+        }
+        let mut sampled_rows = HashSet::new();
+        for sample in expected_samples {
+            assert!(
+                sample.row < expected_metadata.rows,
+                "case {} sample row {} exceeds the table",
+                case.id,
+                sample.row
+            );
+            assert!(
+                sampled_rows.insert(sample.row),
+                "case {} repeats sample row {}",
+                case.id,
+                sample.row
+            );
+            assert_eq!(
+                sample.values.len(),
+                expected_metadata.columns.len(),
+                "case {} sample row {} has the wrong width",
+                case.id,
+                sample.row
             );
         }
 
@@ -1982,15 +2054,27 @@ mod tests {
                 case.id
             )
         });
-        assert_batch(
-            &full_batch,
-            full_request,
-            true,
-            expected_rows,
-            expected_metadata.schema_version,
-            &case.id,
-            chunk_size,
-        );
+        if let Some(expected_rows) = expected_rows {
+            assert_batch(
+                &full_batch,
+                full_request,
+                true,
+                expected_rows,
+                expected_metadata.schema_version,
+                &case.id,
+                chunk_size,
+            );
+        } else {
+            assert_batch_shape(
+                &full_batch,
+                full_request,
+                true,
+                usize::try_from(rows).expect("row count"),
+                expected_metadata.schema_version,
+                &case.id,
+                chunk_size,
+            );
+        }
 
         let overrun_request = RangeRequest::new(0, rows + 1, 0, columns).expect("overrun range");
         let overrun_batch = source.read_range(overrun_request).unwrap_or_else(|error| {
@@ -2000,19 +2084,65 @@ mod tests {
             )
         });
         let returned_overrun = RangeRequest::new(0, rows, 0, columns).expect("returned range");
-        assert_batch(
-            &overrun_batch,
-            returned_overrun,
-            false,
-            expected_rows,
-            expected_metadata.schema_version,
-            &case.id,
-            chunk_size,
-        );
+        if let Some(expected_rows) = expected_rows {
+            assert_batch(
+                &overrun_batch,
+                returned_overrun,
+                false,
+                expected_rows,
+                expected_metadata.schema_version,
+                &case.id,
+                chunk_size,
+            );
+        } else {
+            assert_batch_shape(
+                &overrun_batch,
+                returned_overrun,
+                false,
+                usize::try_from(rows).expect("row count"),
+                expected_metadata.schema_version,
+                &case.id,
+                chunk_size,
+            );
+        }
+
+        for sample in expected_samples {
+            let sample_request =
+                RangeRequest::new(sample.row, 1, 0, columns).expect("sample range");
+            let sample_batch = source.read_range(sample_request).unwrap_or_else(|error| {
+                panic!(
+                    "case {} did not decode sample row {} at chunk size {chunk_size}: {error:?}",
+                    case.id, sample.row
+                )
+            });
+            assert_batch(
+                &sample_batch,
+                sample_request,
+                true,
+                std::slice::from_ref(&sample.values),
+                expected_metadata.schema_version,
+                &case.id,
+                chunk_size,
+            );
+        }
 
         if rows > 0 && columns > 0 {
             let last_row = usize::try_from(rows - 1).expect("last row");
             let last_column = usize::try_from(columns - 1).expect("last column");
+            let expected_last_cell = expected_rows
+                .map(|rows| rows[last_row][last_column].clone())
+                .or_else(|| {
+                    expected_samples
+                        .iter()
+                        .find(|sample| sample.row == rows - 1)
+                        .map(|sample| sample.values[last_column].clone())
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {} with sampled rows must include its last row",
+                        case.id
+                    )
+                });
             let last_cell_request =
                 RangeRequest::new(rows - 1, 1, columns - 1, 1).expect("last-cell range");
             let last_cell_batch = source.read_range(last_cell_request).unwrap_or_else(|error| {
@@ -2025,7 +2155,7 @@ mod tests {
                 &last_cell_batch,
                 last_cell_request,
                 true,
-                &[vec![expected_rows[last_row][last_column].clone()]],
+                &[vec![expected_last_cell]],
                 expected_metadata.schema_version,
                 &case.id,
                 chunk_size,
@@ -2107,6 +2237,35 @@ mod tests {
         case_id: &str,
         chunk_size: usize,
     ) {
+        assert_batch_shape(
+            batch,
+            expected_range,
+            expected_complete,
+            expected_rows.len(),
+            expected_schema_version,
+            case_id,
+            chunk_size,
+        );
+        for (column_index, column) in batch.columns().iter().enumerate() {
+            for (row_index, expected_row) in expected_rows.iter().enumerate() {
+                assert_eq!(
+                    column.value(row_index),
+                    Some(expected_row[column_index].as_deref()),
+                    "case {case_id} chunk {chunk_size}, row {row_index}, column {column_index}"
+                );
+            }
+        }
+    }
+
+    fn assert_batch_shape(
+        batch: &TableBatch,
+        expected_range: RangeRequest,
+        expected_complete: bool,
+        expected_row_count: usize,
+        expected_schema_version: u64,
+        case_id: &str,
+        chunk_size: usize,
+    ) {
         assert_eq!(
             batch.table_id(),
             "table-0",
@@ -2145,16 +2304,9 @@ mod tests {
             );
             assert_eq!(
                 column.len(),
-                expected_rows.len(),
+                expected_row_count,
                 "case {case_id} chunk {chunk_size}"
             );
-            for (row_index, expected_row) in expected_rows.iter().enumerate() {
-                assert_eq!(
-                    column.value(row_index),
-                    Some(expected_row[column_index].as_deref()),
-                    "case {case_id} chunk {chunk_size}, row {row_index}, column {column_index}"
-                );
-            }
         }
     }
 }

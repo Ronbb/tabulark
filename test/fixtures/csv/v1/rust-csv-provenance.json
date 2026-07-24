@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "upstream": {
+    "name": "BurntSushi/rust-csv",
+    "repository": "https://github.com/BurntSushi/rust-csv",
+    "revision": "4a3997e91d668ea1d8595bdef15625a77cf2308a",
+    "license": "MIT"
+  },
+  "files": [
+    {
+      "kind": "license",
+      "localFile": "RUST-CSV-LICENSE-MIT",
+      "upstreamPath": "LICENSE-MIT",
+      "upstreamUrl": "https://github.com/BurntSushi/rust-csv/blob/4a3997e91d668ea1d8595bdef15625a77cf2308a/LICENSE-MIT",
+      "revision": "4a3997e91d668ea1d8595bdef15625a77cf2308a",
+      "storedSha256": "0f96a83840e146e43c0ec96a22ec1f392e0680e6c1226e6f3ba87e0740af850f",
+      "upstreamSha256": "0f96a83840e146e43c0ec96a22ec1f392e0680e6c1226e6f3ba87e0740af850f"
+    },
+    {
+      "kind": "fixture",
+      "localFile": "rust-csv-strange.csv",
+      "upstreamPath": "examples/data/strange.csv",
+      "upstreamUrl": "https://github.com/BurntSushi/rust-csv/blob/4a3997e91d668ea1d8595bdef15625a77cf2308a/examples/data/strange.csv",
+      "revision": "4a3997e91d668ea1d8595bdef15625a77cf2308a",
+      "storedSha256": "c6b5150e0795b2326cedf941fa288b5123be06b4e7b9a83b7adea125ba0eb5d3",
+      "upstreamSha256": "c6b5150e0795b2326cedf941fa288b5123be06b4e7b9a83b7adea125ba0eb5d3",
+      "caseIds": ["rust-csv-strange-strict"]
+    },
+    {
+      "kind": "fixture",
+      "localFile": "rust-csv-uspop-null.csv",
+      "upstreamPath": "examples/data/uspop-null.csv",
+      "upstreamUrl": "https://github.com/BurntSushi/rust-csv/blob/4a3997e91d668ea1d8595bdef15625a77cf2308a/examples/data/uspop-null.csv",
+      "revision": "4a3997e91d668ea1d8595bdef15625a77cf2308a",
+      "storedSha256": "73cd9fb70c3feb3b5c4311d14bad0d2137e9fb20eb98d851edb0eccc3022075c",
+      "upstreamSha256": "73cd9fb70c3feb3b5c4311d14bad0d2137e9fb20eb98d851edb0eccc3022075c",
+      "caseIds": ["rust-csv-uspop-null-strict"]
+    },
+    {
+      "kind": "fixture",
+      "localFile": "rust-csv-uspop-latin1.csv",
+      "upstreamPath": "examples/data/uspop-latin1.csv",
+      "upstreamUrl": "https://github.com/BurntSushi/rust-csv/blob/4a3997e91d668ea1d8595bdef15625a77cf2308a/examples/data/uspop-latin1.csv",
+      "revision": "4a3997e91d668ea1d8595bdef15625a77cf2308a",
+      "storedSha256": "4727b34f26169ac289fcce58d6c00ec2301000d5e975ca2d00581429e2b7af6e",
+      "upstreamSha256": "cadf08609c2f76c9e4aa642d4470de704a5633e690b18cef28bbcaa9958bffbb",
+      "materialization": {
+        "encoding": "latin1"
+      },
+      "caseIds": [
+        "rust-csv-uspop-latin1-strict",
+        "rust-csv-uspop-latin1-lenient"
+      ]
+    }
+  ]
+}

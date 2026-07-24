@@ -3,8 +3,8 @@ import { expect, test } from "@playwright/test";
 
 const WCAG_21_A_AA_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"];
 
-async function openExample(page, colorScheme) {
-  await page.emulateMedia({ colorScheme });
+async function openExample(page, colorScheme, forcedColors = "none") {
+  await page.emulateMedia({ colorScheme, forcedColors });
   await page.goto("/examples/csv-preview/");
   await expect(page.getByTestId("app")).toHaveAttribute("data-state", "idle");
   await expect(page.getByTestId("workspace")).toHaveAttribute("aria-busy", "false");
@@ -96,6 +96,41 @@ test.describe("CSV preview accessibility", () => {
     await expectReady(page);
     await expect(page.getByTestId("state-label")).toHaveText("Ready");
     expect(await page.evaluate(() => matchMedia("(prefers-color-scheme: dark)").matches)).toBe(true);
+
+    await expectNoWcagViolations(page, testInfo);
+  });
+
+  test("ready forced-colors state has no WCAG 2.1 A or AA violations", async (
+    { page },
+    testInfo,
+  ) => {
+    await openExample(page, "light", "active");
+    await page.getByTestId("sample-button").click();
+    await expectReady(page);
+    await expect(page.getByTestId("state-label")).toHaveText("Ready");
+    expect(await page.evaluate(() => matchMedia("(forced-colors: active)").matches)).toBe(true);
+
+    await expectNoWcagViolations(page, testInfo);
+  });
+
+  test("strict parse error forced-colors state has no WCAG 2.1 A or AA violations", async (
+    { page },
+    testInfo,
+  ) => {
+    await openExample(page, "light", "active");
+    await page.getByTestId("source-input").setInputFiles({
+      name: "ragged.csv",
+      mimeType: "text/csv",
+      buffer: Buffer.from("left,right\nonly-left\n"),
+    });
+    await openParsingOptions(page);
+    await page.getByTestId("parse-mode").selectOption("strict");
+    await page.getByTestId("open-button").click();
+    await expect(page.getByTestId("app")).toHaveAttribute("data-state", "error", {
+      timeout: 15_000,
+    });
+    await expect(page.getByTestId("status")).toContainText("PARSE_FAILED");
+    await expect(page.getByTestId("retry-button")).toBeVisible();
 
     await expectNoWcagViolations(page, testInfo);
   });

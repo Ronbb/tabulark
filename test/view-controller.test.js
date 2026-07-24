@@ -163,6 +163,36 @@ test("keyboard navigation scrolls an offscreen active cell into view", async () 
   controller.dispose();
 });
 
+test("column resizing exposes its limits and keeps a focused boundary visible", () => {
+  const table = createMockTable({ rows: 0, columns: 4 });
+  const controller = createTableController(table, {
+    columnWidth: 120,
+    minColumnWidth: 72,
+    maxColumnWidth: 192,
+    rowHeaderWidth: 40,
+    scrollPixelLimit: 300,
+  });
+
+  assert.equal(controller.minColumnWidth, 72);
+  assert.equal(controller.maxColumnWidth, 192);
+  controller.resizeColumn(0, 40);
+  assert.equal(controller.columnWidths[0], 72);
+  controller.resizeColumn(0, 240);
+  assert.equal(controller.columnWidths[0], 192);
+  controller.autosizeColumn(1, 500);
+  assert.equal(controller.columnWidths[1], 192);
+  assert.throws(() => controller.resizeColumn(0, Number.POSITIVE_INFINITY), /finite/);
+
+  controller.updateViewport({ width: 220, height: 100, scrollLeft: 0, scrollTop: 0 });
+  controller.ensureColumnVisible(3);
+  const layout = controller.getSnapshot().layout;
+  assert.equal(layout.horizontal.compressed, true);
+  assert.ok(layout.horizontal.logicalOffset > 0);
+  assert.ok(layout.visibleColumns.some((column) => column.index === 3));
+
+  controller.dispose();
+});
+
 function createMockTable({
   rows,
   columns,

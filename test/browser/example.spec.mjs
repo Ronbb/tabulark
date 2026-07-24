@@ -64,6 +64,29 @@ test.describe("CSV preview example", () => {
     );
   });
 
+  test("renders a header-only file as an empty ready table and restores controls", async ({ page }) => {
+    await openExample(page);
+    await page.getByTestId("source-input").setInputFiles({
+      name: "headers-only.csv",
+      mimeType: "text/csv",
+      buffer: Buffer.from("name,value\n"),
+    });
+
+    await page.getByTestId("open-button").click();
+    const grid = await expectReady(page);
+
+    await expect(grid).toHaveAttribute("aria-rowcount", "1");
+    await expect(grid.getByRole("columnheader", { name: "name" })).toBeVisible();
+    await expect(grid.getByRole("columnheader", { name: "value" })).toBeVisible();
+    await expect(page.locator("[data-tabulark-message]")).toHaveText("No rows to display.");
+    await expect(page.getByTestId("state-label")).toHaveText("Ready");
+    await expect(page.getByTestId("progress")).toBeHidden();
+    await expect(page.getByTestId("advanced-options")).not.toHaveAttribute("inert", "");
+    await expect(page.getByTestId("file-picker")).toHaveAttribute("aria-disabled", "false");
+    await expect(page.getByTestId("open-button")).toBeEnabled();
+    await expect(page.getByTestId("sample-button")).toBeEnabled();
+  });
+
   test("cancels an opening source and retries the same File", async ({ page }) => {
     let delayWorker = true;
     await page.route("**/dist/worker.js", async (route) => {

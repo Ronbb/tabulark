@@ -64,6 +64,61 @@ test.describe("Canvas table view", () => {
     await expect(grid).toHaveAttribute("aria-activedescendant", /-r1-c1$/);
   });
 
+  test("resizes columns by keyboard while preserving separator focus", async ({ page }) => {
+    const { view, grid } = await openSample(page);
+    const separator = view.getByRole("separator").first();
+
+    await expect(separator).toHaveAttribute("aria-label", /Resize .+ column/);
+    await expect(separator).toHaveAttribute("aria-orientation", "vertical");
+    await expect(separator).toHaveAttribute("aria-valuemin", "64");
+    await expect(separator).toHaveAttribute("aria-valuemax", "640");
+    await expect(separator).toHaveAttribute("aria-valuenow", "160");
+    await expect(separator).toHaveAttribute("aria-valuetext", "160 CSS pixels");
+    await expect(separator).toHaveAttribute("tabindex", "0");
+    await expect(separator).toHaveAttribute("aria-controls", await grid.getAttribute("id"));
+    const target = await separator.boundingBox();
+    expect(target).not.toBeNull();
+    expect(target.width).toBeGreaterThanOrEqual(44);
+    expect(target.height).toBeGreaterThanOrEqual(44);
+
+    const activeCellBeforeResize = await grid.getAttribute("aria-activedescendant");
+    await separator.focus();
+    await separator.evaluate((element) => {
+      globalThis.__tabularkOriginalResizeHandle = element;
+    });
+    const expectStableFocus = async () => {
+      await expect.poll(() => page.evaluate(() => (
+        document.activeElement === globalThis.__tabularkOriginalResizeHandle
+        && globalThis.__tabularkOriginalResizeHandle?.isConnected === true
+      ))).toBe(true);
+    };
+
+    await page.keyboard.press("ArrowRight");
+    await expect(separator).toHaveAttribute("aria-valuenow", "168");
+    await expectStableFocus();
+    await page.keyboard.press("Shift+ArrowRight");
+    await expect(separator).toHaveAttribute("aria-valuenow", "200");
+    await expectStableFocus();
+    await page.keyboard.press("Home");
+    await expect(separator).toHaveAttribute("aria-valuenow", "64");
+    await page.keyboard.press("ArrowLeft");
+    await expect(separator).toHaveAttribute("aria-valuenow", "64");
+    await expectStableFocus();
+    await page.keyboard.press("End");
+    await expect(separator).toHaveAttribute("aria-valuenow", "640");
+    await page.keyboard.press("ArrowRight");
+    await expect(separator).toHaveAttribute("aria-valuenow", "640");
+    await expectStableFocus();
+    await page.keyboard.press("Enter");
+    await expect(separator).not.toHaveAttribute("aria-valuenow", "640");
+    await expect(separator).toHaveAttribute("aria-valuetext", / CSS pixels$/);
+    await expectStableFocus();
+
+    expect(await grid.getAttribute("aria-activedescendant")).toBe(activeCellBeforeResize);
+    await expect(view.locator("[data-tabulark-status]")).toContainText("visible content");
+    await page.evaluate(() => delete globalThis.__tabularkOriginalResizeHandle);
+  });
+
   test("virtualizes after scrolling and resizes a column by pointer", async ({ page }) => {
     const { view, grid } = await openSample(page);
     const scroller = view.locator(".tabulark-scroll");
@@ -178,6 +233,10 @@ test.describe("Canvas table view", () => {
       });
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
+      const resizeHandle = view.element.querySelector("[data-column-resize]");
+      resizeHandle?.focus({ preventScroll: true });
+      const resizeHandleWasFocused = document.activeElement === resizeHandle;
+
       const runtimeError = new Error("Worker stopped unexpectedly");
       for (const listener of [...listeners]) {
         listener({ type: "runtimeError", error: runtimeError });
@@ -186,6 +245,8 @@ test.describe("Canvas table view", () => {
         listener({ type: "closed" });
       }
       await new Promise((resolve) => requestAnimationFrame(resolve));
+      const terminalFocusMoved = document.activeElement
+        === view.element.querySelector("[data-tabulark-a11y-grid]");
 
       const scroller = view.element.querySelector("[data-tabulark-scroll]");
       const surface = view.element.querySelector("[data-tabulark-surface]");
@@ -225,7 +286,18 @@ test.describe("Canvas table view", () => {
       const snapshot = view.controller.getSnapshot();
       const message = view.element.querySelector("[data-tabulark-message]")?.textContent ?? "";
       const status = view.element.querySelector("[data-tabulark-status]")?.textContent ?? "";
-      const output = { errors, message, status, snapshotStatus: snapshot.status };
+      const remainingResizeHandles = view.element.querySelectorAll("[data-column-resize]").length;
+      const gridFocused = document.activeElement === view.element.querySelector("[data-tabulark-a11y-grid]");
+      const output = {
+        errors,
+        gridFocused,
+        message,
+        remainingResizeHandles,
+        resizeHandleWasFocused,
+        status,
+        snapshotStatus: snapshot.status,
+        terminalFocusMoved,
+      };
       view.destroy();
       window.removeEventListener("error", onError);
       window.removeEventListener("unhandledrejection", onRejection);
@@ -233,6 +305,10 @@ test.describe("Canvas table view", () => {
     });
 
     expect(result.errors).toEqual([]);
+    expect(result.resizeHandleWasFocused).toBe(true);
+    expect(result.gridFocused).toBe(true);
+    expect(result.terminalFocusMoved).toBe(true);
+    expect(result.remainingResizeHandles).toBe(0);
     expect(result.snapshotStatus).toBe("error");
     expect(result.message).toContain("Worker stopped unexpectedly");
     expect(result.status).toContain("Worker stopped unexpectedly");
