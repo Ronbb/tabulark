@@ -74,7 +74,9 @@ jobs:
         shell: bash
         run: |
           version="$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version' | head -n 1)"
-          cargo install wasm-bindgen-cli --version "$version" --locked
+          if ! command -v wasm-bindgen > /dev/null || ! wasm-bindgen --version | grep -Fx "wasm-bindgen $version" > /dev/null; then
+            cargo install wasm-bindgen-cli --version "$version" --locked --force
+          fi
 
       - name: Build JavaScript and WebAssembly
         run: npm run build
@@ -110,7 +112,9 @@ jobs:
         shell: bash
         run: |
           version="$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version' | head -n 1)"
-          cargo install wasm-bindgen-cli --version "$version" --locked
+          if ! command -v wasm-bindgen > /dev/null || ! wasm-bindgen --version | grep -Fx "wasm-bindgen $version" > /dev/null; then
+            cargo install wasm-bindgen-cli --version "$version" --locked --force
+          fi
 
       - name: Install Node.js
         uses: actions/setup-node@v6
