@@ -95,7 +95,9 @@ try {
       headless: !options.headed,
       viewport: { width: 1024, height: 640, deviceScaleFactor: 1 },
       crossOriginIsolated: true,
-      forcedGcBeforeMemorySample: true,
+      forcedGcBeforeMemorySample: results.every(
+        (result) => result.memory.forcedGcBeforeSample === true,
+      ),
     },
     dataset: {
       generator: manifest.generator,
@@ -178,6 +180,9 @@ function validateResult(result, expected) {
   }
   if (result.memory.api !== "measureUserAgentSpecificMemory") {
     throw new Error("canonical memory API was not used");
+  }
+  if (result.memory.forcedGcBeforeSample !== true) {
+    throw new Error("canonical memory samples were not preceded by forced garbage collection");
   }
 }
 

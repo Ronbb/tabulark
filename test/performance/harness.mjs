@@ -42,8 +42,12 @@ async function runScenario({ expectedRows, requireMemory = true, scrollFrames = 
     throw new Error("performance harness must run with COOP/COEP isolation");
   }
   const memoryAvailable = typeof performance.measureUserAgentSpecificMemory === "function";
+  const forcedGcAvailable = typeof globalThis.gc === "function";
   if (requireMemory && !memoryAvailable) {
     throw new Error("measureUserAgentSpecificMemory is unavailable in canonical Chromium");
+  }
+  if (requireMemory && !forcedGcAvailable) {
+    throw new Error("forced garbage collection is unavailable in canonical Chromium");
   }
 
   host.replaceChildren();
@@ -51,7 +55,7 @@ async function runScenario({ expectedRows, requireMemory = true, scrollFrames = 
   const memory = [];
   const measureMemory = async (phase) => {
     if (!memoryAvailable) return;
-    globalThis.gc?.();
+    if (forcedGcAvailable) globalThis.gc();
     const measurement = await performance.measureUserAgentSpecificMemory();
     if (!Number.isFinite(measurement.bytes) || measurement.bytes <= 0) {
       throw new Error(`invalid memory measurement for ${phase}`);
@@ -168,6 +172,7 @@ async function runScenario({ expectedRows, requireMemory = true, scrollFrames = 
       },
       memory: {
         api: memoryAvailable ? "measureUserAgentSpecificMemory" : "unavailable",
+        forcedGcBeforeSample: forcedGcAvailable,
         peakDeltaBytes: memoryPeakDeltaBytes,
         samples: memory,
       },
