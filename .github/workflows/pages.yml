@@ -30,7 +30,7 @@ jobs:
       - name: Install matching wasm-bindgen CLI
         shell: bash
         run: |
-          version="$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version' | head -n 1)"
+          version="$(cargo metadata --format-version 1 --locked --no-default-features --features wasm | jq -er '[.packages[] | select(.name == "wasm-bindgen") | .version][0]')"
           if ! command -v wasm-bindgen > /dev/null || ! wasm-bindgen --version | grep -Fx "wasm-bindgen $version" > /dev/null; then
             target="x86_64-unknown-linux-musl"
             archive="wasm-bindgen-${version}-${target}.tar.gz"
