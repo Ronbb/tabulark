@@ -19,12 +19,22 @@ const contentTypes = new Map([
   [".wasm", "application/wasm"],
 ]);
 
-function createTestServer() {
+function createTestServer({ crossOriginIsolated = false } = {}) {
+  const isolationHeaders = crossOriginIsolated
+    ? {
+        "cross-origin-embedder-policy": "require-corp",
+        "cross-origin-opener-policy": "same-origin",
+        "cross-origin-resource-policy": "same-origin",
+      }
+    : {};
   return createServer(async (request, response) => {
     try {
       const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
       if (url.pathname === "/health") {
-        response.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+        response.writeHead(200, {
+          ...isolationHeaders,
+          "content-type": "text/plain; charset=utf-8",
+        });
         response.end("ok");
         return;
       }
@@ -53,6 +63,7 @@ function createTestServer() {
       }
 
       response.writeHead(200, {
+        ...isolationHeaders,
         "cache-control": "no-store",
         "content-length": metadata.size,
         "content-type":
@@ -66,8 +77,12 @@ function createTestServer() {
   });
 }
 
-export async function startTestServer({ host = defaultHost, port = defaultPort } = {}) {
-  const server = createTestServer();
+export async function startTestServer({
+  crossOriginIsolated = false,
+  host = defaultHost,
+  port = defaultPort,
+} = {}) {
+  const server = createTestServer({ crossOriginIsolated });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, () => {

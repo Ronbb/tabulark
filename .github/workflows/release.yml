@@ -91,6 +91,12 @@ jobs:
       - name: Run browser integration tests
         run: npm run test:browser
 
+      - name: Run performance invariant smoke
+        run: npm run benchmark:smoke
+
+      - name: Enforce package and site size budgets
+        run: npm run benchmark:size
+
       - name: Upload browser traces and screenshot diffs
         if: failure()
         uses: actions/upload-artifact@v4

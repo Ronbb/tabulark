@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "generator": "test/performance/generate-csv.mjs",
+  "scenarios": {
+    "smoke": {
+      "requestedBytes": 2097152,
+      "generatedBytes": 2097165,
+      "rows": 43888,
+      "sha256": "602838b8ac3935e2ebd833e970ac2425fc54b1052517be9cc504f20dd54e9a15",
+      "measuredIterations": 1,
+      "warmupIterations": 0,
+      "scrollFrames": 60
+    },
+    "canonical": {
+      "requestedBytes": 16777216,
+      "generatedBytes": 16777218,
+      "rows": 326259,
+      "sha256": "00fe6c5174c3bc5f607dc3aaf54eb73cdfee615588dd126dd692e57759ad42a8",
+      "measuredIterations": 5,
+      "warmupIterations": 1,
+      "scrollFrames": 120
+    }
+  }
+}

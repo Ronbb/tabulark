@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "maximumBytes": {
+    "runtimeRaw": 524288,
+    "runtimeBrotli": 147456,
+    "npmPacked": 294912,
+    "npmUnpacked": 1048576,
+    "pagesRaw": 1114112,
+    "pagesBrotli": 262144
+  }
+}

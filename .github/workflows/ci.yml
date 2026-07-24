@@ -158,6 +158,23 @@ jobs:
       - name: Run browser integration tests
         run: npm run test:browser
 
+      - name: Run performance invariant smoke
+        run: npm run benchmark:smoke
+
+      - name: Enforce package and site size budgets
+        run: npm run benchmark:size
+
+      - name: Upload performance measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-smoke-${{ github.sha }}
+          path: |
+            target/bench/performance-smoke.json
+            target/bench/package-sizes.json
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Upload browser traces
         if: failure()
         uses: actions/upload-artifact@v4
