@@ -35,6 +35,7 @@ test("protocol v1 golden fixtures have valid, versioned envelopes", async () => 
     "metadata-event.json",
     "open-source-request.json",
     "read-range-request.json",
+    "warning-event.json",
   ]);
 
   for (const file of files) {
@@ -50,6 +51,12 @@ test("protocol v1 golden fixtures have valid, versioned envelopes", async () => 
 
     if ("event" in payload) {
       assert.ok(events.has(payload.event), `${file} event`);
+      if (payload.event !== "runtimeError") {
+        assert.equal(typeof payload.datasetHandle, "string", `${file} datasetHandle`);
+      }
+      if ("tableHandle" in payload) {
+        assert.equal(typeof payload.datasetHandle, "string", `${file} table routing`);
+      }
       assert.ok("payload" in payload, `${file} payload`);
       continue;
     }
@@ -83,6 +90,17 @@ test("protocol v1 fixtures lock the handshake, acknowledgement, and error shapes
   assert.equal(failure.status, "failure");
   assert.equal(failure.error.code, "INVALID_RANGE");
   assert.equal(failure.error.retryable, false);
+
+  const warning = await fixture("warning-event.json");
+  assert.equal(warning.datasetHandle, "d1");
+  assert.equal(warning.tableId, "csv:table:0");
+  assert.deepEqual(warning.payload, {
+    handle: "d1",
+    kind: "ragged-row",
+    message: "row has 1 fields but the schema has 2",
+    byteOffset: 12,
+    row: 3,
+  });
 });
 
 async function fixture(file) {

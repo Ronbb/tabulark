@@ -1,0 +1,14 @@
+{
+  "protocolVersion": 1,
+  "requestId": "request-open-source-001",
+  "event": "warning",
+  "datasetHandle": "d1",
+  "tableId": "csv:table:0",
+  "payload": {
+    "handle": "d1",
+    "kind": "ragged-row",
+    "message": "row has 1 fields but the schema has 2",
+    "byteOffset": 12,
+    "row": 3
+  }
+}

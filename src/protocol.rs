@@ -275,6 +275,15 @@ pub struct EventEnvelope {
     /// Optional request that initiated the event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// Dataset that owns this event. Required for dataset and table events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_handle: Option<String>,
+    /// Table handle when the event targets one opened table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_handle: Option<String>,
+    /// Logical table ID when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_id: Option<String>,
     /// Event type and payload.
     #[serde(flatten)]
     pub event: RuntimeEvent,
@@ -324,6 +333,9 @@ pub struct WarningEvent {
     /// Source byte offset when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub byte_offset: Option<u64>,
+    /// Zero-based logical data row when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row: Option<u64>,
 }
 
 /// A lifecycle event.
@@ -382,6 +394,7 @@ mod tests {
         assert_fixture::<ResponseEnvelope>(&root, "close-response.json");
         assert_fixture::<ResponseEnvelope>(&root, "invalid-range-response.json");
         assert_fixture::<EventEnvelope>(&root, "metadata-event.json");
+        assert_fixture::<EventEnvelope>(&root, "warning-event.json");
     }
 
     fn assert_fixture<T>(root: &Path, name: &str)

@@ -23,6 +23,10 @@ import {
 import { WorkerRpcClient } from "./rpc-client.js";
 
 const MIN_MEMORY_BUDGET_BYTES = 8 * 1024 * 1024;
+const LIFECYCLE_CLOSE_TIMEOUT_MS = 2_000;
+const MAX_ORPHAN_HANDLES = 32;
+const MAX_ORPHAN_EVENTS_PER_HANDLE = 16;
+const MAX_ORPHAN_EVENTS = 256;
 
 export type DelimitedFormat = "csv" | "tsv";
 export type HeaderMode = "first-row" | "none";
@@ -35,6 +39,8 @@ export interface OpenSourceOptions {
   readonly mode?: ParseMode;
   /** One ASCII delimiter byte. Defaults to comma or tab from format. */
   readonly delimiter?: string;
+  /** Display name for the source. Defaults to File.name when a File is supplied. */
+  readonly sourceName?: string;
   /** Cancels opening and releases any Worker-side source created by the request. */
   readonly signal?: AbortSignal;
 }
@@ -64,6 +70,7 @@ export interface SourceWarning {
   readonly kind: string;
   readonly message: string;
   readonly byteOffset?: number;
+  readonly row?: number;
 }
 
 export type DatasetEvent =
@@ -121,6 +128,7 @@ class Engine implements TabularkEngine {
   readonly #maxArrayBufferBytes: number;
   readonly #sessions = new Map<string, DatasetSessionImpl>();
   readonly #orphanEvents = new Map<string, ProtocolEvent[]>();
+  #orphanEventCount = 0;
   #closed = false;
 
   constructor(rpc: WorkerRpcClient, limits: MemoryBudgetLimits) {
@@ -182,7 +190,7 @@ class Engine implements TabularkEngine {
 
   async open(source: Blob | ArrayBuffer, options: OpenSourceOptions): Promise<DatasetSession> {
     this.#assertOpen();
-    const normalizedOptions = normalizeOpenOptions(options);
+    const normalizedOptions = normalizeOpenOptions(options, inferSourceName(source));
     const transfer: Transferable[] = [];
     if (source instanceof ArrayBuffer) {
       if (source.byteLength > this.#maxArrayBufferBytes) {
@@ -207,8 +215,12 @@ class Engine implements TabularkEngine {
       "dataset",
       options.signal ? { transfer, signal: options.signal } : { transfer },
     );
-    if (!isRecord(dataset) || typeof dataset.datasetHandle !== "string") {
-      throw new TabularkError("PROTOCOL_INCOMPATIBLE", "Worker returned an invalid dataset handle");
+    if (
+      !isRecord(dataset)
+      || typeof dataset.datasetHandle !== "string"
+      || dataset.datasetHandle.length === 0
+    ) {
+      throw this.#terminateForProtocolFailure("Worker returned an invalid dataset handle");
     }
 
     try {
@@ -225,10 +237,19 @@ class Engine implements TabularkEngine {
       const session = new DatasetSessionImpl(this, dataset.datasetHandle, tableDescriptors);
       this.#sessions.set(dataset.datasetHandle, session);
       this.#deliverOrphanEvents(session);
+      if (session.closed) {
+        throw session.terminalError ?? closedError("Dataset session");
+      }
       return session;
     } catch (error) {
+      const terminalError = this.#orphanRuntimeError(dataset.datasetHandle);
+      const session = this.#sessions.get(dataset.datasetHandle);
+      if (session) {
+        session.closeLocally();
+        this.#sessions.delete(dataset.datasetHandle);
+      }
       await this.#discardOpenedDataset(dataset.datasetHandle);
-      throw error;
+      throw terminalError ?? error;
     }
   }
 
@@ -242,6 +263,7 @@ class Engine implements TabularkEngine {
     }
     this.#sessions.clear();
     this.#rangeCache.clear();
+    this.#clearOrphanEvents();
     await this.#rpc.shutdown();
   }
 
@@ -255,31 +277,43 @@ class Engine implements TabularkEngine {
     if (!session.tables.some((table) => table.id === tableId)) {
       throw invalidArgument(`Unknown table: ${tableId}`);
     }
-    const table = await this.#rpc.request<{ tableHandle: string }>(
-      "openTable",
-      { datasetHandle: session.handle, tableId },
-      "table",
-    );
-    if (!isRecord(table) || typeof table.tableHandle !== "string") {
-      throw new TabularkError("PROTOCOL_INCOMPATIBLE", "Worker returned an invalid table handle");
+    let tableHandle: string | undefined;
+    try {
+      const table = await this.#rpc.request<{ tableHandle: string }>(
+        "openTable",
+        { datasetHandle: session.handle, tableId },
+        "table",
+      );
+      if (
+        !isRecord(table)
+        || typeof table.tableHandle !== "string"
+        || table.tableHandle.length === 0
+      ) {
+        throw this.#terminateForProtocolFailure("Worker returned an invalid table handle");
+      }
+      tableHandle = table.tableHandle;
+      const metadata = await this.#rpc.request<unknown>(
+        "getMetadata",
+        { tableHandle },
+        "metadata",
+      );
+      const normalizedMetadata = normalizeMetadataWire(metadata);
+      this.#assertOpen();
+      session.assertOpen();
+      const handle = new TableHandleImpl(
+        this,
+        session,
+        tableHandle,
+        normalizedMetadata,
+      );
+      session.addTableHandle(handle);
+      return handle;
+    } catch (error) {
+      if (tableHandle !== undefined) {
+        await this.#discardOpenedTable(tableHandle);
+      }
+      throw error;
     }
-    const metadata = await this.#rpc.request<unknown>(
-      "getMetadata",
-      { tableHandle: table.tableHandle },
-      "metadata",
-    );
-    const handle = new TableHandleImpl(
-      this,
-      session,
-      table.tableHandle,
-      normalizeMetadataWire(metadata),
-    );
-    if (session.closed) {
-      await this.closeTable(handle);
-      throw closedError("Dataset session");
-    }
-    session.addTableHandle(handle);
-    return handle;
   }
 
   async readRange(
@@ -310,6 +344,8 @@ class Engine implements TabularkEngine {
       "batch",
       options.signal ? { signal: options.signal } : {},
     );
+    this.#assertOpen();
+    table.assertOpen();
     const cachedBatch = cloneWireTableBatch(batch);
     this.#rangeCache.set(
       rangeCacheKey(table.handle, batch.revision, batch.schemaVersion, normalized),
@@ -327,7 +363,7 @@ class Engine implements TabularkEngine {
     if (this.#closed) {
       return;
     }
-    await this.#rpc.request("closeTable", { tableHandle: table.handle }, "acknowledged");
+    await this.#requestRemoteClose("closeTable", { tableHandle: table.handle });
   }
 
   clearTableCache(tableHandle: string): void {
@@ -339,11 +375,16 @@ class Engine implements TabularkEngine {
       return;
     }
     session.closeLocally();
-    this.#sessions.delete(session.handle);
     if (this.#closed) {
+      this.#sessions.delete(session.handle);
       return;
     }
-    await this.#rpc.request("closeSource", { datasetHandle: session.handle }, "acknowledged");
+    try {
+      await this.#requestRemoteClose("closeSource", { datasetHandle: session.handle });
+    } finally {
+      this.#sessions.delete(session.handle);
+      this.#deleteOrphanEvents(session.handle);
+    }
   }
 
   #assertOpen(): void {
@@ -353,7 +394,7 @@ class Engine implements TabularkEngine {
   }
 
   #handleEvent(event: ProtocolEvent): void {
-    const handle = event.datasetHandle ?? event.tableHandle ?? event.requestId;
+    const handle = event.datasetHandle;
     if (!handle && event.event === "runtimeError") {
       this.#handleRuntimeFailure(errorFromWire(event.payload));
       return;
@@ -363,12 +404,14 @@ class Engine implements TabularkEngine {
     }
     const session = this.#sessions.get(handle);
     if (!session) {
-      const events = this.#orphanEvents.get(handle) ?? [];
-      events.push(event);
-      this.#orphanEvents.set(handle, events);
+      this.#rememberOrphanEvent(handle, event);
       return;
     }
     session.handleEvent(event);
+    if (event.event === "closed" && !event.tableHandle && session.closed) {
+      this.#sessions.delete(handle);
+      this.#deleteOrphanEvents(handle);
+    }
   }
 
   #deliverOrphanEvents(session: DatasetSessionImpl): void {
@@ -376,14 +419,39 @@ class Engine implements TabularkEngine {
     if (!events) {
       return;
     }
-    this.#orphanEvents.delete(session.handle);
+    this.#deleteOrphanEvents(session.handle);
     for (const event of events) {
       session.handleEvent(event);
     }
   }
 
+  #orphanRuntimeError(handle: string): TabularkError | undefined {
+    const event = this.#orphanEvents.get(handle)?.find((candidate) => (
+      candidate.event === "runtimeError"
+    ));
+    return event ? errorFromWire(event.payload) : undefined;
+  }
+
+  async #discardOpenedTable(tableHandle: string): Promise<void> {
+    if (this.#closed) {
+      return;
+    }
+    try {
+      await this.#rpc.request(
+        "closeTable",
+        { tableHandle },
+        "acknowledged",
+        { timeoutMs: LIFECYCLE_CLOSE_TIMEOUT_MS },
+      );
+    } catch (error) {
+      if (!this.#closed) {
+        this.#rpc.terminate(asTabularkError(error, "Could not release an opened table"), true);
+      }
+    }
+  }
+
   async #discardOpenedDataset(datasetHandle: string): Promise<void> {
-    this.#orphanEvents.delete(datasetHandle);
+    this.#deleteOrphanEvents(datasetHandle);
     if (this.#closed) {
       return;
     }
@@ -392,14 +460,104 @@ class Engine implements TabularkEngine {
         "closeSource",
         { datasetHandle },
         "acknowledged",
+        { timeoutMs: LIFECYCLE_CLOSE_TIMEOUT_MS },
       );
-    } catch {
-      // The original open failure remains authoritative. A failed Worker owns no live resources.
+    } catch (error) {
+      if (!this.#closed) {
+        this.#rpc.terminate(asTabularkError(error, "Could not release an opened dataset"), true);
+      }
     } finally {
       // closeSource may emit a final closed event before its acknowledgement.
       // No DatasetSession will consume that event after a failed open.
-      this.#orphanEvents.delete(datasetHandle);
+      this.#deleteOrphanEvents(datasetHandle);
     }
+  }
+
+  async #requestRemoteClose(
+    op: "closeTable" | "closeSource",
+    payload: unknown,
+  ): Promise<void> {
+    try {
+      await this.#rpc.request(op, payload, "acknowledged", {
+        timeoutMs: LIFECYCLE_CLOSE_TIMEOUT_MS,
+      });
+    } catch (error) {
+      if (!this.#closed) {
+        this.#rpc.terminate(asTabularkError(error, `Could not complete ${op}`), true);
+      }
+      throw error;
+    }
+  }
+
+  #terminateForProtocolFailure(message: string): TabularkError {
+    const error = new TabularkError("PROTOCOL_INCOMPATIBLE", message);
+    this.#rpc.terminate(error, true);
+    return error;
+  }
+
+  #rememberOrphanEvent(handle: string, event: ProtocolEvent): void {
+    // No caller can subscribe until open() returns, so progress, metadata, and
+    // warning events observed before a DatasetSession exists have no consumer.
+    // Retaining only terminal state prevents an unknown-handle event stream
+    // from becoming an unbounded main-thread cache while preserving the race
+    // that must not return a dead session from open().
+    if (event.event !== "runtimeError" && event.event !== "closed") {
+      return;
+    }
+    let events = this.#orphanEvents.get(handle);
+    if (!events) {
+      while (this.#orphanEvents.size >= MAX_ORPHAN_HANDLES) {
+        this.#evictOldestOrphanHandle();
+      }
+      events = [];
+      this.#orphanEvents.set(handle, events);
+    }
+    if (events.length >= MAX_ORPHAN_EVENTS_PER_HANDLE) {
+      events.shift();
+      this.#orphanEventCount -= 1;
+    }
+    while (this.#orphanEventCount >= MAX_ORPHAN_EVENTS) {
+      this.#evictOldestOrphanEvent();
+    }
+    events.push(event);
+    this.#orphanEventCount += 1;
+  }
+
+  #evictOldestOrphanEvent(): void {
+    const oldest = this.#orphanEvents.entries().next().value as
+      | [string, ProtocolEvent[]]
+      | undefined;
+    if (!oldest) {
+      this.#orphanEventCount = 0;
+      return;
+    }
+    const [handle, events] = oldest;
+    events.shift();
+    this.#orphanEventCount -= 1;
+    if (events.length === 0) {
+      this.#orphanEvents.delete(handle);
+    }
+  }
+
+  #evictOldestOrphanHandle(): void {
+    const handle = this.#orphanEvents.keys().next().value as string | undefined;
+    if (handle !== undefined) {
+      this.#deleteOrphanEvents(handle);
+    }
+  }
+
+  #deleteOrphanEvents(handle: string): void {
+    const events = this.#orphanEvents.get(handle);
+    if (!events) {
+      return;
+    }
+    this.#orphanEventCount -= events.length;
+    this.#orphanEvents.delete(handle);
+  }
+
+  #clearOrphanEvents(): void {
+    this.#orphanEvents.clear();
+    this.#orphanEventCount = 0;
   }
 
   #handleRuntimeFailure(error: TabularkError): void {
@@ -408,7 +566,7 @@ class Engine implements TabularkEngine {
     }
     this.#closed = true;
     this.#rangeCache.clear();
-    this.#orphanEvents.clear();
+    this.#clearOrphanEvents();
     for (const session of this.#sessions.values()) {
       session.failLocally(error);
     }
@@ -423,6 +581,7 @@ class DatasetSessionImpl implements DatasetSession {
   readonly #listeners = new Set<(event: DatasetEvent) => void>();
   readonly #tableHandles = new Set<TableHandleImpl>();
   closed = false;
+  terminalError: TabularkError | undefined;
 
   constructor(engine: Engine, handle: string, tables: readonly TableDescriptor[]) {
     this.#engine = engine;
@@ -475,6 +634,7 @@ class DatasetSessionImpl implements DatasetSession {
       return;
     }
     this.closed = true;
+    this.terminalError = error;
     this.#emit({ type: "runtimeError", error });
     for (const table of [...this.#tableHandles]) {
       table.failLocally(error);
@@ -513,9 +673,15 @@ class DatasetSessionImpl implements DatasetSession {
         }
         break;
       }
-      case "runtimeError":
-        this.#emit({ type: "runtimeError", error: errorFromWire(event.payload) });
+      case "runtimeError": {
+        const error = errorFromWire(event.payload);
+        if (event.tableHandle) {
+          this.#emit({ type: "runtimeError", error });
+        } else {
+          this.failLocally(error);
+        }
         break;
+      }
       case "closed":
         if (!event.tableHandle) {
           this.closeLocally();
@@ -633,7 +799,7 @@ class TableHandleImpl implements TableHandle {
         this.emitWarning(normalizeWarning(event.payload));
         break;
       case "runtimeError":
-        this.#emit({ type: "runtimeError", error: errorFromWire(event.payload) });
+        this.failLocally(errorFromWire(event.payload));
         break;
       case "closed":
         this.closeLocally();
@@ -673,7 +839,10 @@ function normalizeEngineOptions(options: EngineOptions): NormalizedEngineOptions
   };
 }
 
-function normalizeOpenOptions(options: OpenSourceOptions): NormalizedOpenOptions {
+function normalizeOpenOptions(
+  options: OpenSourceOptions,
+  inferredSourceName?: string,
+): NormalizedOpenOptions {
   if (!options || (options.format !== "csv" && options.format !== "tsv")) {
     throw invalidArgument("format must be either csv or tsv");
   }
@@ -689,9 +858,21 @@ function normalizeOpenOptions(options: OpenSourceOptions): NormalizedOpenOptions
   if (delimiter.length !== 1 || delimiter.charCodeAt(0) > 0x7f) {
     throw invalidArgument("delimiter must contain exactly one ASCII byte");
   }
+  const sourceName = options.sourceName ?? inferredSourceName;
+  if (
+    sourceName !== undefined
+    && (typeof sourceName !== "string" || sourceName.length === 0 || sourceName.length > 1_024)
+  ) {
+    throw invalidArgument("sourceName must contain between 1 and 1024 characters");
+  }
   return {
     format: options.format,
-    options: Object.freeze({ header, mode, delimiter }),
+    options: Object.freeze({
+      header,
+      mode,
+      delimiter,
+      ...(sourceName === undefined ? {} : { sourceName }),
+    }),
   };
 }
 
@@ -788,7 +969,17 @@ function normalizeWarning(value: unknown): SourceWarning {
     kind: typeof raw.kind === "string" ? raw.kind : "warning",
     message: typeof raw.message === "string" ? raw.message : "Source warning",
     ...(Number.isSafeInteger(raw.byteOffset) ? { byteOffset: raw.byteOffset as number } : {}),
+    ...(Number.isSafeInteger(raw.row) && (raw.row as number) >= 0
+      ? { row: raw.row as number }
+      : {}),
   };
+}
+
+function inferSourceName(source: unknown): string | undefined {
+  if (typeof File !== "undefined" && source instanceof File && source.name.length > 0) {
+    return source.name;
+  }
+  return undefined;
 }
 
 function errorFromWire(value: unknown): TabularkError {
@@ -801,6 +992,12 @@ function errorFromWire(value: unknown): TabularkError {
     });
   }
   return new TabularkError("RUNTIME_FAILURE", "The Worker reported a runtime failure");
+}
+
+function asTabularkError(error: unknown, message: string): TabularkError {
+  return error instanceof TabularkError
+    ? error
+    : new TabularkError("RUNTIME_FAILURE", message, { cause: error });
 }
 
 function resolveUrl(value: string | URL | undefined, fallback: string): string {

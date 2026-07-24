@@ -4,13 +4,14 @@
 
 **One table model for every tabular source.**
 
-**Status: pre-alpha local CSV/TSV M0–M2 prototype.**
+**Status: pre-alpha; M0–M2 remain an experimental local CSV/TSV prototype.**
 
 > [!IMPORTANT]
 > Tabulark has an experimental CSV/TSV Worker, WebAssembly runtime, and
 > accessible Canvas viewport. There is no stable public API or production-ready
-> release yet. M3 hardening and measurement, M4 second-adapter validation, and
-> the broader format roadmap described below are not shipped.
+> release yet. One M3.1 lifecycle, protocol, diagnostics, and example-hardening
+> slice is implemented, but M3 as a whole, M4 second-adapter validation, and the
+> broader format roadmap described below are not complete.
 
 ## Why Tabulark?
 
@@ -61,12 +62,18 @@ The repository currently contains:
   DOM grid.
 - Golden protocol fixtures, Node contract tests, and Chromium Worker
   integration tests.
-- An interactive Canvas browser example and a deterministic large-CSV
-  generator.
+- Lifecycle hardening for delayed/background scan failures, bounded close
+  waits, and terminal protocol-validation failures.
+- Initial lenient parse diagnostics that remain observable after `open()` and
+  include row and byte-offset context.
+- An interactive Canvas browser example with parsing controls, cancel, retry,
+  strict-to-lenient recovery, and a deterministic large-CSV generator.
 
-M3 production hardening and reproducible measurements, M4 extension validation
-with a second adapter, persistent caches, additional formats, and framework
-bindings remain future milestones.
+M3 is still incomplete. A broader CSV compatibility corpus and parser fuzzing,
+deterministic visual and axe accessibility coverage, and a reproducible
+performance baseline remain pending. M4 extension validation with a second
+adapter, persistent caches, additional formats, and framework bindings also
+remain future milestones.
 
 ## Experimental browser API
 
@@ -75,6 +82,10 @@ sources and returns columnar batches. All names and wire formats may change
 before stabilization.
 `ArrayBuffer` ownership is transferred to the Worker and the caller's buffer is
 detached; use `File` or `Blob` for large sources.
+`File.name` becomes the default source and table display name. Hosts opening a
+`Blob` or `ArrayBuffer` can provide `sourceName`; an explicit `sourceName`
+overrides the inferred file name. Lenient parse warnings expose structured
+`row` and `byteOffset` fields, including warnings found during the initial scan.
 
 ```js
 import { createEngine } from "tabulark";
@@ -128,7 +139,8 @@ Advanced integrations can create a headless controller with
 
 Run `npm run example`, then open
 `http://127.0.0.1:4173/examples/csv-preview/` to try a local file or the
-generated sample dataset.
+generated sample dataset. The example exposes header, parse-mode, and delimiter
+options and demonstrates cancellation and retry with the same local source.
 
 ## Planned data sources
 
@@ -168,13 +180,19 @@ Run the local checks:
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+cargo test --workspace --all-features --locked
 cargo check --target wasm32-unknown-unknown --no-default-features --features wasm --locked
 cargo package --allow-dirty --locked
 npm ci
 npm run build
 npm run check
 npm run test:browser
+```
+
+Run the browser example acceptance spec on its own with:
+
+```bash
+npm run test:browser -- test/browser/example.spec.mjs
 ```
 
 After the first registry release, consumers will be able to install the base
@@ -213,7 +231,10 @@ See the
 - [x] Define the version-one Worker protocol.
 - [x] Implement the first CSV/TSV Worker and WebAssembly vertical slice.
 - [x] Prototype viewport-driven accessible Canvas rendering.
-- [ ] Complete M3 hardening, browser failure coverage, and reproducible measurement.
+- [x] Complete the first M3.1 lifecycle, protocol, diagnostics, and
+  example-hardening slice.
+- [ ] Complete the remaining M3 compatibility, visual/accessibility, and
+  measurement work.
 - [ ] Validate the extension boundary with an M4 second adapter.
 - [ ] Publish the first crates.io and npm packages.
 - [ ] Stabilize extension APIs.

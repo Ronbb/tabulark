@@ -770,11 +770,13 @@ impl CsvScanner {
 
     fn handle_diagnostic(&mut self, diagnostic: CsvDiagnostic) -> Result<()> {
         if self.options.mode == ParseMode::Strict {
-            return Err(
-                TabularkError::new(ErrorCode::ParseFailed, diagnostic.message.clone())
-                    .with_detail("kind", diagnostic_kind_name(diagnostic.kind))
-                    .with_detail("byteOffset", diagnostic.byte_offset),
-            );
+            let mut error = TabularkError::new(ErrorCode::ParseFailed, diagnostic.message.clone())
+                .with_detail("kind", diagnostic_kind_name(diagnostic.kind))
+                .with_detail("byteOffset", diagnostic.byte_offset);
+            if let Some(row) = diagnostic.row {
+                error = error.with_detail("row", row);
+            }
+            return Err(error);
         }
         if self.diagnostics.len() < self.options.limits.max_diagnostics {
             self.diagnostics.push(diagnostic);
@@ -1088,11 +1090,13 @@ impl RangeDecoder {
 
     fn handle_diagnostic(&mut self, diagnostic: CsvDiagnostic) -> Result<()> {
         if self.options.mode == ParseMode::Strict {
-            return Err(
-                TabularkError::new(ErrorCode::ParseFailed, diagnostic.message.clone())
-                    .with_detail("kind", diagnostic_kind_name(diagnostic.kind))
-                    .with_detail("byteOffset", diagnostic.byte_offset),
-            );
+            let mut error = TabularkError::new(ErrorCode::ParseFailed, diagnostic.message.clone())
+                .with_detail("kind", diagnostic_kind_name(diagnostic.kind))
+                .with_detail("byteOffset", diagnostic.byte_offset);
+            if let Some(row) = diagnostic.row {
+                error = error.with_detail("row", row);
+            }
+            return Err(error);
         }
         if self.diagnostics.len() < self.options.limits.max_diagnostics {
             self.diagnostics.push(diagnostic);
@@ -1496,13 +1500,16 @@ mod tests {
         assert_eq!(batch.columns()[1].value(1), Some(Some("")));
         assert_eq!(batch.columns()[2].value(0), Some(None));
         assert_eq!(batch.columns()[2].value(1), Some(Some("3")));
+        let warnings = source.scanner.diagnostics();
+        assert!(!warnings.is_empty());
         assert!(
-            source
-                .scanner
-                .diagnostics()
+            warnings
                 .iter()
-                .all(|warning| { warning.kind() == CsvDiagnosticKind::RaggedRow })
+                .all(|warning| warning.kind() == CsvDiagnosticKind::RaggedRow)
         );
+        assert_eq!(warnings[0].row(), Some(0));
+        assert_eq!(warnings[0].byte_offset(), 4);
+        assert!(!warnings[0].message().is_empty());
     }
 
     #[test]
@@ -1512,10 +1519,15 @@ mod tests {
         let ragged = MemorySource::open(b"a,b\n1\n".to_vec(), strict.clone())
             .expect_err("ragged row must fail");
         assert_eq!(ragged.code(), ErrorCode::ParseFailed);
+        assert_eq!(ragged.details()["kind"], "ragged-row");
+        assert_eq!(ragged.details()["row"], 0);
+        assert!(ragged.details().contains_key("byteOffset"));
 
         let invalid =
             MemorySource::open(b"a\n\xFF\n".to_vec(), strict).expect_err("invalid UTF-8 must fail");
         assert_eq!(invalid.code(), ErrorCode::ParseFailed);
+        assert_eq!(invalid.details()["kind"], "invalid-utf8");
+        assert_eq!(invalid.details()["row"], 0);
     }
 
     #[test]
@@ -1584,5 +1596,29 @@ mod tests {
             panic!("expected completed batch");
         };
         assert_eq!(batch.columns()[0].value(0), Some(Some("r1")));
+    }
+
+    #[test]
+    fn strict_range_decoder_preserves_diagnostic_location() {
+        let bytes = b"a,b\n1,2\n3\n";
+        let mut options = DelimitedOptions::csv();
+        options.mode = ParseMode::Strict;
+        let mut scanner = CsvScanner::new(options).expect("scanner");
+        scanner
+            .feed_chunk(0, &bytes[..8], false)
+            .expect("indexed prefix");
+        let plan = scanner
+            .plan_range(RangeRequest::new(0, 2, 0, 2).expect("range"))
+            .expect("plan");
+        let offset = usize::try_from(plan.source_offset()).expect("offset");
+        let mut decoder = scanner.range_decoder(plan).expect("decoder");
+
+        let error = decoder
+            .feed_chunk(plan.source_offset(), &bytes[offset..], true)
+            .expect_err("ragged range row must fail");
+        assert_eq!(error.code(), ErrorCode::ParseFailed);
+        assert_eq!(error.details()["kind"], "ragged-row");
+        assert_eq!(error.details()["row"], 1);
+        assert!(error.details().contains_key("byteOffset"));
     }
 }

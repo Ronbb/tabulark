@@ -2,6 +2,8 @@
   "protocolVersion": 1,
   "requestId": "request-open-source-001",
   "event": "metadata",
+  "datasetHandle": "d1",
+  "tableId": "csv:table:0",
   "payload": {
     "tableId": "csv:table:0",
     "name": "table",

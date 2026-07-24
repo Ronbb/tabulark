@@ -76,6 +76,223 @@ test("open cancellation sends a Worker cancel while openSource is still pending"
   }
 });
 
+test("a background scan fatal closes its dataset, table, and controller exactly once", async () => {
+  const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  Object.defineProperty(globalThis, "Worker", {
+    configurable: true,
+    writable: true,
+    value: LifecycleWorker,
+  });
+
+  let engine;
+  let controller;
+  try {
+    engine = await createEngine({ memoryBudgetBytes: 8 * 1024 * 1024 });
+    const worker = LifecycleWorker.latest;
+    const dataset = await engine.open(new Blob(["value\na\n"]), { format: "csv" });
+    const table = await dataset.openTable("table-0");
+    const datasetEvents = [];
+    const tableEvents = [];
+    dataset.subscribe((event) => datasetEvents.push(event.type));
+    table.subscribe((event) => tableEvents.push(event.type));
+    controller = createTableController(table);
+
+    worker.failBackgroundScan("d1", "t1");
+
+    assert.deepEqual(datasetEvents, ["runtimeError", "closed"]);
+    assert.deepEqual(tableEvents, ["runtimeError", "closed"]);
+    assert.equal(controller.getSnapshot().status, "error");
+    assert.equal(worker.closedSources.filter((handle) => handle === "d1").length, 1);
+    await assert.rejects(dataset.openTable("table-0"), (error) => error.code === "HANDLE_CLOSED");
+    await assert.rejects(table.readRange({
+      rowStart: 0,
+      rowCount: 1,
+      columnStart: 0,
+      columnCount: 1,
+    }), (error) => error.code === "HANDLE_CLOSED");
+  } finally {
+    controller?.dispose();
+    await engine?.close();
+    restoreWorker(originalWorker);
+  }
+});
+
+test("openTable rolls back a remote table when metadata validation fails", async () => {
+  const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  Object.defineProperty(globalThis, "Worker", {
+    configurable: true,
+    writable: true,
+    value: LifecycleWorker,
+  });
+
+  let engine;
+  try {
+    engine = await createEngine({ memoryBudgetBytes: 8 * 1024 * 1024 });
+    const worker = LifecycleWorker.latest;
+    const dataset = await engine.open(new Blob(["value\na\n"]), { format: "csv" });
+    worker.metadataOverride = {};
+
+    await assert.rejects(dataset.openTable("table-0"), (error) => {
+      assert.equal(error.code, "PROTOCOL_INCOMPATIBLE");
+      return true;
+    });
+    await waitFor(() => worker.closedTables.includes("t1"));
+
+    worker.metadataOverride = undefined;
+    const reopened = await dataset.openTable("table-0");
+    await reopened.close();
+  } finally {
+    await engine?.close();
+    restoreWorker(originalWorker);
+  }
+});
+
+test("malformed Worker protocol messages fail pending work and terminate the Worker", async () => {
+  const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  Object.defineProperty(globalThis, "Worker", {
+    configurable: true,
+    writable: true,
+    value: LifecycleWorker,
+  });
+
+  let engine;
+  try {
+    engine = await createEngine({ memoryBudgetBytes: 8 * 1024 * 1024 });
+    const worker = LifecycleWorker.latest;
+    worker.malformedResponseOp = "listTables";
+
+    await assert.rejects(engine.open(new Blob(["value\na\n"]), { format: "csv" }), (error) => {
+      assert.equal(error.code, "PROTOCOL_INCOMPATIBLE");
+      return true;
+    });
+    assert.equal(worker.terminated, 1);
+    assert.equal(worker.requests.some((request) => request.op === "closeSource"), false);
+  } finally {
+    await engine?.close();
+    restoreWorker(originalWorker);
+  }
+});
+
+test("dataset events without routing fail pending work and terminate the Worker", async () => {
+  const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  Object.defineProperty(globalThis, "Worker", {
+    configurable: true,
+    writable: true,
+    value: LifecycleWorker,
+  });
+
+  let engine;
+  try {
+    engine = await createEngine({ memoryBudgetBytes: 8 * 1024 * 1024 });
+    const worker = LifecycleWorker.latest;
+    worker.malformedEventBeforeListTables = true;
+
+    await assert.rejects(engine.open(new Blob(["value\na\n"]), { format: "csv" }), (error) => {
+      assert.equal(error.code, "PROTOCOL_INCOMPATIBLE");
+      return true;
+    });
+    assert.equal(worker.terminated, 1);
+  } finally {
+    await engine?.close();
+    restoreWorker(originalWorker);
+  }
+});
+
+test("open preserves a background fatal that arrives before listTables completes", async () => {
+  const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  Object.defineProperty(globalThis, "Worker", {
+    configurable: true,
+    writable: true,
+    value: LifecycleWorker,
+  });
+
+  let engine;
+  try {
+    engine = await createEngine({ memoryBudgetBytes: 8 * 1024 * 1024 });
+    const worker = LifecycleWorker.latest;
+    worker.failBeforeListTables = true;
+
+    await assert.rejects(engine.open(new Blob(["value\na\n"]), { format: "csv" }), (error) => {
+      assert.equal(error.code, "PARSE_FAILED");
+      assert.equal(error.message, "Synthetic pre-session scan failure");
+      return true;
+    });
+  } finally {
+    await engine?.close();
+    restoreWorker(originalWorker);
+  }
+});
+
+test("dataset.close tolerates a delayed acknowledgement from a healthy Worker", async () => {
+  const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  Object.defineProperty(globalThis, "Worker", {
+    configurable: true,
+    writable: true,
+    value: LifecycleWorker,
+  });
+
+  let engine;
+  try {
+    engine = await createEngine({ memoryBudgetBytes: 8 * 1024 * 1024 });
+    const worker = LifecycleWorker.latest;
+    const dataset = await engine.open(new Blob(["value\na\n"]), { format: "csv" });
+    worker.delayCloseSourceMs = 750;
+
+    await dataset.close();
+    assert.equal(worker.terminated, 0);
+  } finally {
+    await engine?.close();
+    restoreWorker(originalWorker);
+  }
+});
+
+test("engine.close terminates an unresponsive Worker within a bounded wait", async () => {
+  const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  Object.defineProperty(globalThis, "Worker", {
+    configurable: true,
+    writable: true,
+    value: LifecycleWorker,
+  });
+
+  let engine;
+  try {
+    engine = await createEngine({ memoryBudgetBytes: 8 * 1024 * 1024 });
+    const worker = LifecycleWorker.latest;
+    worker.holdShutdownResponse = true;
+    const startedAt = Date.now();
+    await engine.close();
+    assert.ok(Date.now() - startedAt < 4_000);
+    assert.equal(worker.terminated, 1);
+  } finally {
+    await engine?.close();
+    restoreWorker(originalWorker);
+  }
+});
+
+test("dataset.close terminates an unresponsive Worker within a bounded wait", async () => {
+  const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  Object.defineProperty(globalThis, "Worker", {
+    configurable: true,
+    writable: true,
+    value: LifecycleWorker,
+  });
+
+  let engine;
+  try {
+    engine = await createEngine({ memoryBudgetBytes: 8 * 1024 * 1024 });
+    const worker = LifecycleWorker.latest;
+    const dataset = await engine.open(new Blob(["value\na\n"]), { format: "csv" });
+    worker.holdCloseSourceResponse = true;
+    const startedAt = Date.now();
+    await assert.rejects(dataset.close(), (error) => error.code === "RUNTIME_FAILURE");
+    assert.ok(Date.now() - startedAt < 4_000);
+    assert.equal(worker.terminated, 1);
+  } finally {
+    await engine?.close();
+    restoreWorker(originalWorker);
+  }
+});
+
 for (const eventType of ["error", "messageerror"]) {
   test(`Worker ${eventType} closes live sessions and surfaces a terminal controller error`, async () => {
     const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
@@ -155,8 +372,16 @@ class LifecycleWorker {
   #listeners = new Map();
   requests = [];
   closedSources = [];
+  closedTables = [];
   holdOpenResponse = false;
   holdReadResponses = false;
+  holdShutdownResponse = false;
+  holdCloseSourceResponse = false;
+  delayCloseSourceMs = 0;
+  metadataOverride;
+  malformedResponseOp;
+  malformedEventBeforeListTables = false;
+  failBeforeListTables = false;
   afterOpenResponse;
   terminated = 0;
 
@@ -182,6 +407,73 @@ class LifecycleWorker {
     if (request.op === "readRange" && this.holdReadResponses) {
       return;
     }
+    if (request.op === "shutdown" && this.holdShutdownResponse) {
+      return;
+    }
+    if (request.op === "closeSource" && this.holdCloseSourceResponse) {
+      return;
+    }
+    if (request.op === this.malformedResponseOp) {
+      queueMicrotask(() => this.#emit("message", {
+        data: {
+          protocolVersion: 1,
+          requestId: request.requestId,
+          status: "success",
+        },
+      }));
+      return;
+    }
+    if (request.op === "listTables" && this.malformedEventBeforeListTables) {
+      queueMicrotask(() => this.#emit("message", {
+        data: {
+          protocolVersion: 1,
+          event: "warning",
+          payload: {
+            handle: request.payload.datasetHandle,
+            kind: "synthetic-warning",
+            message: "This event intentionally omits datasetHandle",
+          },
+        },
+      }));
+      return;
+    }
+    if (request.op === "listTables" && this.failBeforeListTables) {
+      queueMicrotask(() => {
+        this.#emit("message", {
+          data: {
+            protocolVersion: 1,
+            event: "runtimeError",
+            datasetHandle: request.payload.datasetHandle,
+            payload: {
+              code: "PARSE_FAILED",
+              message: "Synthetic pre-session scan failure",
+              retryable: false,
+            },
+          },
+        });
+        this.#emit("message", {
+          data: {
+            protocolVersion: 1,
+            event: "closed",
+            datasetHandle: request.payload.datasetHandle,
+            payload: { handle: request.payload.datasetHandle, kind: "source" },
+          },
+        });
+        this.#emit("message", {
+          data: {
+            protocolVersion: 1,
+            requestId: request.requestId,
+            status: "failure",
+            error: {
+              code: "HANDLE_CLOSED",
+              message: "The source is closed",
+              retryable: false,
+            },
+          },
+        });
+      });
+      return;
+    }
     const response = responseFor(request, this);
     if (!response) {
       return;
@@ -196,7 +488,15 @@ class LifecycleWorker {
         },
       }));
     }
-    queueMicrotask(() => this.#emit("message", { data: response }));
+    if (request.op === "closeTable") {
+      this.closedTables.push(request.payload.tableHandle);
+    }
+    const emitResponse = () => this.#emit("message", { data: response });
+    if (request.op === "closeSource" && this.delayCloseSourceMs > 0) {
+      setTimeout(emitResponse, this.delayCloseSourceMs);
+    } else {
+      queueMicrotask(emitResponse);
+    }
   }
 
   terminate() {
@@ -205,6 +505,41 @@ class LifecycleWorker {
 
   fail(type) {
     this.#emit(type, new Event(type));
+  }
+
+  failBackgroundScan(datasetHandle, tableHandle) {
+    this.closedSources.push(datasetHandle);
+    this.#emit("message", {
+      data: {
+        protocolVersion: 1,
+        event: "runtimeError",
+        datasetHandle,
+        payload: {
+          code: "PARSE_FAILED",
+          message: "Synthetic delayed scan failure",
+          retryable: false,
+        },
+      },
+    });
+    this.#emit("message", {
+      data: {
+        protocolVersion: 1,
+        event: "closed",
+        datasetHandle,
+        tableHandle,
+        tableId: "table-0",
+        payload: { handle: tableHandle, kind: "table" },
+      },
+    });
+    this.#emit("message", {
+      data: {
+        protocolVersion: 1,
+        event: "closed",
+        datasetHandle,
+        tableId: "table-0",
+        payload: { handle: datasetHandle, kind: "source" },
+      },
+    });
   }
 
   #emit(type, event) {
@@ -239,7 +574,7 @@ function responseFor(request, worker) {
       break;
     case "getMetadata":
       kind = "metadata";
-      data = metadata();
+      data = worker.metadataOverride ?? metadata();
       break;
     case "closeSource":
       worker.closedSources.push(request.payload.datasetHandle);

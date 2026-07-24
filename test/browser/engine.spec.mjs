@@ -50,6 +50,56 @@ test("opens CSV in a Worker and reads non-adjacent ranges", async ({ page }) => 
   });
 });
 
+test("preserves a File name and replays initial scan diagnostics after open", async ({ page }) => {
+  await page.goto("/test/browser/harness.html");
+
+  const result = await page.evaluate(async () => {
+    const { createEngine } = await import("/dist/index.js");
+    const engine = await createEngine();
+    const dataset = await engine.open(
+      new File(["first,second\nonly-one\n"], "ragged-input.csv", { type: "text/csv" }),
+      { format: "csv", header: "first-row", mode: "lenient" },
+    );
+    const warnings = [];
+    let resolveWarning;
+    const warningObserved = new Promise((resolve) => {
+      resolveWarning = resolve;
+    });
+    const unsubscribe = dataset.subscribe((event) => {
+      if (event.type === "warning") {
+        warnings.push(event.warning);
+        resolveWarning();
+      }
+    });
+    const table = await dataset.openTable(dataset.tables[0].id);
+
+    try {
+      await Promise.race([
+        warningObserved,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("warning timeout")), 2_000)),
+      ]);
+      return {
+        descriptorName: dataset.tables[0].name,
+        tableName: table.metadata.name,
+        warning: warnings[0],
+      };
+    } finally {
+      unsubscribe();
+      await table.close();
+      await dataset.close();
+      await engine.close();
+    }
+  });
+
+  expect(result.descriptorName).toBe("ragged-input.csv");
+  expect(result.tableName).toBe("ragged-input.csv");
+  expect(result.warning).toMatchObject({
+    kind: "ragged-row",
+    row: 0,
+    byteOffset: 13,
+  });
+});
+
 test("cancels a range read with AbortSignal", async ({ page }) => {
   await page.goto("/test/browser/harness.html");
 

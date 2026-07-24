@@ -71,6 +71,7 @@ export interface ProtocolEvent<T = unknown> {
   readonly protocolVersion: ProtocolVersion;
   readonly requestId?: string;
   readonly event: RuntimeEventName;
+  /** Required for dataset/table events; omitted only by a process-wide runtimeError. */
   readonly datasetHandle?: string;
   readonly tableHandle?: string;
   readonly tableId?: string;

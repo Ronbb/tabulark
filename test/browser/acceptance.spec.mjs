@@ -148,7 +148,7 @@ test("reports malformed delimited input as a strict parse failure", async ({ pag
   });
 
   expect(failure.code).toBe("PARSE_FAILED");
-  expect(failure.details).toMatchObject({ kind: "ragged-row" });
+  expect(failure.details).toMatchObject({ kind: "ragged-row", row: 0 });
   expect(failure.message).toContain("row has 1 fields");
 });
 

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
-    <title>Tabulark CSV Canvas preview</title>
+    <title>Tabulark CSV and TSV Canvas preview</title>
     <style>
       :root {
         color-scheme: light dark;
@@ -17,12 +17,12 @@
       }
 
       * { box-sizing: border-box; }
+      [hidden] { display: none !important; }
 
       body { margin: 0; min-width: 20rem; }
+      button, input, select, summary { font: inherit; }
 
-      button, input, select { font: inherit; }
-
-      button, select, .file-label {
+      button, input[type="text"], select, .file-label, summary {
         min-height: 2.75rem;
         border: 1px solid #b7c0d1;
         border-radius: 0.625rem;
@@ -30,7 +30,7 @@
         color: #172033;
       }
 
-      button, .file-label {
+      button, .file-label, summary {
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -39,10 +39,27 @@
         cursor: pointer;
       }
 
-      button:hover, .file-label:hover { background: #eef2ff; }
-      button:disabled { cursor: wait; opacity: 0.65; }
+      button:hover, .file-label:hover, summary:hover { background: #eef2ff; }
+      button:disabled, input:disabled, select:disabled, details[data-disabled] summary {
+        cursor: wait;
+        opacity: 0.58;
+      }
 
-      button:focus-visible, select:focus-visible, .file-label:focus-within {
+      .file-label[data-disabled] {
+        cursor: wait;
+        opacity: 0.58;
+      }
+
+      details[data-disabled] summary,
+      .file-label[data-disabled] {
+        pointer-events: none;
+      }
+
+      button:focus-visible,
+      input:focus-visible,
+      select:focus-visible,
+      summary:focus-visible,
+      .file-label:focus-within {
         outline: 3px solid #7c3aed;
         outline-offset: 2px;
       }
@@ -54,6 +71,20 @@
       }
 
       .primary:hover { background: #3730a3; }
+
+      .cancel-action {
+        border-color: #f1a3a3;
+        background: #fff7f7;
+        color: #a11919;
+      }
+
+      .cancel-action:hover { background: #feecec; }
+
+      .retry-action {
+        border-color: #a5b4fc;
+        background: #eef2ff;
+        color: #3730a3;
+      }
 
       .app-header {
         border-bottom: 1px solid #d7ddea;
@@ -101,10 +132,111 @@
       }
 
       .field { display: grid; gap: 0.35rem; }
-      .field > span { color: #536078; font-size: 0.78rem; font-weight: 700; }
-      select { min-width: 7rem; padding: 0.55rem 2rem 0.55rem 0.75rem; }
-      input[type="file"] { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
-      .file-name { max-width: 18rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .field > span, .helper { color: #536078; font-size: 0.78rem; font-weight: 700; }
+      .helper { font-weight: 500; line-height: 1.4; }
+      select, input[type="text"] { min-width: 8rem; padding: 0.55rem 0.75rem; }
+      input[type="file"] {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip-path: inset(50%);
+      }
+
+      .file-label { max-width: min(100%, 24rem); }
+      .file-name {
+        max-width: 20rem;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .advanced {
+        flex: 1 1 100%;
+        border-top: 1px solid #e1e5ee;
+        padding-top: 0.75rem;
+      }
+
+      .advanced > summary {
+        width: fit-content;
+        list-style-position: inside;
+        background: #f8f9fc;
+      }
+
+      .advanced-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(10rem, 1fr));
+        gap: 0.75rem;
+        padding-top: 0.75rem;
+      }
+
+      .advanced-grid input, .advanced-grid select { width: 100%; }
+
+      .operation-panel {
+        display: grid;
+        gap: 0.55rem;
+        padding: 0.85rem 1rem;
+        border: 1px solid #d7ddea;
+        border-top: 0;
+        background: #f8f9fc;
+      }
+
+      .state-line, .source-meta {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 0.55rem 1rem;
+      }
+
+      .state-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+        border-radius: 999px;
+        padding: 0.25rem 0.65rem;
+        background: #e4e7ec;
+        color: #344054;
+        font-size: 0.78rem;
+        font-weight: 750;
+        letter-spacing: 0.02em;
+        text-transform: uppercase;
+      }
+
+      .state-badge::before {
+        width: 0.5rem;
+        height: 0.5rem;
+        border-radius: 50%;
+        background: currentColor;
+        content: "";
+      }
+
+      .operation-panel[data-state="opening"] .state-badge { background: #eaf2ff; color: #175cd3; }
+      .operation-panel[data-state="indexing"] .state-badge { background: #f3e8ff; color: #7e22ce; }
+      .operation-panel[data-state="ready"] .state-badge { background: #e8f8ef; color: #087443; }
+      .operation-panel[data-state="cancelled"] .state-badge { background: #fff4dc; color: #975a16; }
+      .operation-panel[data-state="error"] .state-badge { background: #feecec; color: #b42318; }
+
+      #status {
+        min-width: 0;
+        margin: 0;
+        color: #344054;
+        line-height: 1.5;
+      }
+
+      #status[data-kind="error"] { color: #b42318; font-weight: 650; }
+      #status[data-kind="cancelled"] { color: #7a4b12; font-weight: 650; }
+
+      .source-meta { color: #667085; font-size: 0.82rem; line-height: 1.45; }
+      .warning-summary { color: #8a4b08; font-weight: 650; }
+
+      progress {
+        width: min(100%, 34rem);
+        height: 0.55rem;
+        overflow: hidden;
+        border: 0;
+        border-radius: 999px;
+        accent-color: #7c3aed;
+      }
 
       .workspace {
         position: relative;
@@ -125,15 +257,15 @@
         display: grid;
         place-content: center;
         justify-items: center;
-        gap: 0.6rem;
+        gap: 0.65rem;
         padding: 2rem;
         text-align: center;
       }
 
       .empty-state[hidden] { display: none; }
-      .empty-mark { font-size: 2.25rem; line-height: 1; }
+      .empty-mark { width: 2.5rem; height: 2.5rem; color: #667085; }
       .empty-state strong { font-size: 1.05rem; }
-      .empty-state p { max-width: 30rem; margin: 0; color: #536078; line-height: 1.5; }
+      .empty-state p { max-width: 32rem; margin: 0; color: #536078; line-height: 1.5; }
 
       .status-row {
         display: flex;
@@ -145,7 +277,8 @@
         font-size: 0.875rem;
       }
 
-      #status[data-kind="error"] { color: #b42318; font-weight: 650; }
+      .privacy-note { font-weight: 650; }
+
       kbd {
         border: 1px solid #b7c0d1;
         border-bottom-width: 2px;
@@ -156,67 +289,178 @@
         font: 0.78rem ui-monospace, monospace;
       }
 
+      @media (max-width: 48rem) {
+        .advanced-grid { grid-template-columns: 1fr; }
+      }
+
       @media (max-width: 42rem) {
         .header-inner { min-height: 3.75rem; }
         .badge, .shortcuts { display: none; }
-        .toolbar > * { flex: 1 1 auto; }
+        .toolbar > :not(.advanced) { flex: 1 1 100%; }
         .file-label, button { width: 100%; }
+        .file-name { max-width: 100%; }
+        .state-line, .source-meta { align-items: flex-start; flex-direction: column; }
       }
 
       @media (prefers-reduced-motion: reduce) {
-        *, *::before, *::after { scroll-behavior: auto !important; }
+        *, *::before, *::after {
+          scroll-behavior: auto !important;
+          transition-duration: 0.01ms !important;
+        }
       }
 
       @media (prefers-color-scheme: dark) {
         :root { color: #edf0f7; background: #111827; }
-        .app-header, .toolbar, .workspace { background: #182235; border-color: #34415a; }
-        button, select, .file-label, kbd { color: #edf0f7; background: #202c42; border-color: #526079; }
-        button:hover, .file-label:hover { background: #293750; }
+        .app-header, .toolbar, .operation-panel, .workspace {
+          background: #182235;
+          border-color: #34415a;
+        }
+        button, input[type="text"], select, .file-label, summary, kbd {
+          color: #edf0f7;
+          background: #202c42;
+          border-color: #526079;
+        }
+        button:hover, .file-label:hover, summary:hover { background: #293750; }
         .primary { background: #7c3aed; border-color: #8b5cf6; }
         .primary:hover { background: #6d28d9; }
-        .lede, .field > span, .empty-state p, .status-row { color: #b5c0d4; }
+        .cancel-action { color: #fecaca; background: #3a232b; border-color: #9f4b58; }
+        .retry-action { color: #ddd6fe; background: #2b2850; border-color: #6d5dae; }
+        .lede, .field > span, .helper, .empty-state p, .status-row, .source-meta {
+          color: #b5c0d4;
+        }
+        #status { color: #d8dfec; }
+        #status[data-kind="error"] { color: #fda4af; }
+        #status[data-kind="cancelled"], .warning-summary { color: #fbd38d; }
         .badge { color: #ddd6fe; }
+        .advanced { border-color: #34415a; }
+        .advanced > summary { background: #202c42; }
+        .state-badge { background: #34415a; color: #d8dfec; }
+        .operation-panel[data-state="opening"] .state-badge { background: #233a61; color: #bfdbfe; }
+        .operation-panel[data-state="indexing"] .state-badge { background: #40265f; color: #e9d5ff; }
+        .operation-panel[data-state="ready"] .state-badge { background: #173e32; color: #a7f3d0; }
+        .operation-panel[data-state="cancelled"] .state-badge { background: #4a351c; color: #fde68a; }
+        .operation-panel[data-state="error"] .state-badge { background: #4b2229; color: #fecaca; }
       }
     </style>
   </head>
   <body>
     <header class="app-header">
       <div class="header-inner">
-        <div class="brand"><strong>Tabulark</strong><span class="badge">M2 PREVIEW</span></div>
+        <div class="brand"><strong>Tabulark</strong><span class="badge">M3.1 PREVIEW</span></div>
         <span class="shortcuts"><kbd>↑</kbd> <kbd>↓</kbd> navigate · <kbd>Ctrl</kbd> <kbd>C</kbd> copy</span>
       </div>
     </header>
-    <main>
+    <main id="app" data-state="idle" data-testid="app">
       <h1>Explore a local table instantly.</h1>
       <p class="lede">
         Your file stays in this browser. Tabulark parses CSV or TSV in a Worker and paints only
         the visible viewport.
       </p>
-      <form id="open-form" class="toolbar">
-        <label class="file-label">
-          <span class="file-name" id="file-name">Choose a file</span>
-          <input id="source" type="file" accept=".csv,.tsv,text/csv,text/tab-separated-values" />
+      <form id="open-form" class="toolbar" data-testid="open-form">
+        <label id="file-picker" data-testid="file-picker" class="file-label">
+          <span class="file-name" id="file-name" data-testid="file-name">Choose a file</span>
+          <input
+            id="source"
+            data-testid="source-input"
+            type="file"
+            accept=".csv,.tsv,text/csv,text/tab-separated-values"
+          />
         </label>
         <label class="field">
           <span>Format</span>
-          <select id="format" aria-label="File format">
+          <select id="format" data-testid="format" aria-label="File format">
             <option value="csv">CSV</option>
             <option value="tsv">TSV</option>
           </select>
         </label>
-        <button id="open" class="primary" type="submit">Open preview</button>
-        <button id="sample" type="button">Try sample data</button>
+        <button id="open" data-testid="open-button" class="primary" type="submit">Open preview</button>
+        <button id="sample" data-testid="sample-button" type="button">Try sample data</button>
+        <button
+          id="cancel"
+          data-testid="cancel-button"
+          class="cancel-action"
+          type="button"
+          hidden
+        >Cancel</button>
+        <button
+          id="retry"
+          data-testid="retry-button"
+          class="retry-action"
+          type="button"
+          hidden
+        >Retry last source</button>
+        <details id="advanced" data-testid="advanced-options" class="advanced">
+          <summary>Parsing options</summary>
+          <div class="advanced-grid">
+            <label class="field">
+              <span>Header row</span>
+              <select id="header-mode" data-testid="header-mode">
+                <option value="first-row">Use first row as headers</option>
+                <option value="none">No header row</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Malformed rows</span>
+              <select id="parse-mode" data-testid="parse-mode">
+                <option value="lenient">Keep previewing with warnings</option>
+                <option value="strict">Stop with an error</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Delimiter override</span>
+              <input
+                id="delimiter"
+                data-testid="delimiter"
+                type="text"
+                maxlength="2"
+                inputmode="text"
+                aria-describedby="delimiter-help"
+              />
+              <span id="delimiter-help" data-testid="delimiter-help" class="helper">
+                Leave blank for comma. Use \t for a tab.
+              </span>
+            </label>
+          </div>
+        </details>
       </form>
-      <section class="workspace" aria-label="Table preview">
-        <div id="preview"></div>
-        <div id="empty-state" class="empty-state">
-          <span class="empty-mark" aria-hidden="true">▦</span>
-          <strong>No table open</strong>
-          <p>Choose a local CSV or TSV, or load the generated sample. Nothing is uploaded.</p>
+      <section
+        id="operation-panel"
+        data-testid="operation-panel"
+        class="operation-panel"
+        data-state="idle"
+        aria-label="Preview status"
+      >
+        <div class="state-line">
+          <span class="state-badge" data-testid="state-label">Idle</span>
+          <p id="status" data-testid="status" role="status" aria-live="polite" aria-atomic="true" tabindex="-1">
+            Choose a local CSV or TSV file, or load the generated sample.
+          </p>
+        </div>
+        <div class="source-meta">
+          <span id="file-summary" data-testid="file-summary">No source selected.</span>
+          <span id="warning-summary" data-testid="warning-summary" class="warning-summary" hidden></span>
+        </div>
+        <progress
+          id="progress"
+          data-testid="progress"
+          aria-label="Source indexing progress"
+          hidden
+        ></progress>
+      </section>
+      <section id="workspace" data-testid="workspace" class="workspace" aria-label="Table preview" aria-busy="false">
+        <div id="preview" data-testid="preview"></div>
+        <div id="empty-state" data-testid="empty-state" class="empty-state">
+          <svg class="empty-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M4 5.5h16v13H4zM4 10h16M9 5.5v13M15 5.5v13" fill="none" stroke="currentColor" stroke-width="1.5" />
+          </svg>
+          <strong id="empty-title" data-testid="empty-title">No table open</strong>
+          <p id="empty-message" data-testid="empty-message">
+            Choose a local CSV or TSV, or load the generated sample. Nothing is uploaded.
+          </p>
         </div>
       </section>
       <div class="status-row">
-        <span id="status" role="status" aria-live="polite">Ready.</span>
+        <span class="privacy-note">Local-only preview · no file upload</span>
         <span class="shortcuts">Drag a column boundary to resize · Shift + arrows selects a range</span>
       </div>
     </main>

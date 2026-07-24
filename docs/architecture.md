@@ -1,7 +1,8 @@
 # Architecture
 
-> Status: M0 through M2 are implemented as an experimental local CSV/TSV
-> vertical slice. M3 hardening and measurement and M4 second-adapter validation
+> Status: M0 through M2 remain an experimental local CSV/TSV vertical slice.
+> One M3.1 lifecycle, protocol, diagnostics, and example-hardening slice is
+> implemented, but M3 hardening and measurement and M4 second-adapter validation
 > remain unfinished, and no interface is stable yet.
 
 This document records the implemented prototype boundaries and the intended
@@ -171,6 +172,10 @@ The initial source inputs are `File`/`Blob` and `ArrayBuffer`. Streams, remote
 range sources, and application-defined byte sources are later extensions. The
 host application remains responsible for authentication, CORS policy, and
 network fetching unless a separately installed source provider says otherwise.
+For the current CSV/TSV adapter, `File.name` is inferred as `sourceName`, which
+becomes the table descriptor and metadata display name. Hosts may provide
+`sourceName` explicitly for `Blob` or `ArrayBuffer` inputs, or to override the
+inferred file name.
 
 ### Identity and lifecycle
 
@@ -179,6 +184,12 @@ network fetching unless a separately installed source provider says otherwise.
 - A table handle belongs to exactly one dataset session.
 - `close()` is idempotent and releases all resources owned by that handle.
 - Closing a dataset invalidates its table handles and cancels outstanding work.
+- A delayed/background scan fatal is terminal for the dataset: the facade
+  closes live child tables and puts controllers into a terminal error state,
+  then the Worker closes the dataset and releases its source slot.
+- Remote table, dataset, and runtime close acknowledgements have bounded waits;
+  an unresponsive Worker is terminated so local handles cannot remain pending
+  indefinitely.
 - The first model is an immutable snapshot. A future live-source model must add
   explicit revisions rather than silently changing data beneath cached ranges.
 
@@ -315,8 +326,13 @@ The Worker may emit interleaved events:
 
 - Open and parse progress.
 - Extent or schema metadata updates.
-- Recoverable source warnings.
+- Recoverable source warnings with structured row and byte-offset context.
 - Runtime-fatal failure.
+
+Diagnostics found by the initial prefix scan are buffered in the Worker until
+the dataset session can subscribe, then emitted through the same warning event
+path as later scan diagnostics. This prevents an `open()` timing race from
+silently losing initial warnings.
 
 Errors are serializable values with a stable code, safe message, retryability,
 and optional structured details. Raw exceptions and implementation stack traces
@@ -328,6 +344,13 @@ Protocol rules:
 - Cancellation is best effort and always produces a terminal request state.
 - Closing a handle invalidates all outstanding requests for that handle.
 - Unknown operations or incompatible protocol versions fail explicitly.
+- Dataset and table events carry a non-empty `datasetHandle`; only a
+  process-wide `runtimeError` may omit routing fields.
+- Malformed protocol-shaped messages, unexpected response kinds, and empty
+  returned handles terminate the runtime with `PROTOCOL_INCOMPATIBLE` rather
+  than leaving partially initialized sessions alive.
+- Lifecycle close requests use a bounded timeout; timeout is a terminal runtime
+  failure followed by Worker termination.
 - Large binary payloads use transfer lists. `SharedArrayBuffer` is not a baseline
   requirement because it adds cross-origin isolation constraints.
 
@@ -450,9 +473,10 @@ to the host. Formula text and external links are treated as data; no embedded
 code is executed. Network access and persistent storage are opt-in extension
 ports rather than implicit adapter privileges.
 
-If a Worker terminates unexpectedly, the facade fails pending requests with a
-runtime error and allows the host to create a new session. Automatic reopening
-is deferred until source replay and side effects are well defined.
+If a Worker terminates unexpectedly, or a delayed scan reaches a fatal error,
+the facade fails pending requests and live handles with a runtime error, closes
+the affected sessions, and allows the host to create a fresh engine. Automatic
+reopening is deferred until source replay and side effects are well defined.
 
 ## 9. Package and repository evolution
 
@@ -527,10 +551,14 @@ Each boundary needs its own evidence:
   frame time, peak memory, transferred bytes, and package size.
 
 The existing contract, Node, and Chromium suites provide M0-M2 prototype
-evidence. The broader compatibility corpus, fuzzing, browser crash matrix,
-screenshot/accessibility automation, and reproducible performance measurements
-listed above are unfinished M3 work. Performance numbers remain engineering
-targets until benchmark hardware, datasets, and harnesses are committed.
+evidence plus the M3.1 lifecycle/protocol slice: delayed scan fatal cleanup,
+bounded close timeouts, malformed-message termination, initial diagnostic
+delivery with row context, source-name propagation, and browser-example
+cancel/retry recovery. The broader CSV compatibility corpus and fuzzing,
+deterministic visual/screenshot and axe accessibility automation, and
+reproducible performance measurements remain unfinished M3 work. Performance
+numbers remain engineering targets until benchmark hardware, datasets, and
+harnesses are committed.
 
 ## 11. Architectural decisions for the first prototype
 

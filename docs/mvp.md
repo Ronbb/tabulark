@@ -1,9 +1,9 @@
 # MVP Roadmap
 
-> Status: the M0-M2 local CSV/TSV path is implemented experimentally. This does
-> not imply that every planned deliverable or hardening criterion below is
-> complete. M3 and M4 remain the proposed sequence, and the MVP is not a stable
-> API promise.
+> Status: the M0-M2 local CSV/TSV path remains an experimental prototype. An
+> M3.1 lifecycle, protocol, diagnostics, and example-hardening slice is
+> implemented, but M3 and M4 are not complete and the MVP is not a stable API
+> promise.
 
 ## Goal
 
@@ -148,6 +148,27 @@ Exit criteria:
 - The preview remains usable while a large file is still being parsed.
 
 ### M3: Hardening and measurement
+
+Status: partially implemented. The M3.1 slice now provides:
+
+- Terminal handling for delayed/background scan failures: live child tables
+  close, controllers enter a terminal error state, the dataset closes, and the
+  Worker releases the source.
+- Bounded lifecycle-close waits. An unresponsive close or shutdown falls back
+  to terminating the unusable Worker instead of waiting indefinitely.
+- Defensive validation of Worker envelopes, response kinds, and returned
+  handles; malformed or incompatible protocol state is terminal.
+- Initial lenient diagnostics delivered after the dataset session is observable,
+  with structured row and byte-offset context.
+- `File.name` inferred as the default `sourceName` and table display name, plus
+  an explicit `sourceName` option for other inputs or host overrides.
+- A browser example with parse options, cancel, retry, strict-to-lenient
+  recovery, and fresh-Worker recovery after terminal runtime failure, covered by
+  `test/browser/example.spec.mjs`.
+
+M3 remains incomplete. The broader CSV compatibility corpus and parser fuzzing,
+deterministic visual/screenshot and axe accessibility coverage, and a committed
+reproducible performance baseline are still pending.
 
 Deliver:
 

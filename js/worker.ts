@@ -51,6 +51,8 @@ interface DatasetState {
   scanError?: ProtocolFault;
   scanPromise?: Promise<void>;
   closed: boolean;
+  eventsReady: boolean;
+  readonly pendingWarnings: unknown[];
   readonly waiters: Set<() => void>;
   readonly rangeCache: ByteLruCache<WireTableBatch>;
 }
@@ -76,6 +78,7 @@ interface ActiveRangeRequest {
   readonly datasetHandle: string;
   readonly tableHandle: string;
   cancelled: boolean;
+  failure?: ProtocolFault;
   cursorHandle?: string | number;
 }
 
@@ -133,6 +136,9 @@ async function dispatch(value: unknown): Promise<void> {
   try {
     const result = await runOperation(request);
     postSuccess(request.requestId, result.kind, result.data, result.transfer);
+    if (request.op === "listTables") {
+      flushPendingDatasetEvents(request.payload);
+    }
     if (request.op === "shutdown") {
       setTimeout(() => scope.close(), 0);
     }
@@ -286,6 +292,8 @@ async function openSource(requestId: string, value: unknown): Promise<unknown> {
       scanOffset: 0,
       scanDone: false,
       closed: false,
+      eventsReady: false,
+      pendingWarnings: [],
       waiters: new Set(),
       rangeCache: new ByteLruCache(rangeCacheBudgetBytes),
     };
@@ -557,17 +565,26 @@ async function scanToEnd(dataset: DatasetState): Promise<void> {
       await scanNextChunk(dataset, true);
     }
   } catch (error) {
+    if (dataset.closed) {
+      return;
+    }
     dataset.scanError = error instanceof ProtocolFault
       ? error
       : new ProtocolFault("RUNTIME_FAILURE", "Background source scanning failed", false, undefined, error);
     dataset.scanDone = true;
     notifyScanWaiters(dataset);
-    emit({
-      event: "runtimeError",
-      datasetHandle: dataset.handle,
-      tableId: dataset.metadata.tableId,
-      payload: serializeFault(dataset.scanError, "Background source scanning failed"),
-    });
+    try {
+      emit({
+        event: "runtimeError",
+        datasetHandle: dataset.handle,
+        tableId: dataset.metadata.tableId,
+        payload: serializeFault(dataset.scanError, "Background source scanning failed"),
+      });
+    } finally {
+      // A delayed scan error is terminal for the source. Closing here also
+      // invalidates any open tables and releases the Wasm source slot.
+      closeDatasetState(dataset, true, dataset.scanError);
+    }
   }
 }
 
@@ -637,18 +654,37 @@ function applyScanUpdate(
   }
 
   const warnings = update.warnings ?? (update.warning === undefined ? [] : [update.warning]);
-  if (emitEvents) {
-    for (const warning of warnings) {
-      emit({
-        event: "warning",
-        datasetHandle: dataset.handle,
-        tableId: dataset.metadata.tableId,
-        payload: {
-          handle: dataset.handle,
-          ...(isRecord(warning) ? warning : { kind: "warning", message: String(warning) }),
-        },
-      });
-    }
+  if (!emitEvents || !dataset.eventsReady) {
+    dataset.pendingWarnings.push(...warnings);
+    return;
+  }
+  emitWarnings(dataset, warnings);
+}
+
+function flushPendingDatasetEvents(value: unknown): void {
+  const payload = isRecord(value) ? value : {};
+  if (typeof payload.datasetHandle !== "string") {
+    return;
+  }
+  const dataset = datasets.get(payload.datasetHandle);
+  if (!dataset || dataset.closed || dataset.eventsReady) {
+    return;
+  }
+  dataset.eventsReady = true;
+  emitWarnings(dataset, dataset.pendingWarnings.splice(0));
+}
+
+function emitWarnings(dataset: DatasetState, warnings: readonly unknown[]): void {
+  for (const warning of warnings) {
+    emit({
+      event: "warning",
+      datasetHandle: dataset.handle,
+      tableId: dataset.metadata.tableId,
+      payload: {
+        handle: dataset.handle,
+        ...(isRecord(warning) ? warning : { kind: "warning", message: String(warning) }),
+      },
+    });
   }
 }
 
@@ -678,8 +714,11 @@ function notifyScanWaiters(dataset: DatasetState): void {
   }
 }
 
-function cancelActive(active: ActiveRequest): void {
+function cancelActive(active: ActiveRequest, failure?: ProtocolFault): void {
   if (active.cancelled) {
+    if (active.kind === "range" && active.failure === undefined && failure !== undefined) {
+      active.failure = failure;
+    }
     return;
   }
   active.cancelled = true;
@@ -693,9 +732,12 @@ function cancelActive(active: ActiveRequest): void {
     }
     return;
   }
+  if (failure !== undefined) {
+    active.failure = failure;
+  }
   rangePermits.cancel(
     active.requestId,
-    new ProtocolFault("CANCELLED", "The range request was cancelled"),
+    failure ?? new ProtocolFault("CANCELLED", "The range request was cancelled"),
   );
   if (active.cursorHandle !== undefined) {
     try {
@@ -712,6 +754,9 @@ function cancelActive(active: ActiveRequest): void {
 
 function throwIfCancelled(active: ActiveRequest): void {
   if (active.cancelled) {
+    if (active.kind === "range" && active.failure !== undefined) {
+      throw active.failure;
+    }
     throw new ProtocolFault(
       "CANCELLED",
       active.kind === "open" ? "The open request was cancelled" : "The range request was cancelled",
@@ -719,11 +764,15 @@ function throwIfCancelled(active: ActiveRequest): void {
   }
 }
 
-function closeTableState(table: OpenTableState, emitEvent: boolean): void {
+function closeTableState(
+  table: OpenTableState,
+  emitEvent: boolean,
+  failure?: ProtocolFault,
+): void {
   table.closed = true;
   for (const active of activeRequests.values()) {
     if (active.kind === "range" && active.tableHandle === table.handle) {
-      cancelActive(active);
+      cancelActive(active, failure);
     }
   }
   tables.delete(table.handle);
@@ -738,19 +787,24 @@ function closeTableState(table: OpenTableState, emitEvent: boolean): void {
   }
 }
 
-function closeDatasetState(dataset: DatasetState, emitEvent: boolean): void {
+function closeDatasetState(
+  dataset: DatasetState,
+  emitEvent: boolean,
+  failure?: ProtocolFault,
+): void {
   dataset.closed = true;
+  dataset.pendingWarnings.length = 0;
   openedDatasetsByRequest.delete(dataset.openRequestId);
   dataset.rangeCache.clear();
   notifyScanWaiters(dataset);
   for (const table of [...tables.values()]) {
     if (table.datasetHandle === dataset.handle) {
-      closeTableState(table, emitEvent);
+      closeTableState(table, emitEvent, failure);
     }
   }
   for (const active of activeRequests.values()) {
     if (active.datasetHandle === dataset.handle) {
-      cancelActive(active);
+      cancelActive(active, failure);
     }
   }
   datasets.delete(dataset.handle);
