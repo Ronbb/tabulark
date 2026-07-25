@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "generator": "examples/generate_arrow_fixture.rs",
+  "arrowVersion": "59.1.0",
+  "rows": 512,
+  "batchRows": 64,
+  "files": [
+    {
+      "path": "m4-file-none.arrow",
+      "container": "file",
+      "compression": "none",
+      "bytes": 56754,
+      "sha256": "1aa831a7e4c6787aa50933981c0db0944bf50e715431ad330470fb720d5b2463"
+    },
+    {
+      "path": "m4-file-lz4.arrow",
+      "container": "file",
+      "compression": "lz4",
+      "bytes": 27058,
+      "sha256": "485568ba5f803d7429ff7764054be30759028af0688265336beeb1a1c8479059"
+    },
+    {
+      "path": "m4-file-zstd.arrow",
+      "container": "file",
+      "compression": "zstd",
+      "bytes": 22450,
+      "sha256": "ba0bb0b0fd749b0f9b9fff828898f04c0f6d9b58baf3dfa13393c36ac7502976"
+    },
+    {
+      "path": "m4-stream-none.arrows",
+      "container": "stream",
+      "compression": "none",
+      "bytes": 55816,
+      "sha256": "a6eb9b08d91eeeede3d93a2aac55b6c8baef752cbf0d8765989b8dff6a937de9"
+    },
+    {
+      "path": "m4-stream-lz4.arrows",
+      "container": "stream",
+      "compression": "lz4",
+      "bytes": 26120,
+      "sha256": "6f92f1f68f16dbd11477954baa9c56228612e889688048ca7059ee2667301a1b"
+    },
+    {
+      "path": "m4-stream-zstd.arrows",
+      "container": "stream",
+      "compression": "zstd",
+      "bytes": 21512,
+      "sha256": "c41c85f6e4ef56b3fb14b61c97495a5a7f598b6c21806acd81012b3a79cee956"
+    }
+  ]
+}

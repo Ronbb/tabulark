@@ -171,40 +171,25 @@ export function rangeCacheKeyBelongsTo(key: string, owner: string): boolean {
 
 export function cloneWireTableBatch(batch: WireTableBatch): WireTableBatch {
   return {
+    layoutVersion: batch.layoutVersion,
     tableId: batch.tableId,
     revision: batch.revision,
     schemaVersion: batch.schemaVersion,
     range: { ...batch.range },
-    columns: batch.columns.map((column) => ({
-      columnId: column.columnId,
-      encoding: "utf8",
-      data: Uint8Array.from(asUint8Array(column.data)),
-      offsets: Uint32Array.from(asUint32Array(column.offsets)),
-      validity: Uint8Array.from(asUint8Array(column.validity)),
-    })),
+    // Clone each pool entry exactly once. Descriptor buffer indexes remain
+    // valid and native/display aliases stay deduplicated.
+    buffers: batch.buffers.map((buffer) => Uint8Array.from(asUint8Array(buffer)).buffer),
+    columns: batch.columns,
     complete: batch.complete,
   };
 }
 
 export function wireBatchByteLength(batch: WireTableBatch): number {
-  return batch.columns.reduce(
-    (total, column) =>
-      total +
-      arrayByteLength(column.data) +
-      arrayByteLength(column.offsets) +
-      arrayByteLength(column.validity),
-    0,
-  );
+  return batch.buffers.reduce((total, buffer) => total + buffer.byteLength, 0);
 }
 
-function asUint8Array(value: Uint8Array | ArrayBuffer): Uint8Array {
-  return value instanceof Uint8Array ? value : new Uint8Array(value);
-}
-
-function asUint32Array(value: Uint32Array | ArrayBuffer): Uint32Array {
-  return value instanceof Uint32Array ? value : new Uint32Array(value);
-}
-
-function arrayByteLength(value: Uint8Array | Uint32Array | ArrayBuffer): number {
-  return value.byteLength;
+function asUint8Array(value: ArrayBuffer | ArrayBufferView): Uint8Array {
+  return value instanceof ArrayBuffer
+    ? new Uint8Array(value)
+    : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
 }

@@ -1,6 +1,10 @@
 //! Bounded parser lifecycle checks shared by the cargo-fuzz target and its
 //! deterministic stable-Cargo smoke binary.
 
+use tabulark::arrow::{
+    ArrowIpcContainer, ArrowIpcLimits, ArrowIpcOpenOperation, ArrowIpcOptions, ArrowIpcRuntime,
+    ArrowReadStart, ArrowRuntimeConfig,
+};
 use tabulark::csv::{CsvLimits, CsvScanner, DelimitedOptions, ParseMode, RangeDecodeStatus};
 use tabulark::{AxisExtent, ErrorCode, RangeRequest, TableBatch};
 
@@ -32,6 +36,203 @@ pub fn exercise(input: &[u8]) {
         source,
         derived_options(source, &controls),
         controls.range_salt,
+    );
+}
+
+/// Exercises bounded Arrow IPC File/Stream parsing, range reads, and cleanup.
+///
+/// Invalid or over-budget bytes are normal fuzz outcomes. A successful open is
+/// driven through table open, projected reads, idempotent close, and shutdown
+/// so libFuzzer also covers post-error handle-registry invariants.
+pub fn exercise_arrow(input: &[u8]) {
+    const MAX_ARROW_SOURCE_BYTES: usize = 64 * 1024;
+    let source = &input[..input.len().min(MAX_ARROW_SOURCE_BYTES)];
+    for container in [
+        ArrowIpcContainer::Auto,
+        ArrowIpcContainer::File,
+        ArrowIpcContainer::Stream,
+    ] {
+        let mut runtime = ArrowIpcRuntime::new(ArrowRuntimeConfig {
+            memory_budget_bytes: 4 * 1024 * 1024,
+            max_sources: 2,
+        })
+        .expect("bounded Arrow fuzz runtime config");
+        let options = ArrowIpcOptions {
+            container,
+            table_name: "fuzz-arrow".into(),
+            limits: ArrowIpcLimits {
+                max_source_bytes: MAX_ARROW_SOURCE_BYTES,
+                max_decoded_bytes: 2 * 1024 * 1024,
+                max_output_bytes: 512 * 1024,
+                max_metadata_bytes: 64 * 1024,
+                max_block_bytes: 1024 * 1024,
+                stream_chunk_bytes: 4 * 1024,
+                max_fields: 256,
+                max_nesting_depth: 32,
+                max_range_cells: 256,
+                max_display_cell_bytes: 16 * 1024,
+            },
+        };
+        exercise_incremental_arrow(source, options.clone());
+        let source_handle = match runtime.open_source(source, options) {
+            Ok(handle) => handle,
+            Err(error) => {
+                assert_arrow_fuzz_error(error.code());
+                assert_eq!(runtime.source_count(), 0);
+                runtime.shutdown();
+                continue;
+            }
+        };
+        assert_eq!(runtime.source_count(), 1);
+        let table = runtime
+            .open_table(source_handle, "table-0")
+            .expect("valid Arrow source must expose table-0");
+        let metadata = runtime.metadata(table).expect("open Arrow metadata");
+        let rows = metadata.extent().rows().value().unwrap_or(0);
+        let columns = metadata.extent().columns().value().unwrap_or(0);
+        if columns > 0 {
+            let row_start = if rows == 0 {
+                0
+            } else {
+                u64::from(control(source, 0)) % rows.saturating_add(1)
+            };
+            let row_count = u64::from(control(source, 1) % 8);
+            let column_start = u64::from(control(source, 2)) % columns;
+            let column_count =
+                (1 + u64::from(control(source, 3) % 4)).min(columns.saturating_sub(column_start));
+            let request = RangeRequest::new(row_start, row_count, column_start, column_count)
+                .expect("bounded Arrow fuzz range");
+            match runtime.read_range(table, request) {
+                Ok(batch) => {
+                    assert!(batch.range().row_count() <= row_count);
+                    assert_eq!(batch.range().column_count(), column_count);
+                    assert_eq!(batch.columns().len(), column_count as usize);
+                    assert!(
+                        batch
+                            .buffers()
+                            .iter()
+                            .map(|buffer| buffer.data().len())
+                            .sum::<usize>()
+                            <= 512 * 1024
+                    );
+                }
+                Err(error) => assert_arrow_fuzz_error(error.code()),
+            }
+        }
+        assert!(runtime.close_table(table));
+        assert!(!runtime.close_table(table));
+        assert!(runtime.close_source(source_handle));
+        assert_eq!(runtime.source_count(), 0);
+        assert_eq!(runtime.table_count(), 0);
+        assert_eq!(runtime.retained_bytes(), 0);
+        runtime.shutdown();
+    }
+}
+
+fn exercise_incremental_arrow(source: &[u8], options: ArrowIpcOptions) {
+    let mut open = match ArrowIpcOpenOperation::new(source.len(), options) {
+        Ok(open) => open,
+        Err(error) => return assert_arrow_fuzz_error(error.code()),
+    };
+    let opened = (0..4_096).find_map(|_| {
+        let action = match open.next_action() {
+            Ok(Some(action)) => action,
+            Ok(None) => return None,
+            Err(error) => {
+                assert_arrow_fuzz_error(error.code());
+                return None;
+            }
+        };
+        let offset = usize::try_from(action.offset).expect("bounded Arrow action offset");
+        let length = usize::try_from(action.length).expect("bounded Arrow action length");
+        let end = offset
+            .checked_add(length)
+            .expect("bounded Arrow action range");
+        assert!(end <= source.len());
+        match open.feed(action.offset, &source[offset..end], end == source.len()) {
+            Ok(source) => source,
+            Err(error) => {
+                assert_arrow_fuzz_error(error.code());
+                None
+            }
+        }
+    });
+    let Some(opened) = opened else {
+        return;
+    };
+
+    let mut runtime = ArrowIpcRuntime::new(ArrowRuntimeConfig {
+        memory_budget_bytes: 4 * 1024 * 1024,
+        max_sources: 2,
+    })
+    .expect("bounded incremental Arrow runtime config");
+    let source_handle = match runtime.open_incremental_source(opened) {
+        Ok(handle) => handle,
+        Err(error) => return assert_arrow_fuzz_error(error.code()),
+    };
+    let table = runtime
+        .open_table(source_handle, "table-0")
+        .expect("incremental Arrow source exposes table-0");
+    let metadata = runtime.metadata(table).expect("incremental Arrow metadata");
+    let rows = metadata.extent().rows().value().unwrap_or(0);
+    let columns = metadata.extent().columns().value().unwrap_or(0);
+    if columns > 0 {
+        let request = RangeRequest::new(0, rows.min(4), 0, columns.min(4))
+            .expect("incremental Arrow fuzz range");
+        match runtime.begin_read(table, request) {
+            Ok(ArrowReadStart::Complete(batch)) => {
+                assert!(batch.range().row_count() <= rows.min(4));
+                assert!(batch.range().column_count() <= columns.min(4));
+            }
+            Ok(ArrowReadStart::File(mut read)) => {
+                for _ in 0..4_096 {
+                    let action = match read.next_action() {
+                        Ok(Some(action)) => action,
+                        Ok(None) => break,
+                        Err(error) => {
+                            assert_arrow_fuzz_error(error.code());
+                            break;
+                        }
+                    };
+                    let offset = usize::try_from(action.offset).expect("bounded read offset");
+                    let length = usize::try_from(action.length).expect("bounded read length");
+                    let end = offset.checked_add(length).expect("bounded read range");
+                    assert!(end <= source.len());
+                    match read.feed(action.offset, &source[offset..end], end == source.len()) {
+                        Ok(Some(batch)) => {
+                            assert!(batch.range().row_count() <= rows.min(4));
+                            assert!(batch.range().column_count() <= columns.min(4));
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            assert_arrow_fuzz_error(error.code());
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(error) => assert_arrow_fuzz_error(error.code()),
+        }
+    }
+    assert!(runtime.close_table(table));
+    assert!(runtime.close_source(source_handle));
+    assert_eq!(runtime.source_count(), 0);
+    assert_eq!(runtime.table_count(), 0);
+    runtime.shutdown();
+}
+
+fn assert_arrow_fuzz_error(code: ErrorCode) {
+    assert!(
+        matches!(
+            code,
+            ErrorCode::ParseFailed
+                | ErrorCode::UnsupportedFeature
+                | ErrorCode::ResourceLimit
+                | ErrorCode::InvalidRange
+                | ErrorCode::InvalidArgument
+        ),
+        "bounded Arrow lifecycle returned unexpected {code:?}"
     );
 }
 

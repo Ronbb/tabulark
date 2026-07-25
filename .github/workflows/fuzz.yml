@@ -13,10 +13,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  csv-lifecycle:
-    name: CSV lifecycle
+  lifecycle:
+    name: ${{ matrix.label }} lifecycle
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: csv_lifecycle
+            label: CSV
+          - target: arrow_lifecycle
+            label: Arrow IPC
     env:
       CARGO_FUZZ_VERSION: "0.12.0"
       FUZZ_TIME_SECONDS: "600"
@@ -49,11 +57,11 @@ jobs:
           fi
 
       - name: Build fuzz target
-        run: cargo fuzz build csv_lifecycle
+        run: cargo fuzz build "${{ matrix.target }}"
 
       - name: Run bounded fuzz campaign
         run: >-
-          cargo fuzz run csv_lifecycle --
+          cargo fuzz run "${{ matrix.target }}" --
           -max_total_time="$FUZZ_TIME_SECONDS"
           -max_len="$FUZZ_MAX_INPUT_BYTES"
 
@@ -61,7 +69,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: csv-lifecycle-fuzz-artifacts-${{ github.sha }}
+          name: ${{ matrix.target }}-fuzz-artifacts-${{ github.sha }}
           path: fuzz/artifacts/
           if-no-files-found: ignore
           retention-days: 7

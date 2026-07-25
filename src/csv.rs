@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ErrorCode, Result, TabularkError};
 use crate::model::{
-    AxisExtent, Capabilities, ColumnSchema, LogicalType, RandomAccess, RangeRequest, Schema,
-    StringColumnBatch, TableBatch, TableExtent, TableMetadata,
+    AxisExtent, Capabilities, ColumnSchema, RandomAccess, RangeRequest, Schema, StringColumnBatch,
+    TableBatch, TableDataType, TableExtent, TableMetadata,
 };
 
 const UTF8_BOM: &[u8; 3] = b"\xEF\xBB\xBF";
@@ -757,7 +757,7 @@ impl CsvScanner {
                 id,
                 name,
                 index_u64,
-                LogicalType::Utf8,
+                TableDataType::Utf8,
                 true,
             )?);
             self.column_string_bytes = self.column_string_bytes.saturating_add(string_bytes);
@@ -1466,7 +1466,7 @@ mod tests {
         RangeDecodeStatus, UTF8_BOM,
     };
     use crate::error::ErrorCode;
-    use crate::model::{AxisExtent, LogicalType, RandomAccess, RangeRequest, TableBatch};
+    use crate::model::{AxisExtent, RandomAccess, RangeRequest, TableBatch, TableDataType};
     use serde::Deserialize;
     use std::collections::HashSet;
     use std::fs;
@@ -1958,8 +1958,8 @@ mod tests {
                 case.id
             );
             assert_eq!(
-                column.logical_type(),
-                LogicalType::Utf8,
+                column.data_type(),
+                &TableDataType::Utf8,
                 "case {} chunk {chunk_size}",
                 case.id
             );

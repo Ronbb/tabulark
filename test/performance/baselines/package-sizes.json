@@ -1,77 +1,149 @@
 {
-  "sizeSchemaVersion": 1,
+  "sizeSchemaVersion": 2,
   "compression": {
     "algorithm": "brotli",
     "quality": 11
   },
-  "runtime": {
-    "rawBytes": 417586,
-    "brotliBytes": 104580,
+  "core": {
+    "rawBytes": 449195,
+    "brotliBytes": 108830,
     "files": [
       {
         "path": "dist/index.js",
-        "rawBytes": 129278,
-        "brotliBytes": 22641
+        "rawBytes": 163705,
+        "brotliBytes": 28585
       },
       {
         "path": "dist/worker.js",
-        "rawBytes": 41775,
-        "brotliBytes": 8182
+        "rawBytes": 95509,
+        "brotliBytes": 17111
       },
       {
-        "path": "dist/wasm/tabulark.js",
-        "rawBytes": 22174,
-        "brotliBytes": 4258
+        "path": "dist/wasm/delimited/tabulark_delimited.js",
+        "rawBytes": 27516,
+        "brotliBytes": 4803
       },
       {
-        "path": "dist/wasm/tabulark_bg.wasm",
-        "rawBytes": 224359,
-        "brotliBytes": 69499
+        "path": "dist/wasm/delimited/tabulark_delimited_bg.wasm",
+        "rawBytes": 162465,
+        "brotliBytes": 58331
+      }
+    ]
+  },
+  "arrow": {
+    "rawBytes": 2175576,
+    "brotliBytes": 335073,
+    "files": [
+      {
+        "path": "dist/arrow.js",
+        "rawBytes": 906,
+        "brotliBytes": 368
+      },
+      {
+        "path": "dist/wasm/arrow/tabulark_arrow.js",
+        "rawBytes": 24879,
+        "brotliBytes": 4416
+      },
+      {
+        "path": "dist/wasm/arrow/tabulark_arrow_bg.wasm",
+        "rawBytes": 2149791,
+        "brotliBytes": 330289
+      }
+    ]
+  },
+  "runtime": {
+    "rawBytes": 2624771,
+    "brotliBytes": 443903,
+    "files": [
+      {
+        "path": "dist/index.js",
+        "rawBytes": 163705,
+        "brotliBytes": 28585
+      },
+      {
+        "path": "dist/worker.js",
+        "rawBytes": 95509,
+        "brotliBytes": 17111
+      },
+      {
+        "path": "dist/wasm/delimited/tabulark_delimited.js",
+        "rawBytes": 27516,
+        "brotliBytes": 4803
+      },
+      {
+        "path": "dist/wasm/delimited/tabulark_delimited_bg.wasm",
+        "rawBytes": 162465,
+        "brotliBytes": 58331
+      },
+      {
+        "path": "dist/arrow.js",
+        "rawBytes": 906,
+        "brotliBytes": 368
+      },
+      {
+        "path": "dist/wasm/arrow/tabulark_arrow.js",
+        "rawBytes": 24879,
+        "brotliBytes": 4416
+      },
+      {
+        "path": "dist/wasm/arrow/tabulark_arrow_bg.wasm",
+        "rawBytes": 2149791,
+        "brotliBytes": 330289
       }
     ]
   },
   "npm": {
-    "packedBytes": 220529,
-    "unpackedBytes": 842670,
-    "files": 29
+    "packedBytes": 746770,
+    "unpackedBytes": 3242685,
+    "files": 38
   },
   "pages": {
-    "rawBytes": 887166,
-    "brotliBytes": 194848,
-    "files": 31
+    "rawBytes": 3316264,
+    "brotliBytes": 576609,
+    "files": 45
   },
   "budget": {
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "comparisons": {
-      "runtimeRaw": {
-        "bytes": 417586,
+      "coreRaw": {
+        "bytes": 449195,
         "maximumBytes": 524288,
-        "remainingBytes": 106702
+        "remainingBytes": 75093
       },
-      "runtimeBrotli": {
-        "bytes": 104580,
+      "coreBrotli": {
+        "bytes": 108830,
         "maximumBytes": 147456,
-        "remainingBytes": 42876
+        "remainingBytes": 38626
+      },
+      "arrowRaw": {
+        "bytes": 2175576,
+        "maximumBytes": 2555904,
+        "remainingBytes": 380328
+      },
+      "arrowBrotli": {
+        "bytes": 335073,
+        "maximumBytes": 393216,
+        "remainingBytes": 58143
       },
       "npmPacked": {
-        "bytes": 220529,
-        "maximumBytes": 294912,
-        "remainingBytes": 74383
+        "bytes": 746770,
+        "maximumBytes": 917504,
+        "remainingBytes": 170734
       },
       "npmUnpacked": {
-        "bytes": 842670,
-        "maximumBytes": 1048576,
-        "remainingBytes": 205906
+        "bytes": 3242685,
+        "maximumBytes": 3735552,
+        "remainingBytes": 492867
       },
       "pagesRaw": {
-        "bytes": 887166,
-        "maximumBytes": 1114112,
-        "remainingBytes": 226946
+        "bytes": 3316264,
+        "maximumBytes": 3866624,
+        "remainingBytes": 550360
       },
       "pagesBrotli": {
-        "bytes": 194848,
-        "maximumBytes": 262144,
-        "remainingBytes": 67296
+        "bytes": 576609,
+        "maximumBytes": 720896,
+        "remainingBytes": 144287
       }
     }
   }

@@ -31,6 +31,8 @@ pub enum ErrorCode {
     RuntimeFailure,
     /// The requested operation is unavailable in this runtime.
     UnsupportedRuntime,
+    /// The input uses a well-formed format feature that this build does not implement.
+    UnsupportedFeature,
 }
 
 /// A serializable error with a stable code and optional structured details.

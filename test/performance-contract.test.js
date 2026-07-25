@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
@@ -11,10 +12,26 @@ test("performance scenarios and size budgets remain reproducible and bounded", a
   ]);
 
   assert.equal(manifest.schemaVersion, 1);
-  assert.equal(budget.schemaVersion, 1);
+  assert.equal(budget.schemaVersion, 2);
   for (const [name, scenario] of Object.entries(manifest.scenarios)) {
-    assert.ok(Number.isSafeInteger(scenario.requestedBytes) && scenario.requestedBytes > 0, name);
-    assert.ok(scenario.generatedBytes >= scenario.requestedBytes, name);
+    if (scenario.kind === "arrow") {
+      assert.match(
+        scenario.fixture,
+        /^test\/(?:fixtures\/arrow|performance\/fixtures\/arrow)\/.+\.arrows?$/u,
+        name,
+      );
+      assert.ok(Number.isSafeInteger(scenario.bytes) && scenario.bytes > 0, name);
+      assert.ok(Number.isSafeInteger(scenario.columns) && scenario.columns > 0, name);
+      assert.ok(["auto", "file", "stream"].includes(scenario.container), name);
+      assert.ok(["none", "lz4", "zstd"].includes(scenario.compression), name);
+      assert.ok(Array.isArray(scenario.randomRangeRows) && scenario.randomRangeRows.length > 0, name);
+      const bytes = await readFile(new URL(`../${scenario.fixture}`, import.meta.url));
+      assert.equal(bytes.byteLength, scenario.bytes, `${name} bytes`);
+      assert.equal(createHash("sha256").update(bytes).digest("hex"), scenario.sha256, `${name} digest`);
+    } else {
+      assert.ok(Number.isSafeInteger(scenario.requestedBytes) && scenario.requestedBytes > 0, name);
+      assert.ok(scenario.generatedBytes >= scenario.requestedBytes, name);
+    }
     assert.ok(Number.isSafeInteger(scenario.rows) && scenario.rows > 0, name);
     assert.match(scenario.sha256, /^[0-9a-f]{64}$/u, name);
     assert.ok(Number.isSafeInteger(scenario.scrollFrames) && scenario.scrollFrames >= 60, name);
@@ -22,18 +39,96 @@ test("performance scenarios and size budgets remain reproducible and bounded", a
   assert.ok(manifest.scenarios.canonical.requestedBytes > 8 * 1024 * 1024);
   assert.ok(manifest.scenarios.canonical.measuredIterations >= 5);
   assert.ok(manifest.scenarios.canonical.warmupIterations >= 1);
+  const arrowScenarios = Object.values(manifest.scenarios).filter(({ kind }) => kind === "arrow");
+  assert.deepEqual(
+    arrowScenarios.map(({ compression, container }) => `${container}-${compression}`).sort(),
+    [
+      "file-lz4",
+      "file-none",
+      "file-zstd",
+      "stream-lz4",
+      "stream-none",
+      "stream-zstd",
+    ],
+  );
+  const provenance = await readJson("./performance/fixtures/arrow/provenance.json");
+  assert.equal(provenance.generator, "examples/generate_arrow_fixture.rs");
+  assert.equal(provenance.arrowVersion, "59.1.0");
+  assert.ok(Number.isSafeInteger(provenance.rows) && provenance.rows >= 128);
+  assert.ok(Number.isSafeInteger(provenance.batchRows) && provenance.batchRows > 0);
+  assert.ok(provenance.batchRows < provenance.rows, "performance fixtures must span batches");
+  const provenanceByPath = new Map(
+    provenance.files.map((fixture) => [`test/performance/fixtures/arrow/${fixture.path}`, fixture]),
+  );
+  for (const scenario of arrowScenarios) {
+    assert.equal(scenario.rows, provenance.rows, `${scenario.fixture} rows`);
+    assert.ok(
+      scenario.randomRangeRows.some((row) => row >= provenance.batchRows),
+      `${scenario.fixture} must measure a range beyond the first RecordBatch`,
+    );
+    assert.deepEqual(
+      {
+        bytes: scenario.bytes,
+        compression: scenario.compression,
+        container: scenario.container,
+        sha256: scenario.sha256,
+      },
+      {
+        bytes: provenanceByPath.get(scenario.fixture)?.bytes,
+        compression: provenanceByPath.get(scenario.fixture)?.compression,
+        container: provenanceByPath.get(scenario.fixture)?.container,
+        sha256: provenanceByPath.get(scenario.fixture)?.sha256,
+      },
+      scenario.fixture,
+    );
+  }
 
   assert.deepEqual(Object.keys(budget.maximumBytes).sort(), [
+    "arrowBrotli",
+    "arrowRaw",
+    "coreBrotli",
+    "coreRaw",
     "npmPacked",
     "npmUnpacked",
     "pagesBrotli",
     "pagesRaw",
-    "runtimeBrotli",
-    "runtimeRaw",
   ]);
   for (const maximum of Object.values(budget.maximumBytes)) {
     assert.ok(Number.isSafeInteger(maximum) && maximum > 0);
   }
+  const packageBaseline = await readJson("./performance/baselines/package-sizes.json");
+  assert.equal(budget.maximumBytes.coreRaw, 524288, "M3 core raw cap must not widen");
+  assert.equal(budget.maximumBytes.coreBrotli, 147456, "M3 core Brotli cap must not widen");
+  assert.equal(
+    budget.maximumBytes.arrowRaw,
+    withDeliveryHeadroom(packageBaseline.arrow.rawBytes),
+    "Arrow raw budget",
+  );
+  assert.equal(
+    budget.maximumBytes.arrowBrotli,
+    withDeliveryHeadroom(packageBaseline.arrow.brotliBytes),
+    "Arrow Brotli budget",
+  );
+  assert.equal(
+    budget.maximumBytes.npmPacked,
+    withDeliveryHeadroom(packageBaseline.npm.packedBytes),
+    "npm packed budget",
+  );
+  assert.equal(
+    budget.maximumBytes.npmUnpacked,
+    withDeliveryHeadroom(packageBaseline.npm.unpackedBytes),
+    "npm unpacked budget",
+  );
+  assert.equal(
+    budget.maximumBytes.pagesRaw,
+    withDeliveryHeadroom(packageBaseline.pages.rawBytes),
+    "Pages raw budget",
+  );
+  assert.equal(
+    budget.maximumBytes.pagesBrotli,
+    withDeliveryHeadroom(packageBaseline.pages.brotliBytes),
+    "Pages Brotli budget",
+  );
 });
 
 test("performance server opts into cross-origin isolation explicitly", async () => {
@@ -88,4 +183,8 @@ test("committed M3 performance baseline records required memory evidence", async
 
 async function readJson(relativePath) {
   return JSON.parse(await readFile(new URL(relativePath, import.meta.url), "utf8"));
+}
+
+function withDeliveryHeadroom(bytes) {
+  return Math.ceil((bytes * 1.15) / (64 * 1024)) * 64 * 1024;
 }

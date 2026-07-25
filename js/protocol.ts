@@ -1,4 +1,11 @@
-export const PROTOCOL_VERSION = 1 as const;
+/** Version 2 introduces registered adapters and generic typed batches. */
+export const PROTOCOL_VERSION = 2 as const;
+
+/** Version of the private, built-in Rust adapter contract. */
+export const ADAPTER_API_VERSION = 1 as const;
+
+/** Version of the descriptor + deduplicated-buffer batch transport. */
+export const BATCH_LAYOUT_VERSION = 1 as const;
 
 export type ProtocolVersion = typeof PROTOCOL_VERSION;
 

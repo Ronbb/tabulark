@@ -11,17 +11,21 @@ const brotliCompressAsync = promisify(brotliCompress);
 const execFileAsync = promisify(execFile);
 const repositoryRoot = resolve(fileURLToPath(new URL("../../", import.meta.url)));
 const options = parseArguments(process.argv.slice(2));
-const runtimePaths = [
+const coreRuntimePaths = [
   "dist/index.js",
   "dist/worker.js",
-  "dist/wasm/tabulark.js",
-  "dist/wasm/tabulark_bg.wasm",
+  "dist/wasm/delimited/tabulark_delimited.js",
+  "dist/wasm/delimited/tabulark_delimited_bg.wasm",
+];
+const arrowRuntimePaths = [
+  "dist/arrow.js",
+  "dist/wasm/arrow/tabulark_arrow.js",
+  "dist/wasm/arrow/tabulark_arrow_bg.wasm",
 ];
 
-const runtimeFiles = [];
-for (const path of runtimePaths) {
-  runtimeFiles.push(await measureFile(resolve(repositoryRoot, path), repositoryRoot));
-}
+const coreRuntimeFiles = await measurePaths(coreRuntimePaths);
+const arrowRuntimeFiles = await measurePaths(arrowRuntimePaths);
+const runtimeFiles = [...coreRuntimeFiles, ...arrowRuntimeFiles];
 const pagesFiles = await walkFiles(resolve(repositoryRoot, "target/pages"));
 const pagesMeasured = [];
 for (const path of pagesFiles) {
@@ -29,8 +33,10 @@ for (const path of pagesFiles) {
 }
 const npm = await measureNpmPackage();
 const report = {
-  sizeSchemaVersion: 1,
+  sizeSchemaVersion: 2,
   compression: { algorithm: "brotli", quality: 11 },
+  core: measuredGroup(coreRuntimeFiles),
+  arrow: measuredGroup(arrowRuntimeFiles),
   runtime: {
     rawBytes: sum(runtimeFiles, "rawBytes"),
     brotliBytes: sum(runtimeFiles, "brotliBytes"),
@@ -46,8 +52,10 @@ const report = {
 
 const budget = JSON.parse(await readFile(resolve(repositoryRoot, options.budget), "utf8"));
 const actual = {
-  runtimeRaw: report.runtime.rawBytes,
-  runtimeBrotli: report.runtime.brotliBytes,
+  coreRaw: report.core.rawBytes,
+  coreBrotli: report.core.brotliBytes,
+  arrowRaw: report.arrow.rawBytes,
+  arrowBrotli: report.arrow.brotliBytes,
   npmPacked: report.npm.packedBytes,
   npmUnpacked: report.npm.unpackedBytes,
   pagesRaw: report.pages.rawBytes,
@@ -82,6 +90,22 @@ async function measureFile(path, root) {
     path: relative(root, path).replaceAll("\\", "/"),
     rawBytes: bytes.byteLength,
     brotliBytes: compressed.byteLength,
+  };
+}
+
+async function measurePaths(paths) {
+  const measured = [];
+  for (const path of paths) {
+    measured.push(await measureFile(resolve(repositoryRoot, path), repositoryRoot));
+  }
+  return measured;
+}
+
+function measuredGroup(files) {
+  return {
+    rawBytes: sum(files, "rawBytes"),
+    brotliBytes: sum(files, "brotliBytes"),
+    files,
   };
 }
 

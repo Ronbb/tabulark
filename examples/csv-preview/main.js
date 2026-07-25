@@ -1,4 +1,14 @@
-import { createCanvasTableView, createEngine } from "../../dist/index.js";
+import {
+  createCanvasTableView,
+  createEngine,
+  delimitedAdapter,
+} from "../../dist/index.js";
+import { arrowIpcAdapter } from "../../dist/arrow.js";
+
+const ARROW_SAMPLE_URL = new URL(
+  "../../test/fixtures/arrow/v1/m4-sample.arrow",
+  import.meta.url,
+);
 
 const TERMINAL_ENGINE_CODES = new Set([
   "HANDLE_CLOSED",
@@ -26,8 +36,11 @@ const modeInput = document.querySelector("#parse-mode");
 const delimiterInput = document.querySelector("#delimiter");
 const delimiterHelp = document.querySelector("#delimiter-help");
 const advanced = document.querySelector("#advanced");
+const arrowOptions = document.querySelector("#arrow-options");
+const arrowContainerInput = document.querySelector("#arrow-container");
 const openButton = document.querySelector("#open");
 const sampleButton = document.querySelector("#sample");
+const arrowSampleButton = document.querySelector("#arrow-sample");
 const cancelButton = document.querySelector("#cancel");
 const retryButton = document.querySelector("#retry");
 const fileName = document.querySelector("#file-name");
@@ -43,7 +56,14 @@ const emptyTitle = document.querySelector("#empty-title");
 const emptyMessage = document.querySelector("#empty-message");
 const status = document.querySelector("#status");
 
-const optionControls = [sourceInput, formatInput, headerInput, modeInput, delimiterInput];
+const optionControls = [
+  sourceInput,
+  formatInput,
+  headerInput,
+  modeInput,
+  delimiterInput,
+  arrowContainerInput,
+];
 
 let currentState = "idle";
 let engine;
@@ -75,13 +95,7 @@ sourceInput.addEventListener("change", () => {
     return;
   }
   rememberSource(source, source.name);
-  const lowerName = source.name.toLowerCase();
-  if (lowerName.endsWith(".tsv")) {
-    formatInput.value = "tsv";
-  } else if (lowerName.endsWith(".csv")) {
-    formatInput.value = "csv";
-  }
-  updateDelimiterHelp();
+  updateSourceOptions();
   updateSourceSummary();
   if (currentState === "ready") {
     setStatus(
@@ -91,7 +105,7 @@ sourceInput.addEventListener("change", () => {
 });
 
 formatInput.addEventListener("change", () => {
-  updateDelimiterHelp();
+  updateSourceOptions();
   updateSourceSummary();
 });
 
@@ -114,9 +128,13 @@ sampleButton.addEventListener("click", () => {
   headerInput.value = "first-row";
   modeInput.value = "lenient";
   delimiterInput.value = "";
-  updateDelimiterHelp();
+  updateSourceOptions();
   rememberSource(source, "generated-sample.csv");
   void openSource(source, "generated-sample.csv");
+});
+
+arrowSampleButton.addEventListener("click", () => {
+  void openArrowSample();
 });
 
 cancelButton.addEventListener("click", () => {
@@ -147,10 +165,10 @@ window.addEventListener("pageshow", (event) => {
     return;
   }
   if (retrySource === undefined) {
-    transition("idle", "Choose a local CSV or TSV file, or load the generated sample.");
+    transition("idle", "Choose CSV, TSV, or Arrow IPC explicitly, then open a local source or sample.");
     showEmptyState(
       "No table open",
-      "Choose a local CSV or TSV, or load the generated sample. Nothing is uploaded.",
+      "Choose a local CSV, TSV, or Arrow IPC source. Nothing is uploaded.",
     );
     return;
   }
@@ -165,8 +183,41 @@ window.addEventListener("pageshow", (event) => {
   );
 });
 
-updateDelimiterHelp();
+updateSourceOptions();
 renderState();
+
+async function openArrowSample() {
+  const operation = ++activeOperation;
+  transition("opening", "Loading the pinned Arrow IPC sample…", { focus: cancelButton });
+  showEmptyState(
+    "Loading Arrow sample",
+    "The committed fixture is being read from this static site before it is opened locally.",
+  );
+  try {
+    const response = await fetch(ARROW_SAMPLE_URL);
+    if (!response.ok) {
+      throw new Error(`Arrow sample request failed with HTTP ${response.status}`);
+    }
+    const bytes = await response.arrayBuffer();
+    if (!isCurrent(operation)) return;
+    const source = new File([bytes], "m4-sample.arrow", {
+      type: "application/vnd.apache.arrow.file",
+    });
+    sourceInput.value = "";
+    formatInput.value = "arrow";
+    arrowContainerInput.value = "auto";
+    updateSourceOptions();
+    rememberSource(source, source.name);
+    await openSource(source, source.name);
+  } catch (error) {
+    if (!isCurrent(operation)) return;
+    transition("error", presentError(error), { focus: status });
+    showEmptyState(
+      "Arrow sample could not load",
+      "Retry the sample or choose a local Arrow IPC file.",
+    );
+  }
+}
 
 async function openSource(source, displayName) {
   rememberSource(source, displayName);
@@ -190,7 +241,7 @@ async function openSource(source, displayName) {
   );
   showEmptyState(
     "Opening local source",
-    "The Worker is starting and reading only the initial preview range.",
+    "The Worker is starting and requesting only the bounded byte ranges needed to open the preview.",
   );
 
   await closeCurrentSession();
@@ -206,9 +257,13 @@ async function openSource(source, displayName) {
       return;
     }
 
+    const openOptions = readOpenOptions();
     openedDataset = await operationEngine.open(source, {
-      ...readOpenOptions(),
-      sourceName: displayName,
+      ...openOptions,
+      adapterOptions: {
+        ...openOptions.adapterOptions,
+        sourceName: displayName,
+      },
       signal: abort.signal,
     });
     if (!isCurrent(operation)) {
@@ -220,7 +275,7 @@ async function openSource(source, displayName) {
     transition("indexing", `Preparing the first rows from ${displayName}…`);
     showEmptyState(
       "Preparing table preview",
-      "The source is open. Tabulark is building the first viewport and continuing to index in the background.",
+      "The source is open. Tabulark is building the first viewport; sequential sources may continue indexing in the background.",
     );
     unsubscribeDataset = dataset.subscribe((event) => {
       handleDatasetEvent(event, operation, operationEngine, sourceSnapshot);
@@ -270,7 +325,7 @@ async function openSource(source, displayName) {
       transition("cancelled", `Opening ${displayName} was cancelled.`, { focus: retryButton });
       showEmptyState(
         "Opening cancelled",
-        "Adjust the parsing options or retry the same local source when you are ready.",
+        "Adjust the adapter options or retry the same local source when you are ready.",
       );
       return;
     }
@@ -304,7 +359,7 @@ async function cancelCurrentOperation() {
   transition("cancelled", `Opening ${displayName} was cancelled.`, { focus: retryButton });
   showEmptyState(
     "Opening cancelled",
-    "Adjust the parsing options or retry the same local source when you are ready.",
+    "Adjust the adapter options or retry the same local source when you are ready.",
   );
   await closeCurrentSession();
 }
@@ -318,7 +373,7 @@ async function ensureEngine() {
   }
 
   const generation = engineGeneration;
-  const pending = createEngine().then(async (created) => {
+  const pending = createEngine({ adapters: [delimitedAdapter, arrowIpcAdapter] }).then(async (created) => {
     if (generation !== engineGeneration) {
       await safelyClose(created);
       throw cancellationError("Engine startup was cancelled because the page was hidden");
@@ -499,6 +554,7 @@ function renderState() {
   filePicker.setAttribute("aria-disabled", String(busy));
   openButton.disabled = busy;
   sampleButton.disabled = busy;
+  arrowSampleButton.disabled = busy;
   cancelButton.hidden = !busy;
   retryButton.hidden = !retryable || retrySource === undefined;
   openButton.textContent = currentState === "opening"
@@ -544,25 +600,37 @@ function updateSourceSummary() {
     fileSummary.textContent = "No source selected.";
     return;
   }
-  fileSummary.textContent = `${lastDisplayName} · ${formatBytes(lastSourceSize)} · ${formatInput.value.toUpperCase()}`;
+  const formatLabel = formatInput.value === "arrow" ? "ARROW IPC" : formatInput.value.toUpperCase();
+  fileSummary.textContent = `${lastDisplayName} · ${formatBytes(lastSourceSize)} · ${formatLabel}`;
 }
 
-function updateDelimiterHelp() {
+function updateSourceOptions() {
+  const isArrow = formatInput.value === "arrow";
+  advanced.hidden = isArrow;
+  arrowOptions.hidden = !isArrow;
   delimiterHelp.textContent = formatInput.value === "tsv"
     ? "Leave blank for a tab. Use \\t to enter a tab explicitly."
     : "Leave blank for comma. Use \\t for a tab.";
 }
 
 function readOpenOptions() {
-  const options = {
-    format: formatInput.value,
+  if (formatInput.value === "arrow") {
+    return {
+      adapter: arrowIpcAdapter,
+      adapterOptions: {
+        container: arrowContainerInput.value,
+      },
+    };
+  }
+  const adapterOptions = {
+    dialect: formatInput.value,
     header: headerInput.value,
     mode: modeInput.value,
   };
   if (delimiterInput.value !== "") {
-    options.delimiter = delimiterInput.value === "\\t" ? "\t" : delimiterInput.value;
+    adapterOptions.delimiter = delimiterInput.value === "\\t" ? "\t" : delimiterInput.value;
   }
-  return options;
+  return { adapter: delimitedAdapter, adapterOptions };
 }
 
 function resetWarnings() {
@@ -611,10 +679,13 @@ function recoveryMessage(error) {
   if (errorCode(error) === "PARSE_FAILED") {
     return "Review the delimiter, header, or malformed-row setting, then retry the same local source.";
   }
+  if (errorCode(error) === "UNSUPPORTED_FEATURE") {
+    return "This Arrow source uses a feature the current IPC adapter cannot decode. Choose another source or container mode.";
+  }
   if (isTerminalEngineError(error)) {
     return "The Worker stopped. Retry will start a fresh Worker and reopen the same local source.";
   }
-  return "Review the parsing options or choose another local source, then retry.";
+  return "Review the adapter options or choose another local source, then retry.";
 }
 
 function isTerminalEngineError(error) {

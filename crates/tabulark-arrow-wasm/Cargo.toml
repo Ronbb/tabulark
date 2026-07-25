@@ -1,0 +1,21 @@
+[package]
+name = "tabulark-arrow-wasm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "tabulark_arrow"
+crate-type = ["cdylib"]
+
+[dependencies]
+js-sys = "=0.3.77"
+serde = { version = "1.0.219", features = ["derive"] }
+serde-wasm-bindgen = "0.6.5"
+tabulark = { path = "../..", default-features = false, features = ["arrow"] }
+wasm-bindgen = "=0.2.100"
+
+[lints.rust]
+unsafe_code = "forbid"

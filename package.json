@@ -10,13 +10,19 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./arrow": {
+      "types": "./dist/arrow.d.ts",
+      "import": "./dist/arrow.js",
+      "default": "./dist/arrow.js"
     }
   },
   "files": [
     "dist",
     "README.md",
     "LICENSE-MIT",
-    "LICENSE-APACHE"
+    "LICENSE-APACHE",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "sideEffects": false,
   "scripts": {
@@ -24,15 +30,16 @@
     "build:js": "node scripts/build.mjs",
     "build:pages": "npm run build && node scripts/build-pages.mjs",
     "build:wasm": "node scripts/build-wasm.mjs",
+    "benchmark:arrow": "node test/performance/run-arrow-matrix.mjs",
     "benchmark:canonical": "node test/performance/run-browser.mjs --scenario canonical --output test/performance/baselines/windows-chromium-16mib.json",
     "benchmark:size": "node test/performance/measure-sizes.mjs",
     "benchmark:smoke": "node test/performance/run-browser.mjs --scenario smoke --output target/bench/performance-smoke.json",
     "typecheck": "tsc --project tsconfig.json",
-    "check": "npm run check:versions && npm run typecheck && npm test && npm run package:check && npm run pages:check",
+    "check": "npm run build && npm run check:versions && npm run typecheck && node --test test/*.test.js && npm run package:check && npm run pages:check",
     "check:versions": "node scripts/check-versions.mjs",
     "example": "npm run build:pages && node test/browser/server.mjs",
     "pages:check": "npm run build:pages",
-    "package:check": "npm pack --dry-run --cache target/npm-cache",
+    "package:check": "node scripts/package-smoke.mjs",
     "test": "npm run build:js && node --test test/*.test.js",
     "test:browser": "npm run build:pages && playwright test",
     "prepack": "npm run build"

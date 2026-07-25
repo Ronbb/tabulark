@@ -1,0 +1,18 @@
+{
+  "protocolVersion": 2,
+  "requestId": "request-hello-002",
+  "status": "success",
+  "result": {
+    "kind": "hello",
+    "data": {
+      "protocolVersion": 2,
+      "adapterApiVersion": 1,
+      "batchLayoutVersion": 1,
+      "adapters": [
+        "tabulark:delimited",
+        "tabulark:arrow-ipc"
+      ],
+      "transferableBatches": true
+    }
+  }
+}

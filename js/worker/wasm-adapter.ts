@@ -1,58 +1,37 @@
 import { ProtocolFault, faultFromUnknown } from "./worker-errors.js";
-
-export interface WasmOpenResult {
-  readonly sourceHandle: string | number;
-  readonly tables?: readonly unknown[];
-  readonly table?: unknown;
-  readonly metadata?: unknown;
-}
-
-export interface WasmScanUpdate {
-  readonly metadata?: unknown;
-  readonly warnings?: readonly unknown[];
-  readonly warning?: unknown;
-  readonly done?: boolean;
-}
-
-export interface WasmRangeStart {
-  readonly cursorHandle: string | number;
-  readonly byteOffset: number;
-  readonly checkpointRow: number;
-  readonly done?: boolean;
-  readonly batch?: unknown;
-}
-
-export interface WasmRangeUpdate {
-  readonly done: boolean;
-  readonly batch?: unknown;
-  readonly nextByteOffset?: number;
-}
+import {
+  ADAPTER_API_VERSION,
+  BATCH_LAYOUT_VERSION,
+  PROTOCOL_VERSION,
+} from "../protocol.js";
+import type { OfficialAdapterId } from "../adapters.js";
 
 interface RawWasmRuntime {
-  openDelimited(options: unknown): unknown;
-  scanChunk(
-    sourceHandle: string | number,
+  protocolVersion(): number;
+  adapterApiVersion(): number;
+  batchLayoutVersion(): number;
+  adapterId(): string;
+  beginOpen(options: unknown, sourceLength: number): unknown;
+  continueOperation(
+    operationHandle: string | number,
     absoluteOffset: number,
     bytes: Uint8Array,
     eof: boolean,
   ): unknown;
-  metadata(sourceHandle: string | number): unknown;
-  beginRange(sourceHandle: string | number, request: unknown): unknown;
-  feedRange(
-    cursorHandle: string | number,
-    absoluteOffset: number,
-    bytes: Uint8Array,
-    eof: boolean,
-  ): unknown;
-  cancel(cursorHandle: string | number): unknown;
-  closeRange(cursorHandle: string | number): unknown;
+  openTable(sourceHandle: string | number, tableId: string): unknown;
+  metadata(handle: string | number): unknown;
+  beginRead(tableHandle: string | number, request: unknown): unknown;
+  cancelOperation(operationHandle: string | number): unknown;
+  closeTable(tableHandle: string | number): unknown;
   closeSource(sourceHandle: string | number): unknown;
+  shutdown(): unknown;
   free?(): void;
 }
 
 interface WasmBindings {
   default(input?: unknown): Promise<unknown> | unknown;
-  WasmRuntime: new (config: unknown) => RawWasmRuntime;
+  WasmRuntime?: new (config: unknown) => RawWasmRuntime;
+  WasmArrowRuntime?: new (config: unknown) => RawWasmRuntime;
 }
 
 /**
@@ -67,7 +46,11 @@ export class WasmAdapter {
     this.#runtime = runtime;
   }
 
-  static async load(moduleUrl: string, config: unknown): Promise<WasmAdapter> {
+  static async load(
+    moduleUrl: string,
+    expectedAdapterId: OfficialAdapterId,
+    config: unknown,
+  ): Promise<WasmAdapter> {
     let bindings: WasmBindings;
     try {
       bindings = (await import(/* @vite-ignore */ moduleUrl)) as WasmBindings;
@@ -75,11 +58,32 @@ export class WasmAdapter {
         throw new TypeError("The WebAssembly module does not export a default initializer");
       }
       await bindings.default();
-      if (typeof bindings.WasmRuntime !== "function") {
-        throw new TypeError("The WebAssembly module does not export WasmRuntime");
+      const Runtime = expectedAdapterId === "tabulark:delimited"
+        ? bindings.WasmRuntime
+        : bindings.WasmArrowRuntime;
+      if (typeof Runtime !== "function") {
+        throw new ProtocolFault(
+          "PROTOCOL_INCOMPATIBLE",
+          `The ${expectedAdapterId} artifact does not export its official runtime class`,
+        );
       }
-      return new WasmAdapter(new bindings.WasmRuntime(config));
+      const adapter = new WasmAdapter(new Runtime(config));
+      try {
+        adapter.#validateContract(expectedAdapterId);
+      } catch (error) {
+        try {
+          adapter.dispose();
+        } catch {
+          // Preserve the ABI validation fault after making a best-effort
+          // release of the just-constructed wasm-bindgen runtime.
+        }
+        throw error;
+      }
+      return adapter;
     } catch (error) {
+      if (error instanceof ProtocolFault) {
+        throw error;
+      }
       throw new ProtocolFault(
         "RUNTIME_FAILURE",
         "Failed to initialize the Tabulark WebAssembly runtime",
@@ -90,80 +94,39 @@ export class WasmAdapter {
     }
   }
 
-  openDelimited(options: unknown): WasmOpenResult {
-    return this.#call("openDelimited", () => this.#runtime.openDelimited(options));
-  }
-
-  scanChunk(
-    sourceHandle: string | number,
-    absoluteOffset: number,
-    bytes: Uint8Array,
-    eof: boolean,
-  ): WasmScanUpdate {
-    return this.#call("scanChunk", () =>
-      this.#runtime.scanChunk(sourceHandle, absoluteOffset, bytes, eof),
-    );
-  }
-
   metadata(sourceHandle: string | number): unknown {
     return this.#call("metadata", () => this.#runtime.metadata(sourceHandle));
   }
 
-  beginRange(sourceHandle: string | number, request: unknown): WasmRangeStart {
-    const result = this.#call<Record<string, unknown>>("beginRange", () =>
-      this.#runtime.beginRange(sourceHandle, request),
-    );
-    const plan = isRecord(result.plan) ? result.plan : {};
-    const checkpoint = isRecord(plan.checkpoint) ? plan.checkpoint : {};
-    return {
-      cursorHandle: handle(result.cursorHandle ?? result.rangeHandle, "beginRange"),
-      byteOffset: nonNegativeNumber(
-        result.byteOffset ?? checkpoint.byteOffset ?? plan.sourceOffset,
-        "beginRange byteOffset",
-      ),
-      checkpointRow: nonNegativeNumber(checkpoint.row ?? result.checkpointRow, "beginRange checkpointRow"),
-      done: result.done === true || result.batch !== undefined,
-      ...(result.batch === undefined ? {} : { batch: result.batch }),
-    };
+  beginOpen(options: unknown, sourceLength: number): unknown {
+    return this.#call("beginOpen", () => this.#runtime.beginOpen(options, sourceLength));
   }
 
-  feedRange(
-    cursorHandle: string | number,
+  continueOperation(
+    operationHandle: string | number,
     absoluteOffset: number,
     bytes: Uint8Array,
     eof: boolean,
-  ): WasmRangeUpdate {
-    const result = this.#call<Record<string, unknown>>("feedRange", () =>
-      this.#runtime.feedRange(cursorHandle, absoluteOffset, bytes, eof),
+  ): unknown {
+    return this.#call("continueOperation", () =>
+      this.#runtime.continueOperation(operationHandle, absoluteOffset, bytes, eof),
     );
-    if (result.status === "complete") {
-      return { done: true, ...(result.batch === undefined ? {} : { batch: result.batch }) };
-    }
-    if (result.status === "need-more") {
-      return {
-        done: false,
-        nextByteOffset: nonNegativeNumber(result.expectedOffset, "feedRange expectedOffset"),
-      };
-    }
-    // The provisional contract also permits a direct {done, batch} shape.
-    if (typeof result.done === "boolean") {
-      return {
-        done: result.done,
-        ...(result.batch === undefined ? {} : { batch: result.batch }),
-        ...(result.nextByteOffset === undefined
-          ? {}
-          : { nextByteOffset: nonNegativeNumber(result.nextByteOffset, "feedRange nextByteOffset") }),
-      };
-    }
-    throw new ProtocolFault("RUNTIME_FAILURE", "feedRange returned an unknown result shape");
   }
 
-  cancel(cursorHandle: string | number): void {
-    this.#call("cancel", () => this.#runtime.cancel(cursorHandle));
+  openTable(sourceHandle: string | number, tableId: string): unknown {
+    return this.#call("openTable", () => this.#runtime.openTable(sourceHandle, tableId));
   }
 
-  closeRange(cursorHandle: string | number): void {
-    this.#call("closeRange", () => this.#runtime.closeRange(cursorHandle));
+  beginRead(tableHandle: string | number, request: unknown): unknown {
+    return this.#call("beginRead", () => this.#runtime.beginRead(tableHandle, request));
+  }
+
+  cancelOperation(operationHandle: string | number): void {
+    this.#call("cancelOperation", () => this.#runtime.cancelOperation(operationHandle));
+  }
+
+  closeTable(tableHandle: string | number): void {
+    this.#call("closeTable", () => this.#runtime.closeTable(tableHandle));
   }
 
   closeSource(sourceHandle: string | number): void {
@@ -171,7 +134,54 @@ export class WasmAdapter {
   }
 
   dispose(): void {
+    try {
+      this.#runtime.shutdown();
+    } catch {
+      // free() still owns the wasm-bindgen allocation after shutdown failure.
+    }
     this.#runtime.free?.();
+  }
+
+  #validateContract(expectedAdapterId: OfficialAdapterId): void {
+    const runtime = this.#runtime as Partial<RawWasmRuntime>;
+    const required = [
+      "protocolVersion",
+      "adapterApiVersion",
+      "batchLayoutVersion",
+      "adapterId",
+      "beginOpen",
+      "continueOperation",
+      "openTable",
+      "metadata",
+      "beginRead",
+      "cancelOperation",
+      "closeTable",
+      "closeSource",
+      "shutdown",
+    ] as const;
+    for (const name of required) {
+      if (typeof runtime[name] !== "function") {
+        throw new ProtocolFault(
+          "PROTOCOL_INCOMPATIBLE",
+          `WebAssembly adapter does not export ${name}`,
+        );
+      }
+    }
+    const protocolVersion = this.#call("protocolVersion", () => this.#runtime.protocolVersion());
+    const adapterVersion = this.#call("adapterApiVersion", () => this.#runtime.adapterApiVersion());
+    const layoutVersion = this.#call("batchLayoutVersion", () => this.#runtime.batchLayoutVersion());
+    const adapterId = this.#call("adapterId", () => this.#runtime.adapterId());
+    if (
+      protocolVersion !== PROTOCOL_VERSION
+      || adapterVersion !== ADAPTER_API_VERSION
+      || layoutVersion !== BATCH_LAYOUT_VERSION
+      || adapterId !== expectedAdapterId
+    ) {
+      throw new ProtocolFault(
+        "PROTOCOL_INCOMPATIBLE",
+        `Adapter ${adapterId} protocol/ABI/layout ${protocolVersion}/${adapterVersion}/${layoutVersion} is incompatible with ${expectedAdapterId} ${PROTOCOL_VERSION}/${ADAPTER_API_VERSION}/${BATCH_LAYOUT_VERSION}`,
+      );
+    }
   }
 
   #call<T>(operation: string, call: () => unknown): T {
@@ -181,25 +191,4 @@ export class WasmAdapter {
       throw faultFromUnknown(error, `WebAssembly ${operation} failed`);
     }
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function handle(value: unknown, operation: string): string | number {
-  if (typeof value === "string") {
-    return value;
-  }
-  if (Number.isSafeInteger(value) && (value as number) >= 0) {
-    return value as number;
-  }
-  throw new ProtocolFault("RUNTIME_FAILURE", `${operation} did not return a handle`);
-}
-
-function nonNegativeNumber(value: unknown, field: string): number {
-  if (!Number.isSafeInteger(value) || (value as number) < 0) {
-    throw new ProtocolFault("RUNTIME_FAILURE", `${field} must be a non-negative safe integer`);
-  }
-  return value as number;
 }

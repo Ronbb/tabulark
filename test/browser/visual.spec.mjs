@@ -52,7 +52,7 @@ test("keeps Canvas layout pixels stable across ready, selection, and horizontal 
 
   await page.evaluate(
     async ({ columnCount, columnWidths, height, theme, width }) => {
-      const { createCanvasTableView, createEngine } = await import("/dist/index.js");
+      const { createCanvasTableView, createEngine, delimitedAdapter } = await import("/dist/index.js");
       const host = document.createElement("div");
       host.id = "visual-table-host";
       Object.assign(host.style, {
@@ -87,10 +87,13 @@ test("keeps Canvas layout pixels stable across ready, selection, and horizontal 
         ).join(","),
       );
 
-      const engine = await createEngine();
+      const engine = await createEngine({ adapters: [delimitedAdapter] });
       const dataset = await engine.open(
         new Blob([[headers.join(","), ...rows].join("\n") + "\n"]),
-        { format: "csv", header: "first-row", mode: "strict" },
+        {
+          adapter: delimitedAdapter,
+          adapterOptions: { dialect: "csv", header: "first-row", mode: "strict" },
+        },
       );
       const table = await dataset.openTable(dataset.tables[0].id);
       const widthsById = Object.fromEntries(

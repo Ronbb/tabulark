@@ -19,10 +19,20 @@ const scenario = manifest.scenarios[options.scenario];
 if (scenario === undefined) {
   throw new Error(`unknown performance scenario: ${options.scenario}`);
 }
+const scenarioKind = scenario.kind ?? "csv";
+if (scenarioKind !== "csv" && scenarioKind !== "arrow") {
+  throw new Error(`unsupported performance scenario kind: ${scenarioKind}`);
+}
 const measuredIterations = options.iterations ?? scenario.measuredIterations;
 const warmupIterations = options.warmups ?? scenario.warmupIterations;
-const datasetPath = resolve(repositoryRoot, "target", "bench", `tabulark-${options.scenario}.csv`);
-await ensureDataset(datasetPath, scenario);
+const datasetPath = scenarioKind === "arrow"
+  ? resolve(repositoryRoot, scenario.fixture)
+  : resolve(repositoryRoot, "target", "bench", `tabulark-${options.scenario}.csv`);
+if (scenarioKind === "arrow") {
+  await ensureFixture(datasetPath, scenario);
+} else {
+  await ensureDataset(datasetPath, scenario);
+}
 
 const server = await startTestServer({ crossOriginIsolated: true, port: 0 });
 const address = server.address();
@@ -57,33 +67,54 @@ try {
     await page.goto(`${baseURL}/test/performance/harness.html`, { waitUntil: "load" });
     await page.waitForFunction(() => globalThis.__tabularkPerformanceReady === true);
     await page.locator("#source").setInputFiles(datasetPath);
-    const result = await page.evaluate(async ({ expectedRows, scrollFrames }) => (
-      globalThis.__tabularkRunPerformanceScenario({
-        expectedRows,
-        requireMemory: true,
-        scrollFrames,
+    const result = scenarioKind === "arrow"
+      ? await page.evaluate(async (input) => (
+        globalThis.__tabularkRunArrowPerformanceScenario({
+          ...input,
+          requireMemory: true,
+        })
+      ), {
+        container: scenario.container,
+        expectedColumns: scenario.columns,
+        expectedFirstDataText: scenario.firstDataText,
+        expectedRows: scenario.rows,
+        randomRangeRows: scenario.randomRangeRows,
+        scrollFrames: scenario.scrollFrames,
       })
-    ), { expectedRows: scenario.rows, scrollFrames: scenario.scrollFrames });
+      : await page.evaluate(async ({ expectedRows, scrollFrames }) => (
+        globalThis.__tabularkRunPerformanceScenario({
+          expectedRows,
+          requireMemory: true,
+          scrollFrames,
+        })
+      ), { expectedRows: scenario.rows, scrollFrames: scenario.scrollFrames });
     await context.close();
     if (pageErrors.length > 0) {
       throw new Error(`performance page emitted errors: ${pageErrors.join("; ")}`);
     }
-    validateResult(result, scenario);
+    if (scenarioKind === "arrow") validateArrowResult(result, scenario);
+    else validateResult(result, scenario);
     if (index >= warmupIterations) {
       results.push(result);
     }
-    process.stderr.write(
-      `${index < warmupIterations ? "warmup" : "sample"} ${index + 1}/${totalIterations}: `
-      + `startup=${result.workerWasmStartupMs.toFixed(1)}ms, `
-      + `paint=${result.firstUsablePaintMs.toFixed(1)}ms, `
-      + `scan=${result.completedScan.mibPerSecond.toFixed(1)}MiB/s\n`,
-    );
+    const prefix = `${index < warmupIterations ? "warmup" : "sample"} ${index + 1}/${totalIterations}: `;
+    process.stderr.write(scenarioKind === "arrow"
+      ? prefix
+        + `engine=${result.coldLoad.engineStartupMs.toFixed(1)}ms, `
+        + `arrow-open=${result.coldLoad.adapterColdOpenMs.toFixed(1)}ms, `
+        + `paint=${result.coldLoad.firstUsablePaintMs.toFixed(1)}ms, `
+        + `range=${result.rangeRead.medianMs.toFixed(1)}ms\n`
+      : prefix
+        + `startup=${result.workerWasmStartupMs.toFixed(1)}ms, `
+        + `paint=${result.firstUsablePaintMs.toFixed(1)}ms, `
+        + `scan=${result.completedScan.mibPerSecond.toFixed(1)}MiB/s\n`);
   }
 
   const revision = await repositoryRevision();
   const report = {
-    benchmarkSchemaVersion: 1,
+    benchmarkSchemaVersion: scenarioKind === "arrow" ? 2 : 1,
     scenario: options.scenario,
+    adapter: scenarioKind,
     recordedAt: new Date().toISOString(),
     source: revision,
     environment: {
@@ -99,18 +130,28 @@ try {
         (result) => result.memory.forcedGcBeforeSample === true,
       ),
     },
-    dataset: {
-      generator: manifest.generator,
-      requestedBytes: scenario.requestedBytes,
-      generatedBytes: scenario.generatedBytes,
-      rows: scenario.rows,
-      sha256: scenario.sha256,
-    },
+    dataset: scenarioKind === "arrow"
+      ? {
+        fixture: scenario.fixture,
+        bytes: scenario.bytes,
+        rows: scenario.rows,
+        columns: scenario.columns,
+        container: scenario.container,
+        compression: scenario.compression,
+        sha256: scenario.sha256,
+      }
+      : {
+        generator: manifest.generator,
+        requestedBytes: scenario.requestedBytes,
+        generatedBytes: scenario.generatedBytes,
+        rows: scenario.rows,
+        sha256: scenario.sha256,
+      },
     iterations: {
       warmup: warmupIterations,
       measured: measuredIterations,
     },
-    summary: summarizeResults(results),
+    summary: scenarioKind === "arrow" ? summarizeArrowResults(results) : summarizeResults(results),
     samples: results,
   };
   const output = resolve(repositoryRoot, options.output);
@@ -140,6 +181,19 @@ async function ensureDataset(path, expected) {
   if (metadata.size !== expected.generatedBytes || digest !== expected.sha256) {
     throw new Error(
       `generated dataset does not match manifest: ${metadata.size} bytes, sha256 ${digest}`,
+    );
+  }
+}
+
+async function ensureFixture(path, expected) {
+  const metadata = await stat(path).catch(() => undefined);
+  if (!metadata?.isFile()) {
+    throw new Error(`Arrow performance fixture is missing: ${expected.fixture}`);
+  }
+  const digest = await sha256(path);
+  if (metadata.size !== expected.bytes || digest !== expected.sha256) {
+    throw new Error(
+      `Arrow performance fixture does not match manifest: ${metadata.size} bytes, sha256 ${digest}`,
     );
   }
 }
@@ -175,6 +229,7 @@ function validateResult(result, expected) {
   if (result.scroll.frames !== expected.scrollFrames) {
     throw new Error("scroll frame sample count is incomplete");
   }
+  validateScrollTravel(result.scroll, "CSV");
   if (result.transfer.batchResponses < 1 || result.transfer.sourceRatio >= 1) {
     throw new Error("range transfer invariant failed: expected bounded demand-driven batches");
   }
@@ -183,6 +238,65 @@ function validateResult(result, expected) {
   }
   if (result.memory.forcedGcBeforeSample !== true) {
     throw new Error("canonical memory samples were not preceded by forced garbage collection");
+  }
+}
+
+function validateArrowResult(result, expected) {
+  const finite = [
+    result.coldLoad.engineStartupMs,
+    result.coldLoad.adapterColdOpenMs,
+    result.coldLoad.firstUsablePaintMs,
+    result.rangeRead.medianMs,
+    result.rangeRead.p95Ms,
+    result.scroll.medianMs,
+    result.scroll.p95Ms,
+    result.scroll.maxMs,
+    result.transfer.batchPayloadBytes,
+    result.transfer.sourceRatio,
+    result.memory.peakDeltaBytes,
+  ];
+  if (finite.some((value) => !Number.isFinite(value) || value < 0)) {
+    throw new Error("Arrow performance result contains a non-finite or negative metric");
+  }
+  if (result.adapter.container !== expected.container) {
+    throw new Error("Arrow performance container does not match the scenario manifest");
+  }
+  if (result.adapter.sourceBytes !== expected.bytes) {
+    throw new Error("Arrow performance source byte count does not match the fixture");
+  }
+  if (result.rangeRead.samples.length !== result.rangeRead.starts.length) {
+    throw new Error("Arrow range measurement sample count is incomplete");
+  }
+  if (result.rangeRead.samples.length < 1 || result.rangeBatchBytes.some((bytes) => bytes <= 0)) {
+    throw new Error("Arrow range measurement did not return bounded batches");
+  }
+  if (result.scroll.frames !== expected.scrollFrames) {
+    throw new Error("Arrow scroll frame sample count is incomplete");
+  }
+  validateScrollTravel(result.scroll, "Arrow");
+  if (result.transfer.batchResponses < 1 || result.transfer.batchPayloadBytes <= 0) {
+    throw new Error("Arrow transfer invariant failed: expected at least one typed batch response");
+  }
+  if (result.memory.api !== "measureUserAgentSpecificMemory") {
+    throw new Error("canonical Arrow memory API was not used");
+  }
+  if (result.memory.forcedGcBeforeSample !== true) {
+    throw new Error("canonical Arrow memory samples were not preceded by forced garbage collection");
+  }
+}
+
+function validateScrollTravel(scroll, adapter) {
+  const travel = [
+    scroll.maximumScrollTop,
+    scroll.maximumObservedScrollTop,
+    scroll.finalScrollTop,
+    scroll.changedFrames,
+  ];
+  if (travel.some((value) => !Number.isFinite(value) || value <= 0)) {
+    throw new Error(`${adapter} scroll measurement did not exercise a non-zero scroll range`);
+  }
+  if (scroll.maximumObservedScrollTop > scroll.maximumScrollTop) {
+    throw new Error(`${adapter} scroll measurement exceeded its scroll range`);
   }
 }
 
@@ -196,6 +310,39 @@ function summarizeResults(results) {
     ),
     rangeReadMedianMs: distribution(results.map((result) => result.rangeRead.medianMs)),
     scrollP95Ms: distribution(results.map((result) => result.scroll.p95Ms)),
+    scrollMaximumTop: distribution(results.map((result) => result.scroll.maximumScrollTop)),
+    scrollObservedTop: distribution(
+      results.map((result) => result.scroll.maximumObservedScrollTop),
+    ),
+    scrollChangedFrames: distribution(results.map((result) => result.scroll.changedFrames)),
+    scrollLongFramesOver33ms: distribution(
+      results.map((result) => result.scroll.longFramesOver33ms),
+    ),
+    transferBatchPayloadBytes: distribution(
+      results.map((result) => result.transfer.batchPayloadBytes),
+    ),
+    memoryPeakDeltaBytes: distribution(
+      results.map((result) => result.memory.peakDeltaBytes),
+    ),
+  };
+}
+
+function summarizeArrowResults(results) {
+  if (results.length === 0) throw new Error("at least one measured Arrow iteration is required");
+  return {
+    engineStartupMs: distribution(results.map((result) => result.coldLoad.engineStartupMs)),
+    adapterColdOpenMs: distribution(results.map((result) => result.coldLoad.adapterColdOpenMs)),
+    firstUsablePaintMs: distribution(
+      results.map((result) => result.coldLoad.firstUsablePaintMs),
+    ),
+    rangeReadMedianMs: distribution(results.map((result) => result.rangeRead.medianMs)),
+    scrollP95Ms: distribution(results.map((result) => result.scroll.p95Ms)),
+    scrollMaximumTop: distribution(results.map((result) => result.scroll.maximumScrollTop)),
+    scrollObservedTop: distribution(
+      results.map((result) => result.scroll.maximumObservedScrollTop),
+    ),
+    scrollFinalTop: distribution(results.map((result) => result.scroll.finalScrollTop)),
+    scrollChangedFrames: distribution(results.map((result) => result.scroll.changedFrames)),
     scrollLongFramesOver33ms: distribution(
       results.map((result) => result.scroll.longFramesOver33ms),
     ),
@@ -256,7 +403,7 @@ function parseArguments(args) {
     else if (argument === "--warmups") parsed.warmups = nonNegativeInteger(requiredValue(args, ++index, argument));
     else if (argument === "--headed") parsed.headed = true;
     else if (argument === "--help" || argument === "-h") {
-      process.stdout.write("Usage: node test/performance/run-browser.mjs [--scenario smoke|canonical] [--iterations N] [--warmups N] [--output PATH] [--headed]\n");
+      process.stdout.write("Usage: node test/performance/run-browser.mjs [--scenario NAME] [--iterations N] [--warmups N] [--output PATH] [--headed]\n");
       process.exit(0);
     } else throw new Error(`unknown argument: ${argument}`);
   }

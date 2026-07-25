@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "external": {
+    "repository": "https://github.com/apache/arrow-testing",
+    "revision": "9ff285c88565f0f6abc855918c6a342e70e4909c",
+    "license": "Apache-2.0",
+    "licenseFile": "APACHE-ARROW-TESTING-LICENSE.txt",
+    "files": [
+      {
+        "path": "apache-arrow-1.0.0-generated-nested.arrow",
+        "upstreamPath": "data/arrow-ipc-stream/integration/1.0.0-littleendian/generated_nested.arrow_file",
+        "gitBlob": "99de7738404ef832374040850be8129060d0c5b6",
+        "bytes": 2706,
+        "sha256": "06d494c58537a9909a7a1ea53a48a8e018d713d937a5d70a660bd1419839f829"
+      }
+    ],
+    "licenseSha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+  },
+  "playground": {
+    "path": "m4-sample.arrow",
+    "generator": "examples/generate_arrow_fixture.rs",
+    "bytes": 3850,
+    "sha256": "760585e0e438576fd8225cda1506b558be19dd0fec16dffa36dbc35724511a2b"
+  }
+}

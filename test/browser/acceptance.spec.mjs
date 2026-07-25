@@ -4,8 +4,8 @@ test("opens a tab-separated File using the TSV default delimiter", async ({ page
   await page.goto("/test/browser/harness.html");
 
   const result = await page.evaluate(async () => {
-    const { createEngine } = await import("/dist/index.js");
-    const engine = await createEngine();
+    const { createEngine, delimitedAdapter } = await import("/dist/index.js");
+    const engine = await createEngine({ adapters: [delimitedAdapter] });
     let dataset;
     let table;
     try {
@@ -13,7 +13,7 @@ test("opens a tab-separated File using the TSV default delimiter", async ({ page
         new File(["name\tnote\tactive\nAda\t\"red\tteam\"\tyes\nGrace\tblue,no\t\n"], "sample.tsv", {
           type: "text/tab-separated-values",
         }),
-        { format: "tsv", header: "first-row", mode: "strict" },
+        { adapter: delimitedAdapter, adapterOptions: { dialect: "tsv", header: "first-row", mode: "strict" } },
       );
       table = await dataset.openTable(dataset.tables[0].id);
       const batch = await table.readRange({
@@ -42,21 +42,21 @@ test("opens a tab-separated File using the TSV default delimiter", async ({ page
   });
 });
 
-test("transfers an ArrayBuffer source to the Worker and returns its table", async ({ page }) => {
+test("can explicitly transfer an ArrayBuffer source to the Worker and returns its table", async ({ page }) => {
   await page.goto("/test/browser/harness.html");
 
   const result = await page.evaluate(async () => {
-    const { createEngine } = await import("/dist/index.js");
-    const engine = await createEngine();
+    const { createEngine, delimitedAdapter } = await import("/dist/index.js");
+    const engine = await createEngine({ adapters: [delimitedAdapter] });
     let dataset;
     let table;
     try {
       const source = new TextEncoder().encode("name,score\nAda,10\n").buffer;
       const bytesBeforeOpen = source.byteLength;
       dataset = await engine.open(source, {
-        format: "csv",
-        header: "first-row",
-        mode: "strict",
+        adapter: delimitedAdapter,
+        adapterOptions: { dialect: "csv", header: "first-row", mode: "strict" },
+        transferInput: true,
       });
       const bytesAfterOpen = source.byteLength;
       table = await dataset.openTable(dataset.tables[0].id);
@@ -83,16 +83,14 @@ test("treats the first row as data with header none and honors a custom delimite
   await page.goto("/test/browser/harness.html");
 
   const result = await page.evaluate(async () => {
-    const { createEngine } = await import("/dist/index.js");
-    const engine = await createEngine();
+    const { createEngine, delimitedAdapter } = await import("/dist/index.js");
+    const engine = await createEngine({ adapters: [delimitedAdapter] });
     let dataset;
     let table;
     try {
       dataset = await engine.open(new Blob(["alpha|beta\none|two\n"]), {
-        format: "csv",
-        header: "none",
-        delimiter: "|",
-        mode: "strict",
+        adapter: delimitedAdapter,
+        adapterOptions: { dialect: "csv", header: "none", delimiter: "|", mode: "strict" },
       });
       table = await dataset.openTable(dataset.tables[0].id);
       const batch = await table.readRange({
@@ -127,13 +125,12 @@ test("reports malformed delimited input as a strict parse failure", async ({ pag
   await page.goto("/test/browser/harness.html");
 
   const failure = await page.evaluate(async () => {
-    const { createEngine } = await import("/dist/index.js");
-    const engine = await createEngine();
+    const { createEngine, delimitedAdapter } = await import("/dist/index.js");
+    const engine = await createEngine({ adapters: [delimitedAdapter] });
     try {
       await engine.open(new Blob(["left,right\nonly-left\n"]), {
-        format: "csv",
-        header: "first-row",
-        mode: "strict",
+        adapter: delimitedAdapter,
+        adapterOptions: { dialect: "csv", header: "first-row", mode: "strict" },
       });
       return { code: "RESOLVED" };
     } catch (error) {
@@ -156,19 +153,18 @@ test("keeps the Canvas, horizontal scroll host, and bounded ARIA viewport in syn
   await page.goto("/test/browser/harness.html");
 
   await page.evaluate(async () => {
-    const { createCanvasTableView, createEngine } = await import("/dist/index.js");
+    const { createCanvasTableView, createEngine, delimitedAdapter } = await import("/dist/index.js");
     const host = document.createElement("div");
     host.id = "wide-table-host";
     Object.assign(host.style, { height: "220px", width: "420px" });
     document.body.replaceChildren(host);
 
-    const engine = await createEngine();
+    const engine = await createEngine({ adapters: [delimitedAdapter] });
     const headers = Array.from({ length: 12 }, (_, index) => `Column ${index + 1}`).join(",");
     const values = Array.from({ length: 12 }, (_, index) => `Value ${index + 1}`).join(",");
     const dataset = await engine.open(new Blob([`${headers}\n${values}\n`]), {
-      format: "csv",
-      header: "first-row",
-      mode: "strict",
+      adapter: delimitedAdapter,
+      adapterOptions: { dialect: "csv", header: "first-row", mode: "strict" },
     });
     const table = await dataset.openTable(dataset.tables[0].id);
     const view = createCanvasTableView({ container: host, table });

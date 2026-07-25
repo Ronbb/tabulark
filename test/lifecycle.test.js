@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createEngine, createTableController } from "../dist/index.js";
+import { createEngine, createTableController, delimitedAdapter } from "../dist/index.js";
+
+const createTestEngine = () => createEngine({
+  adapters: [delimitedAdapter],
+  memoryBudgetBytes: 8 * 1024 * 1024,
+});
+const csvOptions = (extra = {}) => ({
+  adapter: delimitedAdapter,
+  adapterOptions: { dialect: "csv" },
+  ...extra,
+});
 
 test("open forwards AbortSignal and reclaims a source when cancellation races session delivery", async () => {
   const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
@@ -13,13 +23,13 @@ test("open forwards AbortSignal and reclaims a source when cancellation races se
 
   let engine;
   try {
-    engine = await createEngine({ memoryBudgetBytes: 8 * 1024 * 1024 });
+    engine = await createTestEngine();
     const worker = LifecycleWorker.latest;
     const controller = new AbortController();
     worker.afterOpenResponse = () => controller.abort();
 
     await assert.rejects(
-      engine.open(new Blob(["value\na\n"]), { format: "csv", signal: controller.signal }),
+      engine.open(new Blob(["value\na\n"]), csvOptions({ signal: controller.signal })),
       (error) => {
         assert.equal(error.code, "CANCELLED");
         return true;
@@ -29,7 +39,7 @@ test("open forwards AbortSignal and reclaims a source when cancellation races se
     assert.deepEqual(worker.closedSources, ["d1"]);
     assert.equal(worker.requests.some((request) => request.op === "listTables"), false);
 
-    const reopened = await engine.open(new Blob(["value\nb\n"]), { format: "csv" });
+    const reopened = await engine.open(new Blob(["value\nb\n"]), csvOptions());
     const table = await reopened.openTable("table-0");
     await table.close();
     await reopened.close();
@@ -49,14 +59,11 @@ test("open cancellation sends a Worker cancel while openSource is still pending"
 
   let engine;
   try {
-    engine = await createEngine({ memoryBudgetBytes: 8 * 1024 * 1024 });
+    engine = await createTestEngine();
     const worker = LifecycleWorker.latest;
     worker.holdOpenResponse = true;
     const controller = new AbortController();
-    const opening = engine.open(new Blob(["value\na\n"]), {
-      format: "csv",
-      signal: controller.signal,
-    });
+    const opening = engine.open(new Blob(["value\na\n"]), csvOptions({ signal: controller.signal }));
     await waitFor(() => worker.requests.some((request) => request.op === "openSource"));
     const openRequest = worker.requests.find((request) => request.op === "openSource");
     controller.abort();
@@ -87,9 +94,9 @@ test("a background scan fatal closes its dataset, table, and controller exactly 
   let engine;
   let controller;
   try {
-    engine = await createEngine({ memoryBudgetBytes: 8 * 1024 * 1024 });
+    engine = await createTestEngine();
     const worker = LifecycleWorker.latest;
-    const dataset = await engine.open(new Blob(["value\na\n"]), { format: "csv" });
+    const dataset = await engine.open(new Blob(["value\na\n"]), csvOptions());
     const table = await dataset.openTable("table-0");
     const datasetEvents = [];
     const tableEvents = [];
@@ -127,9 +134,9 @@ test("openTable rolls back a remote table when metadata validation fails", async
 
   let engine;
   try {
-    engine = await createEngine({ memoryBudgetBytes: 8 * 1024 * 1024 });
+    engine = await createTestEngine();
     const worker = LifecycleWorker.latest;
-    const dataset = await engine.open(new Blob(["value\na\n"]), { format: "csv" });
+    const dataset = await engine.open(new Blob(["value\na\n"]), csvOptions());
     worker.metadataOverride = {};
 
     await assert.rejects(dataset.openTable("table-0"), (error) => {
@@ -147,6 +154,56 @@ test("openTable rolls back a remote table when metadata validation fails", async
   }
 });
 
+test("metadata normalization excludes negative extents and canonicalizes capabilities", async () => {
+  const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  Object.defineProperty(globalThis, "Worker", {
+    configurable: true,
+    writable: true,
+    value: LifecycleWorker,
+  });
+
+  let engine;
+  try {
+    engine = await createTestEngine();
+    const worker = LifecycleWorker.latest;
+    const dataset = await engine.open(new Blob(["value\na\n"]), csvOptions());
+    worker.metadataOverride = {
+      ...metadata(),
+      extent: {
+        rows: { kind: "exact", value: -1 },
+        columns: { kind: "at-least", value: -2 },
+      },
+      capabilities: {
+        randomAccess: "untrusted",
+        typedValues: "yes",
+        search: 1,
+        sort: null,
+        filter: {},
+        multiTable: "true",
+        customCapability: "preserved",
+      },
+    };
+
+    const table = await dataset.openTable("table-0");
+    assert.deepEqual(table.metadata.extent, {
+      rows: { kind: "at-least", value: 0 },
+      columns: { kind: "exact", value: 1 },
+    });
+    assert.deepEqual(table.metadata.capabilities, {
+      randomAccess: "indexed-prefix",
+      typedValues: false,
+      search: false,
+      sort: false,
+      filter: false,
+      multiTable: false,
+      customCapability: "preserved",
+    });
+  } finally {
+    await engine?.close();
+    restoreWorker(originalWorker);
+  }
+});
+
 test("malformed Worker protocol messages fail pending work and terminate the Worker", async () => {
   const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
   Object.defineProperty(globalThis, "Worker", {
@@ -157,16 +214,39 @@ test("malformed Worker protocol messages fail pending work and terminate the Wor
 
   let engine;
   try {
-    engine = await createEngine({ memoryBudgetBytes: 8 * 1024 * 1024 });
+    engine = await createTestEngine();
     const worker = LifecycleWorker.latest;
     worker.malformedResponseOp = "listTables";
 
-    await assert.rejects(engine.open(new Blob(["value\na\n"]), { format: "csv" }), (error) => {
+    await assert.rejects(engine.open(new Blob(["value\na\n"]), csvOptions()), (error) => {
       assert.equal(error.code, "PROTOCOL_INCOMPATIBLE");
       return true;
     });
     assert.equal(worker.terminated, 1);
     assert.equal(worker.requests.some((request) => request.op === "closeSource"), false);
+  } finally {
+    await engine?.close();
+    restoreWorker(originalWorker);
+  }
+});
+
+test("protocol-v1 Worker responses are explicitly rejected", async () => {
+  const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  Object.defineProperty(globalThis, "Worker", {
+    configurable: true,
+    writable: true,
+    value: LifecycleWorker,
+  });
+  let engine;
+  try {
+    engine = await createTestEngine();
+    const worker = LifecycleWorker.latest;
+    worker.v1ResponseOp = "listTables";
+    await assert.rejects(engine.open(new Blob(["value\na\n"]), csvOptions()), (error) => {
+      assert.equal(error.code, "PROTOCOL_INCOMPATIBLE");
+      return true;
+    });
+    assert.equal(worker.terminated, 1);
   } finally {
     await engine?.close();
     restoreWorker(originalWorker);
@@ -183,11 +263,11 @@ test("dataset events without routing fail pending work and terminate the Worker"
 
   let engine;
   try {
-    engine = await createEngine({ memoryBudgetBytes: 8 * 1024 * 1024 });
+    engine = await createTestEngine();
     const worker = LifecycleWorker.latest;
     worker.malformedEventBeforeListTables = true;
 
-    await assert.rejects(engine.open(new Blob(["value\na\n"]), { format: "csv" }), (error) => {
+    await assert.rejects(engine.open(new Blob(["value\na\n"]), csvOptions()), (error) => {
       assert.equal(error.code, "PROTOCOL_INCOMPATIBLE");
       return true;
     });
@@ -208,11 +288,11 @@ test("open preserves a background fatal that arrives before listTables completes
 
   let engine;
   try {
-    engine = await createEngine({ memoryBudgetBytes: 8 * 1024 * 1024 });
+    engine = await createTestEngine();
     const worker = LifecycleWorker.latest;
     worker.failBeforeListTables = true;
 
-    await assert.rejects(engine.open(new Blob(["value\na\n"]), { format: "csv" }), (error) => {
+    await assert.rejects(engine.open(new Blob(["value\na\n"]), csvOptions()), (error) => {
       assert.equal(error.code, "PARSE_FAILED");
       assert.equal(error.message, "Synthetic pre-session scan failure");
       return true;
@@ -233,9 +313,9 @@ test("dataset.close tolerates a delayed acknowledgement from a healthy Worker", 
 
   let engine;
   try {
-    engine = await createEngine({ memoryBudgetBytes: 8 * 1024 * 1024 });
+    engine = await createTestEngine();
     const worker = LifecycleWorker.latest;
-    const dataset = await engine.open(new Blob(["value\na\n"]), { format: "csv" });
+    const dataset = await engine.open(new Blob(["value\na\n"]), csvOptions());
     worker.delayCloseSourceMs = 750;
 
     await dataset.close();
@@ -256,7 +336,7 @@ test("engine.close terminates an unresponsive Worker within a bounded wait", asy
 
   let engine;
   try {
-    engine = await createEngine({ memoryBudgetBytes: 8 * 1024 * 1024 });
+    engine = await createTestEngine();
     const worker = LifecycleWorker.latest;
     worker.holdShutdownResponse = true;
     const startedAt = Date.now();
@@ -279,9 +359,9 @@ test("dataset.close terminates an unresponsive Worker within a bounded wait", as
 
   let engine;
   try {
-    engine = await createEngine({ memoryBudgetBytes: 8 * 1024 * 1024 });
+    engine = await createTestEngine();
     const worker = LifecycleWorker.latest;
-    const dataset = await engine.open(new Blob(["value\na\n"]), { format: "csv" });
+    const dataset = await engine.open(new Blob(["value\na\n"]), csvOptions());
     worker.holdCloseSourceResponse = true;
     const startedAt = Date.now();
     await assert.rejects(dataset.close(), (error) => error.code === "RUNTIME_FAILURE");
@@ -305,9 +385,9 @@ for (const eventType of ["error", "messageerror"]) {
     let engine;
     let controller;
     try {
-      engine = await createEngine({ memoryBudgetBytes: 8 * 1024 * 1024 });
+      engine = await createTestEngine();
       const worker = LifecycleWorker.latest;
-      const dataset = await engine.open(new Blob(["value\na\n"]), { format: "csv" });
+      const dataset = await engine.open(new Blob(["value\na\n"]), csvOptions());
       const table = await dataset.openTable("table-0");
       const datasetEvents = [];
       const tableEvents = [];
@@ -354,7 +434,7 @@ for (const eventType of ["error", "messageerror"]) {
         assert.equal(error.code, "HANDLE_CLOSED");
         return true;
       });
-      await assert.rejects(engine.open(new Blob(["value\na\n"]), { format: "csv" }), (error) => {
+      await assert.rejects(engine.open(new Blob(["value\na\n"]), csvOptions()), (error) => {
         assert.equal(error.code, "HANDLE_CLOSED");
         return true;
       });
@@ -380,6 +460,7 @@ class LifecycleWorker {
   delayCloseSourceMs = 0;
   metadataOverride;
   malformedResponseOp;
+  v1ResponseOp;
   malformedEventBeforeListTables = false;
   failBeforeListTables = false;
   afterOpenResponse;
@@ -416,17 +497,23 @@ class LifecycleWorker {
     if (request.op === this.malformedResponseOp) {
       queueMicrotask(() => this.#emit("message", {
         data: {
-          protocolVersion: 1,
+          protocolVersion: 2,
           requestId: request.requestId,
           status: "success",
         },
       }));
       return;
     }
+    if (request.op === this.v1ResponseOp) {
+      const response = responseFor(request, this);
+      response.protocolVersion = 1;
+      queueMicrotask(() => this.#emit("message", { data: response }));
+      return;
+    }
     if (request.op === "listTables" && this.malformedEventBeforeListTables) {
       queueMicrotask(() => this.#emit("message", {
         data: {
-          protocolVersion: 1,
+          protocolVersion: 2,
           event: "warning",
           payload: {
             handle: request.payload.datasetHandle,
@@ -441,7 +528,7 @@ class LifecycleWorker {
       queueMicrotask(() => {
         this.#emit("message", {
           data: {
-            protocolVersion: 1,
+            protocolVersion: 2,
             event: "runtimeError",
             datasetHandle: request.payload.datasetHandle,
             payload: {
@@ -453,7 +540,7 @@ class LifecycleWorker {
         });
         this.#emit("message", {
           data: {
-            protocolVersion: 1,
+            protocolVersion: 2,
             event: "closed",
             datasetHandle: request.payload.datasetHandle,
             payload: { handle: request.payload.datasetHandle, kind: "source" },
@@ -461,7 +548,7 @@ class LifecycleWorker {
         });
         this.#emit("message", {
           data: {
-            protocolVersion: 1,
+            protocolVersion: 2,
             requestId: request.requestId,
             status: "failure",
             error: {
@@ -481,7 +568,7 @@ class LifecycleWorker {
     if (request.op === "closeSource") {
       queueMicrotask(() => this.#emit("message", {
         data: {
-          protocolVersion: 1,
+          protocolVersion: 2,
           event: "closed",
           datasetHandle: request.payload.datasetHandle,
           payload: { handle: request.payload.datasetHandle, kind: "dataset" },
@@ -511,7 +598,7 @@ class LifecycleWorker {
     this.closedSources.push(datasetHandle);
     this.#emit("message", {
       data: {
-        protocolVersion: 1,
+        protocolVersion: 2,
         event: "runtimeError",
         datasetHandle,
         payload: {
@@ -523,7 +610,7 @@ class LifecycleWorker {
     });
     this.#emit("message", {
       data: {
-        protocolVersion: 1,
+        protocolVersion: 2,
         event: "closed",
         datasetHandle,
         tableHandle,
@@ -533,7 +620,7 @@ class LifecycleWorker {
     });
     this.#emit("message", {
       data: {
-        protocolVersion: 1,
+        protocolVersion: 2,
         event: "closed",
         datasetHandle,
         tableId: "table-0",
@@ -558,7 +645,13 @@ function responseFor(request, worker) {
   switch (request.op) {
     case "hello":
       kind = "hello";
-      data = { protocolVersion: 1, transferableBatches: true };
+      data = {
+        protocolVersion: 2,
+        adapterApiVersion: 1,
+        batchLayoutVersion: 1,
+        adapters: request.payload.adapters.map((adapter) => adapter.id),
+        transferableBatches: true,
+      };
       break;
     case "openSource":
       kind = "dataset";
@@ -589,7 +682,7 @@ function responseFor(request, worker) {
       return undefined;
   }
   return {
-    protocolVersion: 1,
+    protocolVersion: 2,
     requestId: request.requestId,
     status: "success",
     result: data === undefined ? { kind } : { kind, data },
@@ -611,7 +704,7 @@ function metadata() {
         id: "c0",
         name: "value",
         index: 0,
-        logicalType: "utf8",
+        dataType: { type: "utf8" },
         nullable: true,
       }],
     },

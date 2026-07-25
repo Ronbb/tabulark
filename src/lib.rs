@@ -1,13 +1,15 @@
 //! Core types for Tabulark.
 //!
-//! This crate supplies the model, version-one Worker protocol, CSV/TSV runtime,
-//! and WebAssembly bridge for the M0-M2 local CSV/TSV prototype. Its public API
-//! is experimental and may change while M3 hardening and M4 adapter validation
-//! are completed.
+//! This crate supplies protocol-v2 model types, the delimited runtime, and an
+//! opt-in Apache Arrow IPC adapter. Its public API remains experimental while
+//! the built-in adapter ABI is validated before a stable release.
 
 pub mod error;
 pub mod model;
 pub mod protocol;
+
+#[cfg(feature = "arrow")]
+pub mod arrow;
 
 #[cfg(feature = "csv")]
 pub mod csv;
@@ -20,15 +22,18 @@ mod wasm;
 
 pub use error::{ErrorCode, Result, TabularkError};
 pub use model::{
-    AxisExtent, Capabilities, ColumnSchema, LogicalType, RandomAccess, RangeRequest, ReturnedRange,
-    Schema, StringColumnBatch, TableBatch, TableExtent, TableMetadata,
+    ArrayDescriptor, ArrayLayout, AxisExtent, BATCH_LAYOUT_VERSION, BatchBuffer, BitmapSlice,
+    BufferSlice, Capabilities, ColumnSchema, IntervalUnit, MAX_DATA_TYPE_NESTING_DEPTH,
+    RandomAccess, RangeRequest, ReturnedRange, Schema, StringColumnBatch, TableBatch,
+    TableDataType, TableExtent, TableField, TableMetadata, TimeUnit, TypedColumnBatch,
+    TypedTableBatch, UnionArray, UnionField, UnionMode,
 };
 
 #[cfg(feature = "wasm")]
 pub use wasm::WasmRuntime;
 
-/// The current maturity of the experimental M0-M2 API.
-pub const PROJECT_STATUS: &str = "prototype";
+/// The current maturity of the experimental M4 API.
+pub const PROJECT_STATUS: &str = "pre-alpha";
 
 /// The number of rows and columns exposed by a table.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]

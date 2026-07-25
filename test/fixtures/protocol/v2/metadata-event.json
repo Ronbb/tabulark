@@ -1,0 +1,50 @@
+{
+  "protocolVersion": 2,
+  "event": "metadata",
+  "datasetHandle": "d1",
+  "tableHandle": "t1",
+  "tableId": "table-0",
+  "payload": {
+    "tableId": "table-0",
+    "name": "Arrow IPC",
+    "revision": 0,
+    "extent": {
+      "rows": { "kind": "exact", "value": 4 },
+      "columns": { "kind": "exact", "value": 2 }
+    },
+    "schema": {
+      "version": 0,
+      "columns": [
+        {
+          "id": "c0",
+          "name": "bigint",
+          "index": 0,
+          "dataType": { "type": "int64" },
+          "nullable": true
+        },
+        {
+          "id": "c1",
+          "name": "tags",
+          "index": 1,
+          "dataType": {
+            "type": "list",
+            "field": {
+              "name": "item",
+              "dataType": { "type": "utf8" },
+              "nullable": true
+            }
+          },
+          "nullable": true
+        }
+      ]
+    },
+    "capabilities": {
+      "randomAccess": "full",
+      "typedValues": true,
+      "search": false,
+      "sort": false,
+      "filter": false,
+      "multiTable": false
+    }
+  }
+}

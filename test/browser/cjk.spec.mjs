@@ -77,20 +77,23 @@ test("preserves CJK text from BOM/CRLF TSV through Canvas and clipboard", async 
       }
       const bytes = new TextEncoder().encode(transformedText);
 
-      const { createCanvasTableView, createEngine } = await import("/dist/index.js");
+      const { createCanvasTableView, createEngine, delimitedAdapter } = await import("/dist/index.js");
       const host = document.createElement("div");
       Object.assign(host.style, { height: "260px", width: "760px" });
       document.body.replaceChildren(host);
 
-      const engine = await createEngine();
+      const engine = await createEngine({ adapters: [delimitedAdapter] });
       const dataset = await engine.open(
         new File([bytes], fixtureCase.file, {
           type: fixtureCase.options.format === "tsv" ? "text/tab-separated-values" : "text/csv",
         }),
         {
-          format: fixtureCase.options.format,
-          header: fixtureCase.options.header ? "first-row" : "none",
-          mode: fixtureCase.options.mode,
+          adapter: delimitedAdapter,
+          adapterOptions: {
+            dialect: fixtureCase.options.format,
+            header: fixtureCase.options.header ? "first-row" : "none",
+            mode: fixtureCase.options.mode,
+          },
         },
       );
       const table = await dataset.openTable(dataset.tables[0].id);

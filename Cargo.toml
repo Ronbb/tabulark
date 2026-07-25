@@ -14,6 +14,7 @@ keywords = ["table", "preview", "wasm", "data", "canvas"]
 # pattern also matches dependency documentation such as `node_modules/**/README.md`.
 include = [
     "/src/**",
+    "/examples/generate_arrow_fixture.rs",
     "/Cargo.toml",
     "/README.md",
     "/LICENSE-MIT",
@@ -23,13 +24,42 @@ include = [
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[example]]
+name = "generate_arrow_fixture"
+required-features = ["arrow"]
+
 [features]
 default = ["csv"]
 csv = ["dep:csv-core"]
 wasm = ["csv", "dep:js-sys", "dep:serde-wasm-bindgen", "dep:wasm-bindgen"]
+# Arrow IPC support intentionally lives behind an opt-in feature.  Keeping it
+# out of the default CSV build preserves the M3 core-size budget, while the
+# dedicated Arrow WASM wrapper can opt into the complete safe arrow-rs stack.
+arrow = [
+    "dep:arrow-array",
+    "dep:arrow-buffer",
+    "dep:arrow-cast",
+    "dep:arrow-data",
+    "dep:arrow-ipc",
+    "dep:arrow-schema",
+    "dep:arrow-select",
+    "dep:flatbuffers",
+    "arrow-array/chrono-tz",
+    "arrow-array/force_validate",
+    "arrow-cast/force_validate",
+    "arrow-data/force_validate",
+]
 
 [dependencies]
+arrow-array = { version = "=59.1.0", default-features = false, optional = true }
+arrow-buffer = { version = "=59.1.0", default-features = false, optional = true }
+arrow-cast = { version = "=59.1.0", default-features = false, optional = true }
+arrow-data = { version = "=59.1.0", default-features = false, optional = true }
+arrow-ipc = { version = "=59.1.0", default-features = false, features = ["lz4", "zstd"], optional = true }
+arrow-schema = { version = "=59.1.0", default-features = false, optional = true }
+arrow-select = { version = "=59.1.0", default-features = false, optional = true }
 csv-core = { version = "0.1.13", optional = true }
+flatbuffers = { version = "=25.12.19", default-features = false, optional = true }
 js-sys = { version = "=0.3.77", optional = true }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
@@ -37,7 +67,20 @@ serde-wasm-bindgen = { version = "0.6.5", optional = true }
 wasm-bindgen = { version = "=0.2.100", optional = true }
 
 [workspace]
+members = [
+    ".",
+    "crates/tabulark-arrow-wasm",
+    "crates/tabulark-delimited-wasm",
+]
+default-members = ["."]
 resolver = "3"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+panic = "abort"
+strip = "symbols"
 
 [lints.rust]
 missing_docs = "warn"

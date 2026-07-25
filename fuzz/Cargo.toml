@@ -3,12 +3,13 @@ name = "tabulark-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
+rust-version = "1.85"
 
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
-tabulark = { path = ".." }
+tabulark = { path = "..", features = ["arrow"] }
 
 # The production crate also emits a cdylib. Its cargo-fuzz linkage is currently
 # maintained on Linux/WSL; keeping libFuzzer Unix-scoped preserves the stable
@@ -19,6 +20,13 @@ libfuzzer-sys = "0.4"
 [[bin]]
 name = "csv_lifecycle"
 path = "fuzz_targets/csv_lifecycle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "arrow_lifecycle"
+path = "fuzz_targets/arrow_lifecycle.rs"
 test = false
 doc = false
 bench = false

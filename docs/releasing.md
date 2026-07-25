@@ -1,84 +1,91 @@
-# Releasing Tabulark
+# Delivery and release policy
 
-Tabulark publishes the same version number to crates.io and npm. The release
-workflow validates that `Cargo.toml`, `package.json`, and the Git tag agree.
+> **M4 does not publish a crate or npm package.** It is a pre-alpha validation
+> milestone. Do not create a tag, change registry ownership, publish to
+> crates.io/npm, or call the milestone complete merely because a local build
+> succeeds.
 
-## Bootstrap the package names
+## Candidate delivery gates
 
-Trusted Publishing can only be configured after the package names have an
-initial owner. Publish the first version manually from a trusted workstation:
+For a commit to be considered an M4 delivery candidate, all of the following
+must be green for that same commit:
 
-```bash
-cargo login
-npm login
+1. Rust formatting, Clippy, workspace tests, adapter lifecycle checks, fuzz
+   seed replay, and `wasm32-unknown-unknown` checks for both wrapper crates.
+2. JavaScript type checks, protocol/fixture/lifecycle tests, package-consumer
+   smoke, and a clean `npm run build`.
+3. Chromium Worker, Arrow, Canvas, ARIA, axe, visual, forced-colors, CJK,
+   keyboard/copy, mobile, and lazy-artifact tests.
+4. CSV and Arrow performance/size measurement gates. The M3 CSV canonical
+   baseline remains intact; Arrow has its own measurements and budget.
+5. A Pages assembly from the built package with relative URLs, both WASM
+   artifacts, fixture/provenance/license/notice assets, and local artifact
+   browser tests before upload.
+6. GitHub Pages deployment followed by a smoke test against the actual URL
+   returned by the deployment action. That smoke opens CSV, TSV, and Arrow,
+   switches sources, copies from the semantic grid, checks console/page errors,
+   and verifies lazy artifact network behavior.
 
-cargo publish --locked
-npm publish
-```
+The first five gates can establish a local or pull-request candidate. The sixth
+is mandatory production evidence and cannot be inferred from a test server.
 
-The first registry release is an installable, explicitly pre-alpha CSV/TSV
-prototype with the bounded M3 hardening and measurement evidence. It establishes
-package ownership while validating package contents and the release chain; it
-does not imply M4 extension validation, broad format/browser compatibility,
-production readiness, or API stability. Run the complete verification suite
-locally before publishing it.
+## Local verification sequence
 
-## Configure Trusted Publishing
-
-After the first release, configure both registries to trust the GitHub Actions
-workflow instead of storing long-lived publishing tokens.
-
-Use these values on npm:
-
-- Organization or user: `Ronbb`
-- Repository: `tabulark`
-- Workflow filename: `release.yml`
-- Allowed action: `npm publish`
-
-Use the equivalent GitHub Trusted Publisher settings on crates.io for the
-`tabulark` crate and `.github/workflows/release.yml`.
-
-The committed workflow requests `id-token: write`, uses GitHub-hosted runners,
-and obtains short-lived credentials from each registry. No npm or crates.io
-publishing secret is required after bootstrap.
-
-## Publish a release
-
-1. Update the version in both `Cargo.toml` and `package.json`.
-2. Update release notes when a changelog is introduced.
-3. Run the full local verification suite.
-4. Commit the version change.
-5. Create and push the matching tag.
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features --locked
-cargo check --target wasm32-unknown-unknown --no-default-features --features wasm --locked
-cargo package --allow-dirty --locked
-cargo run --manifest-path fuzz/Cargo.toml --bin csv_lifecycle --locked
+```sh
 npm ci
 npm run build
 npm run check
 npm run test:browser
 npm run benchmark:smoke
+npm run benchmark:arrow
 npm run benchmark:size
-
-VERSION=0.1.0 # replace with the synchronized Cargo/npm version
-git tag -a "v$VERSION" -m "v$VERSION"
-git push origin main --follow-tags
+npm run build:pages
 ```
 
-The initial workflow accepts stable `vX.Y.Z` tags only. It deliberately rejects
-pre-release versions until the project defines a separate npm dist-tag policy.
+The exact complete test matrix and any platform caveats are documented in
+[Testing and performance validation](testing.md). `benchmark:canonical` is
+intentionally a fuller CSV reference benchmark; it is not substituted by the
+small smoke scenario.
 
-Pushing a tag shaped like `vX.Y.Z` starts `.github/workflows/release.yml`. The
-workflow re-runs validation and publishes any registry version that does not
-already exist, which makes rerunning an interrupted release safe.
+## Package contents
 
-## Recommended repository protection
+The packed archive must contain:
 
-- Protect version tags from unreviewed creation.
-- Require the CI workflow before merging to `main`.
-- Optionally attach the release jobs to a protected GitHub environment.
-- After validating Trusted Publishing, require it exclusively in each registry.
+- The `tabulark` root entry point and `tabulark/arrow` subpath export.
+- JavaScript, declarations, and source maps for the root, Arrow entry, and
+  generic Worker.
+- Delimited and Arrow WASM glue, declaration files, and `.wasm` payloads.
+- MIT/Apache licenses and `THIRD_PARTY_NOTICES.md`.
+
+`scripts/package-smoke.mjs` packs the built tree, installs it into a temporary
+consumer, checks the export map and exact files, verifies there are no
+production dependencies, imports both public entry points, and typechecks a
+consumer snippet.
+
+## Static Pages delivery
+
+`npm run build:pages` creates `target/pages` with no CDN runtime dependency and
+only relative internal URLs. It contains the built package runtime, Arrow
+fixtures and provenance, licenses, notice, and the static Playground. The Pages
+workflow tests this assembled directory before `upload-pages-artifact`.
+
+The deployment job receives the URL output from `actions/deploy-pages` and runs
+the dedicated deployed Pages test with `TABULARK_DEPLOYED_BASE_URL`. If the
+deployment cannot be reached, the job fails; a skipped or missing deployed URL
+does not count as M4 evidence.
+
+## Future formal releases
+
+The repository may retain a tag-triggered formal release workflow for a later
+milestone, but that workflow is not authorization to publish M4. Before a
+future release is proposed, explicitly decide and record:
+
+- The public API and adapter-ABI stability policy.
+- Semver versioning and changelog policy.
+- Registry ownership and trusted publishing configuration.
+- Supported browsers, source formats, compression/type guarantees, and
+  compatibility horizon.
+- Reproducible artifact provenance, notices, and security-review process.
+
+Until then, source builds and GitHub Pages candidates are the only intended M4
+delivery channels.

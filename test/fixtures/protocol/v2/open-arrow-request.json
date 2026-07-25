@@ -1,0 +1,12 @@
+{
+  "protocolVersion": 2,
+  "requestId": "request-open-arrow-002",
+  "op": "openSource",
+  "payload": {
+    "adapterId": "tabulark:arrow-ipc",
+    "options": {
+      "container": "auto",
+      "sourceName": "m4-sample.arrow"
+    }
+  }
+}

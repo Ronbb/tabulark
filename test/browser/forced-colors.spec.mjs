@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 
 async function openSample(page) {
   await page.goto("/examples/csv-preview/");
-  await page.getByRole("button", { name: "Try sample data" }).click();
+  await page.getByRole("button", { name: "Try CSV sample" }).click();
   const view = page.locator("[data-tabulark-view]");
   const grid = page.locator("[data-tabulark-a11y-grid]");
   await expect(view).toBeVisible({ timeout: 15_000 });

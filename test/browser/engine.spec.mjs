@@ -4,16 +4,15 @@ test("opens CSV in a Worker and reads non-adjacent ranges", async ({ page }) => 
   await page.goto("/test/browser/harness.html");
 
   const result = await page.evaluate(async () => {
-    const { createEngine } = await import("/dist/index.js");
-    const engine = await createEngine({ memoryBudgetBytes: 256 * 1024 * 1024 });
+    const { createEngine, delimitedAdapter } = await import("/dist/index.js");
+    const engine = await createEngine({ adapters: [delimitedAdapter], memoryBudgetBytes: 256 * 1024 * 1024 });
     const source = new Blob([
       "name,score,team\nAda,10,red\nGrace,20,blue\nLinus,30,green\n",
     ]);
 
     const dataset = await engine.open(source, {
-      format: "csv",
-      header: "first-row",
-      mode: "lenient",
+      adapter: delimitedAdapter,
+      adapterOptions: { dialect: "csv", header: "first-row", mode: "lenient" },
     });
     const table = await dataset.openTable(dataset.tables[0].id);
 
@@ -54,11 +53,11 @@ test("preserves a File name and replays initial scan diagnostics after open", as
   await page.goto("/test/browser/harness.html");
 
   const result = await page.evaluate(async () => {
-    const { createEngine } = await import("/dist/index.js");
-    const engine = await createEngine();
+    const { createEngine, delimitedAdapter } = await import("/dist/index.js");
+    const engine = await createEngine({ adapters: [delimitedAdapter] });
     const dataset = await engine.open(
       new File(["first,second\nonly-one\n"], "ragged-input.csv", { type: "text/csv" }),
-      { format: "csv", header: "first-row", mode: "lenient" },
+      { adapter: delimitedAdapter, adapterOptions: { dialect: "csv", header: "first-row", mode: "lenient" } },
     );
     const warnings = [];
     let resolveWarning;
@@ -104,12 +103,11 @@ test("cancels a range read with AbortSignal", async ({ page }) => {
   await page.goto("/test/browser/harness.html");
 
   const errorCode = await page.evaluate(async () => {
-    const { createEngine } = await import("/dist/index.js");
-    const engine = await createEngine();
+    const { createEngine, delimitedAdapter } = await import("/dist/index.js");
+    const engine = await createEngine({ adapters: [delimitedAdapter] });
     const dataset = await engine.open(new Blob(["value\n1\n2\n"]), {
-      format: "csv",
-      header: "first-row",
-      mode: "lenient",
+      adapter: delimitedAdapter,
+      adapterOptions: { dialect: "csv", header: "first-row", mode: "lenient" },
     });
     const table = await dataset.openTable(dataset.tables[0].id);
     const controller = new AbortController();
@@ -172,13 +170,12 @@ test("cancels a range read after it has been sent to the Worker", async ({ page 
     let dataset;
     let table;
     try {
-      const { createEngine } = await import("/dist/index.js");
-      engine = await createEngine();
+      const { createEngine, delimitedAdapter } = await import("/dist/index.js");
+      engine = await createEngine({ adapters: [delimitedAdapter] });
       const row = "0123456789abcdef\n";
       dataset = await engine.open(new Blob(["value\n", row.repeat(1_000_000)]), {
-        format: "csv",
-        header: "first-row",
-        mode: "lenient",
+        adapter: delimitedAdapter,
+        adapterOptions: { dialect: "csv", header: "first-row", mode: "lenient" },
       });
       table = await dataset.openTable(dataset.tables[0].id);
 
@@ -242,16 +239,15 @@ test("enforces low-budget input limits and keeps the same engine reusable", asyn
     const memoryBudgetBytes = 8 * 1024 * 1024;
     const maxArrayBufferBytes = memoryBudgetBytes / 2;
     const maxFieldBytes = memoryBudgetBytes / 32;
-    const { createEngine } = await import("/dist/index.js");
-    const engine = await createEngine({ memoryBudgetBytes });
+    const { createEngine, delimitedAdapter } = await import("/dist/index.js");
+    const engine = await createEngine({ adapters: [delimitedAdapter], memoryBudgetBytes });
     const oversizedBuffer = new ArrayBuffer(maxArrayBufferBytes + 1);
 
     const captureOpenFailure = async (source) => {
       try {
         const unexpected = await engine.open(source, {
-          format: "csv",
-          header: "first-row",
-          mode: "strict",
+          adapter: delimitedAdapter,
+          adapterOptions: { dialect: "csv", header: "first-row", mode: "strict" },
         });
         await unexpected.close();
         return { code: "RESOLVED", details: null, message: "" };
@@ -265,9 +261,8 @@ test("enforces low-budget input limits and keeps the same engine reusable", asyn
     };
     const readOne = async (value) => {
       const dataset = await engine.open(new Blob([`value\n${value}\n`]), {
-        format: "csv",
-        header: "first-row",
-        mode: "strict",
+        adapter: delimitedAdapter,
+        adapterOptions: { dialect: "csv", header: "first-row", mode: "strict" },
       });
       const table = await dataset.openTable(dataset.tables[0].id);
       try {
@@ -325,13 +320,12 @@ test("reports an unterminated quoted field through the real Worker and Wasm path
   await page.goto("/test/browser/harness.html");
 
   const failure = await page.evaluate(async () => {
-    const { createEngine } = await import("/dist/index.js");
-    const engine = await createEngine();
+    const { createEngine, delimitedAdapter } = await import("/dist/index.js");
+    const engine = await createEngine({ adapters: [delimitedAdapter] });
     try {
       await engine.open(new Blob(["left,right\n\"unterminated,right\n"]), {
-        format: "csv",
-        header: "first-row",
-        mode: "strict",
+        adapter: delimitedAdapter,
+        adapterOptions: { dialect: "csv", header: "first-row", mode: "strict" },
       });
       return { code: "RESOLVED", details: null, message: "" };
     } catch (error) {
@@ -356,13 +350,13 @@ test("cancels a large source open without consuming a Worker source slot", async
   await page.goto("/test/browser/harness.html");
 
   const result = await page.evaluate(async () => {
-    const { createEngine } = await import("/dist/index.js");
-    const engine = await createEngine();
+    const { createEngine, delimitedAdapter } = await import("/dist/index.js");
+    const engine = await createEngine({ adapters: [delimitedAdapter] });
     const abort = new AbortController();
     const largeSource = new Blob(["value\n", "0123456789abcdef\n".repeat(1_000_000)]);
     const opening = engine.open(largeSource, {
-      format: "csv",
-      header: "first-row",
+      adapter: delimitedAdapter,
+      adapterOptions: { dialect: "csv", header: "first-row" },
       signal: abort.signal,
     });
     abort.abort();
@@ -379,8 +373,8 @@ test("cancels a large source open without consuming a Worker source slot", async
     try {
       for (let index = 0; index < 2; index += 1) {
         datasets.push(await engine.open(new Blob([`value\n${index}\n`]), {
-          format: "csv",
-          header: "first-row",
+          adapter: delimitedAdapter,
+          adapterOptions: { dialect: "csv", header: "first-row" },
         }));
       }
       return { errorCode, reopened: datasets.length };
@@ -417,9 +411,12 @@ test("propagates an unexpected Worker error to live table handles", async ({ pag
     let engine;
     let controller;
     try {
-      const { createEngine, createTableController } = await import("/dist/index.js");
-      engine = await createEngine();
-      const dataset = await engine.open(new Blob(["value\na\n"]), { format: "csv" });
+      const { createEngine, createTableController, delimitedAdapter } = await import("/dist/index.js");
+      engine = await createEngine({ adapters: [delimitedAdapter] });
+      const dataset = await engine.open(new Blob(["value\na\n"]), {
+        adapter: delimitedAdapter,
+        adapterOptions: { dialect: "csv" },
+      });
       const table = await dataset.openTable(dataset.tables[0].id);
       const events = [];
       table.subscribe((event) => events.push(event.type));
@@ -466,12 +463,11 @@ test("closing a table keeps its dataset reusable", async ({ page }) => {
   await page.goto("/test/browser/harness.html");
 
   const result = await page.evaluate(async () => {
-    const { createEngine } = await import("/dist/index.js");
-    const engine = await createEngine();
+    const { createEngine, delimitedAdapter } = await import("/dist/index.js");
+    const engine = await createEngine({ adapters: [delimitedAdapter] });
     const dataset = await engine.open(new Blob(["value\nfirst\nsecond\n"]), {
-      format: "csv",
-      header: "first-row",
-      mode: "lenient",
+      adapter: delimitedAdapter,
+      adapterOptions: { dialect: "csv", header: "first-row", mode: "lenient" },
     });
 
     try {
@@ -503,13 +499,12 @@ test("reads a range discovered after the first 1 MiB scan chunk", async ({ page 
   await page.goto("/test/browser/harness.html");
 
   const result = await page.evaluate(async () => {
-    const { createEngine } = await import("/dist/index.js");
+    const { createEngine, delimitedAdapter } = await import("/dist/index.js");
     const row = "0123456789abcdefghij\n";
-    const engine = await createEngine();
+    const engine = await createEngine({ adapters: [delimitedAdapter] });
     const dataset = await engine.open(new Blob(["value\n", row.repeat(100_000)]), {
-      format: "csv",
-      header: "first-row",
-      mode: "lenient",
+      adapter: delimitedAdapter,
+      adapterOptions: { dialect: "csv", header: "first-row", mode: "lenient" },
     });
     const table = await dataset.openTable(dataset.tables[0].id);
 

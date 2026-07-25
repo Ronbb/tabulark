@@ -747,7 +747,7 @@ function batchGridRange(batch: TableBatch): Readonly<GridRange> {
 }
 
 function batchRows(batch: TableBatch): readonly (readonly (string | null)[])[] {
-  return Object.freeze(batch.toRows({
+  return Object.freeze(batch.toDisplayRows({
     maxCells: Math.max(1, batch.range.rowCount * batch.range.columnCount),
   }).map((row) => Object.freeze(row)));
 }

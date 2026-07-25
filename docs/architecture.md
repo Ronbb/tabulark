@@ -1,654 +1,182 @@
 # Architecture
 
-> Status: M3 is complete for the bounded experimental local CSV/TSV vertical
-> slice, including lifecycle/resource recovery, compatibility and fuzz evidence,
-> inclusive interaction, and reproducible measurement. M4 second-adapter
-> validation remains unfinished, and no interface is stable yet.
+> **M4 candidate, pre-alpha.** This document describes the current
+> CSV/TSV-plus-Arrow IPC architecture. It does not assert that M4 is complete:
+> CI, Pages deployment, and deployed-site smoke evidence must exist for the
+> candidate revision before that label is earned.
 
-This document records the implemented prototype boundaries and the intended
-architecture they are validating. M0-M3 descriptions apply to the current
-CSV/TSV path unless a section is marked as a future extension. A general
-adapter registry, remote byte sources, additional formats, and package splitting
-remain design targets rather than shipped features.
+## Design constraints
 
-## 1. Product boundary
+Tabulark previews local tabular sources without sending their contents to a
+service. It keeps format parsing and large allocations off the main thread,
+keeps rendered DOM proportional to the viewport, and makes source ownership and
+lifecycle explicit.
 
-Tabulark is browser infrastructure for opening and previewing tabular data. It
-owns the path from source bytes to a visible, navigable table surface, while the
-host application owns product-specific workflows and presentation.
+The M4 extension boundary is intentionally closed. The runtime accepts only two
+frozen official descriptors:
 
-### Core responsibilities
+| ID | Public entry point | Artifact |
+| --- | --- | --- |
+| `tabulark:delimited` | `tabulark` | `dist/wasm/delimited/` |
+| `tabulark:arrow-ipc` | `tabulark/arrow` | `dist/wasm/arrow/` |
 
-- Open a source through a format-specific runtime boundary: built-in CSV/TSV
-  today and independently installed adapters in a future extension.
-- Enumerate one or more logical tables exposed by that source.
-- Expose consistent metadata, schema, extent, and range access for each table.
-- Parse and retain source data outside the browser main thread.
-- Transfer bounded, render-oriented batches instead of complete tables or
-  per-cell JavaScript objects.
-- Coordinate viewport requests, cancellation, prefetching, and memory-bounded
-  caching.
-- Provide a framework-neutral layout engine and a Canvas renderer.
-- Expose headless controllers for keyboard navigation, selection, and copying.
+There is no public arbitrary-adapter factory, module URL, global registry,
+remote byte provider, or Arrow JavaScript/C Data Interface path in M4.
 
-### Composable extensions
-
-- Additional source adapters.
-- Search, sorting, filtering, and derived table views.
-- Framework bindings such as React or Vue.
-- Persistent caches backed by IndexedDB or OPFS.
-- Alternative renderers and application-specific toolbars.
-- Optional editing layers that do not change the core preview contract.
-
-### Out of scope
-
-- Spreadsheet formula evaluation and workbook recalculation.
-- Macros, VBA, or arbitrary workbook code.
-- Pixel-perfect Office rendering.
-- Database query planning or execution.
-- Pivot tables, chart authoring, BI modeling, or document editing.
-
-## 2. System overview
+## Runtime shape
 
 ```text
-Host application
-    |
-    v
-Public facade and headless controller                 main thread
-    |                                                        |
-    +--> viewport state --> range cache --> layout --> Canvas |
-    |                                                        |
-    +---------------- versioned Worker protocol -------------+
-                                                             |
-Worker runtime                                               |
-    |                                                        |
-    +--> adapter registry (M4 target; CSV/TSV only today)    |
-    +--> source sessions and table handles                   |
-    +--> parser/index state                                  |
-    +--> memory-bounded batch cache                          |
-    |                                                        |
-    +--> built-in WebAssembly CSV/TSV path -------------------+
-             |
-             v
-        source bytes / externally supplied row batches
+File | Blob | ArrayBuffer
+          |
+          v
+  main-thread Engine / Dataset / Table handles
+          |  protocol v2 RPC
+          v
+      module Worker
+          |
+          +-- source byte broker (bounded Blob/ArrayBuffer slices)
+          +-- adapter manager (loads selected artifact on first open)
+          |       +-- Delimited Rust/WASM adapter
+          |       +-- Arrow IPC Rust/WASM adapter
+          |
+          +-- generic layout-v1 batch validation and transfer
+          v
+Canvas viewport + bounded ARIA grid + TSV copy
 ```
 
-The overview shows the intended component boundary. The M0-M3 prototype uses
-one built-in CSV/TSV scanner selected by an explicit format option; it does not
-yet expose an independently installable adapter registry.
+`createEngine({ adapters })` validates and freezes its official allow-list but
+does not load WASM. The first open for a registered adapter loads that adapter’s
+glue/WASM artifact. Concurrent first opens coalesce. The Worker never delegates
+format interpretation to JavaScript: it only supplies bounded `read-bytes`
+responses to the Rust operation ABI and validates/transfers generic batch
+buffers.
 
-The dependency direction is one-way:
+## Rust packages and build outputs
+
+The root `tabulark` crate owns shared models, protocol values, resource limits,
+and the native adapter implementations. Two `publish = false` `cdylib` wrappers
+produce independently loadable browser artifacts:
 
 ```text
-model <- protocol <- runtime <- client/controller <- renderer/bindings
-             ^
-             |
-          adapters
+tabulark-delimited-wasm  -> dist/wasm/delimited/tabulark_delimited*.{js,wasm}
+tabulark-arrow-wasm      -> dist/wasm/arrow/tabulark_arrow*.{js,wasm}
 ```
 
-The renderer must not know which adapter produced a table. Adapters must not
-know which renderer consumes their batches. Framework bindings must not own
-parsing, viewport calculation, or cell rendering.
+The Arrow wrapper uses individual `arrow-array`, `arrow-buffer`, `arrow-cast`,
+`arrow-data`, `arrow-ipc`, `arrow-schema`, and `arrow-select` dependencies
+pinned to 59.1.0 with default features disabled. IPC LZ4 and Zstd support is
+enabled in the Arrow artifact only; the historical Delimited core remains
+separately size-gated.
 
-## 3. Runtime boundaries
+## Adapter and operation ABI
 
-### Main thread
-
-The main thread owns browser interaction and presentation:
-
-- Public JavaScript facade and lifecycle.
-- Source selection and adapter configuration.
-- Viewport, focus, selection, and column layout state.
-- Visible-range calculation and bounded look-ahead prefetching.
-- A small cache of batches needed for the current view.
-- Frame scheduling, Canvas painting, hit testing, and the semantic DOM layer.
-
-React or another UI framework may display metadata, progress, errors, toolbars,
-and inspectors. It must not render one component per cell or receive the entire
-dataset as component state.
-
-### Worker runtime
-
-The Worker owns data-heavy and latency-sensitive work:
-
-- Explicit source-format selection and initialization; future adapter loading
-  and probing belong behind the same boundary.
-- Parsing, indexing, schema discovery, and table enumeration.
-- Source and table handle registries.
-- Request scheduling, cancellation, progress, and resource cleanup.
-- Parsed blocks and a byte-budgeted LRU cache.
-- Construction of transferable response buffers.
-
-WebAssembly is the preferred implementation for performance-sensitive parsers
-and data operations, but it is not a requirement for every adapter. The Worker
-boundary is the architectural requirement.
-
-### Adapter boundary
-
-An adapter converts one source family into the common dataset and table model.
-It is responsible for format semantics, not UI behavior. The current CSV/TSV
-runtime validates much of this boundary internally, but making the boundary
-independently installable and proving it with a second source are M4 work.
-
-An adapter may:
-
-- Probe a bounded prefix and declared source metadata.
-- Validate adapter-specific open options.
-- Open a dataset session and enumerate its logical tables.
-- Report metadata and capabilities.
-- Serve bounded table ranges.
-- Maintain format-specific indexes and parser state.
-
-An adapter must not:
-
-- Manipulate the DOM or Canvas.
-- Fetch arbitrary network resources by default.
-- Return an entire large table as nested JavaScript arrays.
-- Expose implementation pointers or Rust traits through the Worker protocol.
-- Treat Worker isolation as a security sandbox.
-
-## 4. Domain model
-
-### Source, dataset, and table
-
-A physical source and a logical table are different concepts:
+The internal Rust ABI is experimental but common to both built-in adapters:
 
 ```text
-SourceInput
-    -> DatasetSession
-        -> TableDescriptor[]
-            -> TableHandle
+beginOpen -> continueOperation* -> openTable -> metadata -> beginRead
+     |                                      |                |
+     +-------- cancelOperation -------------+----------------+
+
+closeTable -> closeSource -> shutdown
 ```
 
-- A CSV source exposes one logical table.
-- An XLSX source may expose one table per worksheet.
-- A database adapter may expose externally supplied result sets.
+An operation can request one bounded `read-bytes { offset, length }` action at
+a time. The Worker reads the requested Blob/ArrayBuffer range and returns bytes
+without examining format framing. Adapter failure, cancellation, source close,
+or engine shutdown releases the operation/source/table handles owned by that
+adapter; a failed Arrow source must not poison the Delimited path on the same
+engine.
 
-The common name `Table` applies to each logical table, not necessarily to the
-whole file. Format-specific names such as workbook or sheet remain adapter
-metadata and do not leak into the renderer contract.
+## Input ownership and lifecycle
 
-The initial source inputs are `File`/`Blob` and `ArrayBuffer`. Streams, remote
-range sources, and application-defined byte sources are later extensions. The
-host application remains responsible for authentication, CORS policy, and
-network fetching unless a separately installed source provider says otherwise.
-For the current CSV/TSV adapter, `File.name` is inferred as `sourceName`, which
-becomes the table descriptor and metadata display name. Hosts may provide
-`sourceName` explicitly for `Blob` or `ArrayBuffer` inputs, or to override the
-inferred file name.
+`Engine.open()` accepts only `File`, `Blob`, or `ArrayBuffer` and always needs
+an explicitly registered descriptor. `transferInput` defaults to `false`.
+Only an `ArrayBuffer` may be transferred; a requested `Blob`/`File` transfer is
+an `INVALID_ARGUMENT` error.
 
-### Identity and lifecycle
-
-- Dataset sessions and table handles use opaque protocol IDs, never memory
-  addresses.
-- A table handle belongs to exactly one dataset session.
-- `close()` is idempotent and releases all resources owned by that handle.
-- Closing a dataset invalidates its table handles and cancels outstanding work.
-- A delayed/background scan fatal is terminal for the dataset: the facade
-  closes live child tables and puts controllers into a terminal error state,
-  then the Worker closes the dataset and releases its source slot.
-- Remote table, dataset, and runtime close acknowledgements have bounded waits;
-  an unresponsive Worker is terminated so local handles cannot remain pending
-  indefinitely.
-- The first model is an immutable snapshot. A future live-source model must add
-  explicit revisions rather than silently changing data beneath cached ranges.
-
-### Extent
-
-`TableShape { rows, columns }` is insufficient while a source is still being
-parsed. Each axis needs an explicit state:
-
-```ts
-type AxisExtent =
-  | { kind: "exact"; value: number }
-  | { kind: "at-least"; value: number }
-  | { kind: "unknown" };
-
-interface TableExtent {
-  rows: AxisExtent;
-  columns: AxisExtent;
-}
-```
-
-For the first JavaScript API, every externally visible coordinate and count
-must be a non-negative safe integer. Rust may use `u64` internally, but the
-protocol must reject values that would lose precision instead of silently
-rounding them. A `bigint` API can be designed later if real sources require it.
-
-### Schema and values
-
-The minimum schema contains:
-
-- Stable column ID within the table revision.
-- Display name.
-- Zero-based logical column index.
-- Logical data type.
-- Nullable flag when the adapter can determine it.
-- Optional source-specific metadata under a namespaced extension field.
-
-The initial logical types are:
+The public lifetimes are nested but explicit:
 
 ```text
-unknown, utf8, boolean, int64, float64, decimal, date, datetime, binary
+Engine
+  └─ DatasetSession
+       └─ TableHandle
+            └─ TableBatch
 ```
 
-Adapters may support only a subset. CSV/TSV starts as `utf8`; automatic type
-inference is not part of the first parser contract because it can change values
-and schema after the first paint.
+A UI changes sources in this order: destroy view, close table, close dataset,
+then open the next source. An engine closes on `pagehide` and terminal Worker
+failure. Closing a table does not require closing an otherwise usable dataset.
 
-The model must distinguish:
+## Protocol and typed batches
 
-- An empty string.
-- A missing or null value.
-- An invalid value for a declared type.
-- A value that was truncated or could not be decoded.
+M4 freezes the following wire identifiers:
 
-Parse diagnostics are separate from display text so the renderer can show a
-safe fallback without losing structured error information.
-
-### Ranges and batches
-
-All ranges use zero-based, half-open coordinates: `[start, end)`. A range is
-rectangular and bounded by a runtime maximum so one request cannot allocate an
-unbounded response.
-
-The conceptual table API is deliberately small:
-
-```ts
-interface TableHandle {
-  metadata(): Promise<TableMetadata>;
-  readRange(request: RangeRequest): Promise<TableBatch>;
-  close(): Promise<void>;
-}
-```
-
-`AbortSignal` is accepted by the JavaScript facade. The facade maps it to a
-protocol cancellation request; signals themselves do not cross the Worker
-boundary.
-
-`TableBatch` is column-oriented. It must not be represented as one object per
-cell. Physical encodings may include:
-
-- Typed numeric buffers plus a validity bitmap.
-- UTF-8 data plus offset and validity buffers.
-- Dictionary-encoded strings when an adapter can produce them cheaply.
-- A display-text encoding for render and clipboard requests.
-
-Every batch identifies its table, revision, actual returned range, schema
-version, and whether the requested range is complete. Transferable buffers are
-owned by the response; transferring them must not detach the runtime's cache
-backing storage.
-
-### Capabilities
-
-Capabilities prevent optional operations from becoming assumptions. Examples
-include:
-
-- Known or progressively discovered row count.
-- Random range access.
-- Typed values versus display-only values.
-- Search, sort, or filter pushdown.
-- Source styles or row/column sizing metadata.
-- Multi-table enumeration.
-
-The MVP renderer relies only on metadata and range-read capabilities.
-
-## 5. Worker protocol
-
-The wire protocol is a versioned product boundary, independent of Rust traits
-and JavaScript class layouts. Rust and JavaScript implementations should share
-generated definitions or, at minimum, golden protocol fixtures and compatibility
-tests.
-
-Every request contains:
-
-- Protocol version.
-- Unique request ID.
-- Operation name and serializable payload.
-- Relevant dataset or table handle.
-
-The first operations are:
-
-| Operation | Purpose |
+| Contract | Version |
 | --- | --- |
-| `hello` | Negotiate protocol and runtime capabilities. |
-| `openSource` | Select an explicit source format and create a dataset session. |
-| `listTables` | Return table descriptors for a dataset. |
-| `openTable` | Create a handle for one logical table. |
-| `getMetadata` | Return current extent, schema, revision, and capabilities. |
-| `readRange` | Return a bounded columnar or display batch. |
-| `cancel` | Best-effort cancellation of an outstanding request. |
-| `closeTable` | Release a logical table handle. |
-| `closeSource` | Release the dataset and all child resources. |
-| `shutdown` | Dispose the runtime instance. |
-
-The Worker may emit interleaved events:
-
-- Open and parse progress.
-- Extent or schema metadata updates.
-- Recoverable source warnings with structured row and byte-offset context.
-- Runtime-fatal failure.
-
-Diagnostics found by the initial prefix scan are buffered in the Worker until
-the dataset session can subscribe, then emitted through the same warning event
-path as later scan diagnostics. This prevents an `open()` timing race from
-silently losing initial warnings.
-
-Errors are serializable values with a stable code, safe message, retryability,
-and optional structured details. Raw exceptions and implementation stack traces
-are not the public error contract.
-
-Protocol rules:
-
-- Responses are matched by request ID; global response ordering is not assumed.
-- Cancellation is best effort and always produces a terminal request state.
-- Closing a handle invalidates all outstanding requests for that handle.
-- Unknown operations or incompatible protocol versions fail explicitly.
-- Dataset and table events carry a non-empty `datasetHandle`; only a
-  process-wide `runtimeError` may omit routing fields.
-- Malformed protocol-shaped messages, unexpected response kinds, and empty
-  returned handles terminate the runtime with `PROTOCOL_INCOMPATIBLE` rather
-  than leaving partially initialized sessions alive.
-- Lifecycle close requests use a bounded timeout; timeout is a terminal runtime
-  failure followed by Worker termination.
-- Large binary payloads use transfer lists. `SharedArrayBuffer` is not a baseline
-  requirement because it adds cross-origin isolation constraints.
-
-## 6. Scheduling and caching
-
-The controller converts viewport state into normalized range requests. It
-requests the visible range first and a small overscan range second. A generation
-number allows responses from an older scroll position or table view to be
-discarded without painting stale data.
-
-There are two distinct caches:
-
-### Worker cache
-
-- Owns parser blocks, source indexes, decoded columns, and reusable values.
-- Uses an explicit byte budget and LRU-style eviction.
-- Coalesces identical in-flight reads when possible.
-- Keeps internal backing memory separate from transferred response buffers.
-
-### Main-thread range cache
-
-- Retains only visible and nearby render-ready batches.
-- Is keyed by table ID, revision, schema version, normalized range, and requested
-  representation.
-- Evicts by byte cost, not item count.
-- Drops stale generations before layout or painting.
-
-Persistent caching is disabled by default. A future `CacheStore` port may use
-IndexedDB or OPFS and should key entries by a source fingerprint, adapter name
-and version, open options, and schema version. Storage consent and eviction
-policy belong to the host application.
-
-## 7. Viewport and rendering
-
-Rendering is split into reusable headless stages:
-
-```text
-Table metadata
-    -> TableController
-    -> ViewportModel
-    -> LayoutEngine
-    -> Range requests / cached batches
-    -> PaintPlan
-    -> CanvasRenderer
-```
-
-### TableController
-
-The controller is an explicit state machine rather than a framework store. Its
-snapshot exposes `loading`, `ready`, `error`, and `closed`; error values preserve
-structured cancellation, unsupported-input, malformed-input, resource-limit,
-and runtime failures. The example maps those states to progress, empty, error,
-cancel, and same-source retry presentation, including fresh-Worker recovery
-after terminal runtime failure. The controller owns:
-
-- Source and view lifecycle.
-- Selected table and current metadata.
-- Viewport dimensions, scroll position, and device-pixel ratio.
-- Active cell, selection, hover, and column widths.
-- Request generation and pending work.
-
-Framework bindings subscribe to snapshots of this state. A React binding can
-use `useSyncExternalStore`; high-frequency scroll and paint work remains in the
-controller and renderer.
-
-### LayoutEngine
-
-The layout engine has no Canvas dependency. It calculates:
-
-- Visible and overscan rows and columns.
-- Logical-to-pixel and pixel-to-logical coordinate mapping.
-- Header and cell rectangles.
-- Hit testing and selection geometry.
-- Column width measurement constraints.
-- Logical scrolling when the full table exceeds browser pixel limits.
-
-Frozen regions and variable row heights are extension points, not MVP
-requirements.
-
-### CanvasRenderer
-
-The initial renderer:
-
-- Paints only the current viewport and overscan needed for a frame.
-- Scales correctly for device-pixel ratio.
-- Clips and truncates text predictably.
-- Schedules work through `requestAnimationFrame`.
-- Exposes theme tokens instead of hard-coding application styling.
-- Never parses data or mutates controller state during paint.
-
-`OffscreenCanvas` may become an optimization, but the first design does not
-depend on it. Moving parsing and data ownership to a Worker provides the most
-important responsiveness boundary first.
-
-### Interaction and accessibility
-
-The Canvas is a visual layer, not the sole semantic layer. The renderer package
-must provide or integrate with a bounded virtual DOM grid that:
-
-- Owns keyboard focus while the Canvas remains `aria-hidden`.
-- Exposes the active cell, row and column indexes, selection, and known extents.
-- Supports arrow keys, Page Up/Down, Home/End, Escape, and copy shortcuts.
-- Keeps the DOM proportional to the viewport, never to the full table.
-- Announces parsing progress and errors without excessive live-region updates.
-
-Selection cannot be communicated by color alone, focus must remain visible, and
-reduced-motion and high-contrast preferences must be respected.
-
-Column boundaries are stable focusable ARIA `separator` elements whose value,
-bounds, controlled grid, and key instructions remain synchronized with the
-controller. Arrow/Shift+Arrow, Home/End, and Enter-to-fit complement pointer
-drag/double-click; separator focus survives updates and the viewport keeps the
-operated boundary visible. In forced-colors mode the Canvas switches dynamically
-to system colors and uses distinct outline geometry for selection and the active
-cell, while resize and error controls retain visible non-color focus cues.
-
-## 8. Security and resilience
-
-All source data is untrusted. Each runtime and adapter must support limits for:
-
-- Input bytes and decompressed bytes.
-- Columns, field length, rows retained, and cells returned per request.
-- Parser nesting or recursion where a format permits it.
-- Worker memory and outstanding requests.
-- Time spent probing an unsupported source.
-
-Malformed input yields structured errors or diagnostics, never a panic exposed
-to the host. Formula text and external links are treated as data; no embedded
-code is executed. Network access and persistent storage are opt-in extension
-ports rather than implicit adapter privileges.
-
-If a Worker terminates unexpectedly, or a delayed scan reaches a fatal error,
-the facade fails pending requests and live handles with a runtime error, closes
-the affected sessions, and allows the host to create a fresh engine. Automatic
-reopening is deferred until source replay and side effects are well defined.
-
-## 9. Package and repository evolution
-
-The M0-M3 implementation stays in one root Rust crate and one npm package so
-the experimental contracts can change quickly:
-
-```text
-src/
-  model.rs
-  error.rs
-  protocol.rs
-  runtime.rs
-  csv.rs
-  wasm.rs
-
-js/
-  index.ts
-  client.ts
-  protocol.ts
-  range-cache.ts
-  rpc-client.ts
-  worker/
-  worker.ts
-  view/
-
-examples/
-  csv-preview/
-
-test/
-  fixtures/
-  browser/
-  performance/
-
-fuzz/
-  corpus/csv_lifecycle/
-  fuzz_targets/csv_lifecycle.rs
-```
-
-After the adapter and Worker contracts survive an end-to-end implementation
-and a second source type, the repository can split along these boundaries:
-
-```text
-crates/
-  tabulark-core/
-  tabulark-protocol/
-  tabulark-runtime/
-  tabulark-csv/
-  tabulark-wasm/
-
-packages/
-  tabulark/              # public facade
-  protocol/
-  worker/
-  adapter-csv/
-  renderer-canvas/
-  controller/
-  react/                 # optional binding
-```
-
-The split is a release and ownership boundary, not a prerequisite for the first
-working prototype. Premature package separation would make contract iteration
-slower without proving extensibility.
-
-## 10. Engineering validation
-
-Each boundary needs its own evidence:
-
-- Model and protocol: Rust/JavaScript golden fixtures and compatibility tests.
-- CSV/TSV: standards-oriented fixtures, malformed-input tests, property tests,
-  and fuzzing on the Rust parser boundary.
-- Worker: real-browser tests for transfer, cancellation, close, crash, and
-  out-of-order responses.
-- Renderer: deterministic layout tests, screenshot tests, keyboard tests, and
-  accessibility checks against the semantic layer.
-- Performance: reproducible local-file datasets, first-paint timing, scroll
-  frame time, peak memory, transferred bytes, and package size.
-
-The contract, Node, and Chromium suites provide vertical-slice evidence through
-M3.1: delayed scan fatal cleanup,
-bounded close timeouts, malformed-message termination, initial diagnostic
-delivery with row context, source-name propagation, and browser-example
-cancel/retry recovery.
-
-The M3.2 baseline adds a versioned, manifest-driven CSV/TSV corpus. Every case
-is scanned and range-decoded across multiple chunk sizes so chunk boundaries,
-expected metadata and rows, warnings, and structured failures stay reviewable.
-The checked-in `csv_lifecycle` fuzz target applies bounded, contiguous scanner
-and range-decoder lifecycles to arbitrary bytes and starts from a small seed
-corpus. Its stable executable is deterministic smoke coverage, including on
-Windows; this repository currently supports sanitizer-backed libFuzzer
-execution through Linux or WSL with nightly Rust and `cargo-fuzz`. The scheduled
-Linux workflow runs that real campaign for 10 minutes each week.
-
-The M3.3 baseline adds strict Canvas snapshots for ready, keyboard-selection,
-and horizontal-scroll states. CI and release verification validate those
-snapshots with Playwright Chromium on Ubuntu 24.04; that runner is the
-canonical environment for intentional baseline generation and updates. The
-snapshots deliberately omit text pixels, locking layout, grid, selection, and
-scrolling without claiming stable glyph shaping.
-Automated axe scans cover WCAG 2.0/2.1 A and AA tagged rules for idle, ready,
-strict-error, and dark-ready example states through the semantic DOM layer.
-These scans are a bounded automated check, not a complete accessibility audit.
-
-The M3.4 CJK regression adds one manifest-driven TSV source with UTF-8 BOM and
-CRLF transforms, Chinese/Japanese/Korean headers and cells, mixed Latin/CJK
-content, and full-width punctuation. The parser corpus applies the full chunk
-matrix, including one-byte scanner and range-decoder input. Chromium then opens
-the same case through the Worker/WebAssembly runtime and verifies exact table
-data, semantic-grid content, Canvas `fillText` paint and `measureText` autosize
-inputs, and keyboard-driven TSV copy. This locks Tabulark's Unicode data path
-without claiming that platform fonts shape or rasterize glyphs identically.
-
-The M3.5 closure pins a license-preserving subset of the external
-`BurntSushi/rust-csv` corpus by revision and digest, then applies the same
-multi-chunk scanner/range matrix to unusual quotes, empty fields versus the
-literal `NULL`, and strict/lenient Latin-1 behavior. Real Worker/WASM browser
-tests cover an in-flight range cancellation, recoverable input and field limits,
-strict malformed-quote offsets, and a header-only table. View tests lock the
-keyboard separator contract and focus continuity. Forced-colors tests inspect
-Canvas system-color paint commands, distinct focus/selection geometry, resize focus,
-and textual retryable errors; axe also scans ready/error forced-colors states.
-
-The M3.6 harness generates and digest-checks deterministic 2 MiB smoke and
-16 MiB-target canonical CSV scenarios; the latter is 16,777,218 bytes so it ends
-on a complete row. It measures Worker/WASM startup, first usable Canvas paint,
-completed scan throughput, non-adjacent range reads, scroll frames, exact binary
-batch transfer, and implementation-dependent benchmark-page memory deltas under
-cross-origin isolation. The committed canonical report contains the source
-revision, browser/OS/hardware, one warm-up, five samples, and summary
-statistics. Runtime, npm, and Pages raw/compressed sizes are separately enforced
-against committed budgets. Exact commands, metric definitions, results, and
-limitations are documented in `docs/testing.md`.
-
-The repository-root introduction and playground are also the static GitHub
-Pages entry point. `scripts/build-pages.mjs` assembles a minimal site under
-`target/pages` from the built ESM, module Worker, WebAssembly runtime, and
-playground assets. All internal runtime references remain relative so the same
-artifact works at a project subpath such as `/tabulark/`. The Pages workflow is
-a publication boundary only; it does not introduce a hosted data service, and
-the playground continues to open and process sources locally in the browser.
-
-M3 is complete against these bounded criteria. Continuing corpus/fuzz evolution
-is maintenance rather than an unbounded milestone gate. The evidence does not
-establish broad-format or cross-browser compatibility, identical platform-font
-rendering, complete accessibility conformance, or performance guarantees on
-other machines; those remain explicit boundaries, not missing M3 deliverables.
-
-## 11. Architectural decisions for the first prototype
-
-The M0-M3 prototype follows these decisions:
-
-1. A source opens a dataset session; a dataset contains one or more tables.
-2. Tables are immutable snapshots with progressively discovered metadata.
-3. The Worker protocol, not a Rust trait, is the cross-runtime contract.
-4. External coordinates are JavaScript safe integers in the first API.
-5. Range responses are bounded, column-oriented, and transferable.
-6. CSV/TSV values remain strings until explicit type inference is designed.
-7. Parsing and data ownership stay in a Worker; Canvas painting starts on the
-   main thread.
-8. Caches are memory-bounded and persistence is opt-in.
-9. The Canvas renderer ships with a bounded semantic DOM layer.
-10. Package splitting happens only after a working vertical slice validates the
-    contracts.
-
-The implementation roadmap and release-level acceptance criteria are defined in
-[MVP roadmap](mvp.md).
+| Worker protocol | 2 |
+| Built-in adapter API | 1 |
+| Generic batch layout | 1 |
+
+Protocol v1 receives an explicit incompatibility error. A table batch carries a
+deduplicated pool of typed buffers plus, for each column, a Rust-produced native
+descriptor and a UTF-8 display descriptor. The main thread performs generic
+range/buffer boundary checks, caches batches under the engine budget, and
+constructs `TableBatch`; it does not parse CSV or Arrow itself.
+
+`toRows()` decodes logical native values. Dictionary and run-end descriptors
+remain visible for inspection while the method returns their logical values.
+`toDisplayRows()` returns stable `(string | null)[][]`; Canvas paint, the ARIA
+grid, column sizing, and copy use this display-only method. This split keeps
+browser rendering deterministic without losing Arrow semantics for programmatic
+callers.
+
+`ColumnSchema.dataType` recursively represents the Arrow 59.1.0 built-in type
+family, including nested, union, dictionary, decimal, temporal, interval,
+run-end encoded, and extension storage types. Unknown extension types retain
+extension name/metadata and decode through their storage type.
+
+## Arrow IPC adapter
+
+The Arrow adapter supports one logical table per IPC source.
+
+- File containers read the magic/footer, schema, dictionaries, and RecordBatch
+  block index before satisfying projected range reads.
+- Stream containers build schema, dictionaries, and a row-prefix index in
+  order. Before EOF metadata can report `indexed-prefix`; after completion it
+  becomes exact/full.
+- A requested range can span RecordBatches; the adapter slices, projects, and
+  merges the selected cells.
+- IPC File and Stream inputs support no compression, LZ4, and Zstd.
+- Tensor, sparse tensor, and non-native-endian inputs return a structured
+  `UNSUPPORTED_FEATURE` error rather than being misinterpreted.
+
+The Rust resource broker accounts for ingress bytes, WASM copies, schema/index
+state, dictionaries, compressed/decompressed blocks, decoded arrays, display
+output, and caches. M4 fixes nesting at 64, fields at 16,384, and range cells at
+250,000; related caps derive from the engine’s memory budget.
+
+## View layer
+
+`createCanvasTableView()` uses native scrolling and draws the visible table
+region on Canvas. A viewport-sized ARIA grid mirrors only active/visible cells;
+it supports keyboard navigation, selection, copy, and column resizing. The
+semantics and pixels are deliberately driven by display text, never raw
+recursive native values.
+
+The static Playground owns source selection and lifecycle rather than format
+inference. It exposes CSV, TSV, and Arrow IPC explicitly, hides delimited-only
+controls for Arrow, clears the previous session before switching, and provides
+loading, cancellation, retry, focus, forced-colors, reduced-motion, and
+responsive behavior.
+
+## Delivery boundary
+
+The npm archive contains the root and `/arrow` entry points, declarations,
+source maps, generic Worker, both WASM artifacts, licenses, and notices. The
+Pages assembler copies the same runtime, the pinned Arrow fixture, provenance,
+licenses, and notice into a relative-URL static artifact. Package and Pages
+tests verify those contents; post-deployment browser smoke remains the final
+environmental proof.
+
+For detailed commands and evidence rules, see [Testing and performance
+validation](testing.md).

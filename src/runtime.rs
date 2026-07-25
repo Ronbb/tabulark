@@ -92,13 +92,6 @@ impl RangeHandle {
     pub const fn get(self) -> u32 {
         self.0
     }
-
-    /// Reconstructs a handle received from the trusted Worker wire boundary.
-    #[must_use]
-    #[cfg(feature = "wasm")]
-    pub(crate) const fn from_raw(value: u32) -> Self {
-        Self(value)
-    }
 }
 
 /// Result returned after creating a checkpoint-backed range decoder.

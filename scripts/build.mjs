@@ -35,6 +35,11 @@ await Promise.all([
   }),
   build({
     ...shared,
+    entryPoints: [fileURLToPath(new URL("js/arrow.ts", rootUrl))],
+    outfile: fileURLToPath(new URL("dist/arrow.js", rootUrl)),
+  }),
+  build({
+    ...shared,
     entryPoints: [fileURLToPath(new URL("js/worker.ts", rootUrl))],
     outfile: fileURLToPath(new URL("dist/worker.js", rootUrl)),
   }),

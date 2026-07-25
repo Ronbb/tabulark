@@ -1,139 +1,104 @@
 # Tabulark
 
-> A WebAssembly-first engine for fast, format-agnostic tabular data preview in the browser.
+> **Status: pre-alpha M4 candidate.** Tabulark has an explicit built-in
+> adapter boundary for local CSV/TSV and Apache Arrow IPC. The source and local
+> test suite implement the M4 contract, but M4 must not be called complete
+> until CI, GitHub Pages deployment, and the deployed-URL smoke test have run
+> successfully for the candidate revision.
 
-**One table model for every tabular source.**
+Tabulark is a WebAssembly-first browser primitive for previewing local tabular
+data without uploading it. A module Worker owns parsing, byte access, adapter
+state, cancellation, and cleanup; a Canvas viewport renders visible cells; a
+bounded semantic grid supplies keyboard and screen-reader access.
 
-[Open the introduction and live playground](https://ronbb.github.io/tabulark/)
-· [Browse the architecture notes](docs/architecture.md)
+[Try the playground](https://ronbb.github.io/tabulark/) · [Architecture](docs/architecture.md) · [M4 migration](docs/m4-migration.md) · [Testing](docs/testing.md)
 
-**Status: pre-alpha; M3 is complete for the experimental local CSV/TSV vertical slice.**
+## What the M4 candidate contains
 
-> [!IMPORTANT]
-> Tabulark has an experimental CSV/TSV Worker, WebAssembly runtime, and
-> accessible Canvas viewport. The bounded M3 exit criteria are implemented and
-> measured, including lifecycle and resource recovery, compatibility and fuzz
-> corpora, inclusive resize/high-contrast interaction, and reproducible browser
-> performance and package-size baselines. There is still no stable public API or
-> production-ready release. M4 second-adapter validation and the broader format
-> roadmap described below are not complete.
+- Explicit, immutable registration of the built-in CSV/TSV and Arrow IPC
+  adapters.
+- Separate lazily loaded WebAssembly artifacts. Creating an engine loads no
+  WASM; opening CSV/TSV does not fetch Arrow; concurrent first opens share one
+  artifact load.
+- Apache Arrow IPC File and Stream decoding through Rust/WASM, including
+  uncompressed, LZ4, and Zstd IPC payloads.
+- A recursive Arrow schema and a generic typed-buffer batch layout shared by
+  both adapters.
+- Native values for programmatic consumers and stable display strings for the
+  Canvas viewport, ARIA grid, sizing, and TSV copy.
+- Static GitHub Pages packaging, a pinned Arrow fixture, source maps,
+  declarations, third-party notices, browser integration coverage, and size
+  gates.
 
-## Why Tabulark?
+This is not a spreadsheet, a remote data connector, a generic third-party
+adapter marketplace, or a released compatibility promise.
 
-Tabular data reaches web applications through many formats, but preview
-interfaces repeatedly reimplement parsing, data transfer, caching, and
-rendering for each one.
+## Install and build
 
-Tabulark is being designed as composable browser infrastructure that presents
-those sources through one format-agnostic `Table` model. It is a preview engine,
-not a spreadsheet application.
+The package has no production npm dependencies. It targets modern Chromium
+browsers and requires Node 20+ to build from source.
 
-## Design principles
-
-- One `Table` abstraction for every supported data source.
-- Independently loadable source adapters, including format-specific parsers.
-- Parsing and data ownership outside the browser main thread, with WebAssembly
-  as the primary runtime for performance-sensitive components.
-- Demand-driven access instead of copying an entire dataset into JavaScript.
-- Viewport-oriented rendering, with Canvas as the first experimental renderer.
-- Framework-neutral, composable building blocks.
-
-## Target architecture
-
-```text
-Data source
-    -> source adapter
-    -> Worker / WebAssembly runtime
-    -> unified Table model and cache
-    -> viewport query API
-    -> renderer
-    -> application UI
+```sh
+npm ci
+npm run build
+npm test
+npm run test:browser
 ```
 
-This architecture is intentionally provisional while the first end-to-end
-prototype is being developed.
+`npm run build` produces the root runtime, the `tabulark/arrow` entry point, a
+generic Worker, and independent Delimited and Arrow WASM artifacts under
+`dist/wasm/`.
 
-## Current prototype
+## Open a source explicitly
 
-The repository currently contains:
+Choose adapters when constructing the engine; the engine’s allow-list is fixed
+for its lifetime. The only accepted source inputs are `File`, `Blob`, and
+`ArrayBuffer`.
 
-- Rust table extent, schema, range, columnar batch, structured error, and
-  version-one Worker protocol models.
-- An incremental CSV/TSV parser and sparse row index compiled to WebAssembly.
-- A browser ESM facade backed by a dedicated module Worker, with progressive
-  metadata, bounded range reads, cancellation, and explicit lifecycle cleanup.
-- A framework-neutral viewport controller, high-DPI Canvas painter, native
-  virtual scrolling, selection, clipboard, column resize, and bounded semantic
-  DOM grid.
-- Golden protocol fixtures, Node contract tests, and Chromium Worker
-  integration tests.
-- Lifecycle hardening for delayed/background scan failures, bounded close
-  waits, and terminal protocol-validation failures.
-- Initial lenient parse diagnostics that remain observable after `open()` and
-  include row and byte-offset context.
-- An interactive Canvas browser example with parsing controls, cancel, retry,
-  strict-to-lenient recovery, and a deterministic large-CSV generator.
-- A responsive introduction and local-file playground published as a static
-  GitHub Pages site from `main`.
-- A versioned, manifest-driven CSV/TSV compatibility corpus that checks each
-  fixture across single-byte, tiny, and larger scanner/range chunk sizes.
-- A bounded `cargo-fuzz` `csv_lifecycle` target with checked-in seeds, a stable
-  deterministic smoke path, and a scheduled 10-minute Linux campaign.
-- Strict-pixel Canvas snapshots for ready, keyboard-selection, and horizontal
-  scroll states, validated in CI with Playwright Chromium on Ubuntu 24.04; that
-  runner is the canonical environment for intentional baseline updates.
-- Automated axe WCAG 2.1 A/AA checks for six example states: idle, ready,
-  strict-error, dark-ready, forced-colors ready, and forced-colors error.
-- A Chinese/Japanese/Korean TSV regression that crosses the versioned parser
-  corpus, single-byte scanner chunks, real Worker/WebAssembly decoding, the
-  semantic grid, Canvas paint/autosize text calls, keyboard selection, and
-  exact clipboard output.
-- A pinned, license-preserving subset of the external `rust-csv` example corpus,
-  covering unusual quoting, empty fields versus the literal `NULL`, and
-  strict/lenient Latin-1 behavior with reviewable provenance and content digests.
-- Browser recovery tests for in-flight cancellation, oversized inputs and
-  fields, malformed quotes, and header-only sources, including reuse of the
-  same engine after recoverable resource failures.
-- Keyboard-operable column separators with bounded Arrow/Shift+Arrow,
-  Home/End, and Enter-to-fit behavior, plus dynamic forced-colors Canvas and DOM
-  contracts using system colors and non-color focus/selection cues.
-- A deterministic 16 MiB-target Chromium benchmark (16,777,218 generated bytes,
-  ending on a complete CSV row) covering startup, first usable paint, scan
-  throughput, non-adjacent range reads, scroll frames, transferred payloads, and
-  memory, plus enforced runtime/npm/Pages size budgets.
+```ts
+import { createEngine, delimitedAdapter } from "tabulark";
+import { arrowIpcAdapter } from "tabulark/arrow";
 
-M3 is complete against its bounded exit criteria, not against every possible
-compatibility or accessibility dimension. The CJK Canvas check locks the exact
-strings sent to the browser drawing API, not platform font shaping or glyph
-rasterization. The visual, axe, forced-colors, and performance automation are a
-Chromium baseline rather than cross-browser evidence, a complete accessibility
-audit, or a performance guarantee. The checked-in external corpus and fuzz
-target remain deliberately bounded and will continue to grow with real failures.
-M4 extension validation with a second adapter, persistent caches, additional
-formats, and framework bindings remain future milestones.
-
-## Experimental browser API
-
-The experimental data API opens `File`, `Blob`, or bounded `ArrayBuffer`
-sources and returns columnar batches. All names and wire formats may change
-before stabilization.
-`ArrayBuffer` ownership is transferred to the Worker and the caller's buffer is
-detached; use `File` or `Blob` for large sources.
-`File.name` becomes the default source and table display name. Hosts opening a
-`Blob` or `ArrayBuffer` can provide `sourceName`; an explicit `sourceName`
-overrides the inferred file name. Lenient parse warnings expose structured
-`row` and `byteOffset` fields, including warnings found during the initial scan.
-
-```js
-import { createEngine } from "tabulark";
-
-const engine = await createEngine();
-const dataset = await engine.open(file, {
-  format: "csv",
-  header: "first-row",
-  mode: "lenient",
+const engine = await createEngine({
+  adapters: [delimitedAdapter, arrowIpcAdapter],
 });
-const table = await dataset.openTable(dataset.tables[0].id);
+
+const csv = await engine.open(csvFile, {
+  adapter: delimitedAdapter,
+  adapterOptions: {
+    dialect: "csv",
+    header: "first-row",
+    mode: "lenient",
+  },
+});
+
+const arrow = await engine.open(arrowFile, {
+  adapter: arrowIpcAdapter,
+  adapterOptions: { container: "auto" }, // "auto" | "file" | "stream"
+});
+```
+
+Adapter selection never comes from a filename or extension. `container: "auto"`
+is resolved by the Rust Arrow adapter from the IPC bytes.
+
+`ArrayBuffer` ownership is retained by default. Use `transferInput: true` only
+when intentionally detaching an `ArrayBuffer`; using it with a `Blob` or
+`File` fails with `INVALID_ARGUMENT`.
+
+```ts
+const moved = await engine.open(buffer, {
+  adapter: arrowIpcAdapter,
+  transferInput: true,
+});
+```
+
+The former `format`, `wasmModuleUrl`, and `workerUrl` options are removed. See
+[the migration guide](docs/m4-migration.md) for before/after code.
+
+## Read tables and batches
+
+```ts
+const table = await arrow.openTable(arrow.tables[0].id);
 const batch = await table.readRange({
   rowStart: 0,
   rowCount: 100,
@@ -141,183 +106,106 @@ const batch = await table.readRange({
   columnCount: table.metadata.schema.columns.length,
 });
 
-console.table(batch.toRows());
+const nativeRows = batch.toRows();
+const displayRows = batch.toDisplayRows();
+```
 
+`ColumnSchema.dataType` is recursive and replaces the old coarse
+`logicalType`. `toRows()` returns native recursive values, including
+`bigint`, `Uint8Array`, decimal, temporal, interval, list, struct, map, and
+union representations. `toDisplayRows()` returns only `(string | null)[][]`.
+The visual renderer, accessible grid, width measurement, and copy path consume
+display rows only.
+
+The Rust display contract preserves nulls, renders binary as lowercase `0x…`,
+uses `NaN`, `Infinity`, `-Infinity`, and `-0` for special floats, preserves
+decimal scale, uses stable ISO temporal text, and escapes tabs/newlines in
+nested values.
+
+## Runtime and lifecycle
+
+The public protocol is version 2, the built-in adapter ABI is version 1, and
+the batch layout is version 1. Protocol v1 is explicitly rejected. A source
+exposes one logical dataset and one or more explicit table handles; callers
+close view, table, dataset, and engine resources deliberately.
+
+```ts
+view.destroy();
 await table.close();
 await dataset.close();
 await engine.close();
 ```
 
-## Experimental Canvas viewport
+The Playground follows the same order before switching sources, closes its
+engine on `pagehide`, and creates a new engine after terminal Worker failure.
 
-Mount the viewport into a container with an explicit height. The returned view
-owns only its DOM and controller; the host remains responsible for closing the
-table, dataset, and engine.
+## Playground and fixtures
 
-```js
-import { createCanvasTableView } from "tabulark";
+`npm run example` builds the static site and serves it locally. The Playground
+offers explicit CSV, TSV, and Arrow IPC modes; delimited-only controls disappear
+for Arrow, and the file picker accepts `.csv`, `.tsv`, `.arrow`, `.arrows`, and
+`.feather`.
 
-const view = createCanvasTableView({
-  container: document.querySelector("#preview"),
-  table,
-});
+The Arrow sample is a committed IPC File fetched as a static asset, not created
+in browser JavaScript. Its SHA-256, generator provenance, and Apache
+cross-language companion fixture are recorded in
+[`test/fixtures/arrow/v1/provenance.json`](test/fixtures/arrow/v1/provenance.json).
 
-view.focus();
+## Verification
 
-// When unmounting the preview:
-view.destroy();
-```
-
-The visual Canvas is paired with a viewport-sized ARIA grid. Arrow keys,
-Page Up/Down, Home/End, Shift-selection, copy as TSV, horizontal and vertical
-scrolling, and pointer or keyboard column resizing are part of the experimental
-surface. Focus a column separator, then use Arrow keys (or Shift+Arrow for a
-larger step), Home/End for the bounds, and Enter to fit visible content.
-Advanced integrations can create a headless controller with
-`createTableController(table, options)` and pass it to the Canvas view.
-
-Run `npm run example`, then open `http://127.0.0.1:4173/` to view the same
-introduction and playground that are packaged for GitHub Pages. The playground
-exposes header, parse-mode, and delimiter options and demonstrates cancellation
-and retry with the same local source. `npm run build:pages` writes the reviewed
-static artifact to `target/pages`; all runtime URLs remain relative so project
-Pages works at `/tabulark/` without a hard-coded deployment base.
-
-## Planned data sources
-
-CSV and TSV are the only implemented source formats in this prototype.
-Longer-term candidates include XLSX, XLS, Parquet, Apache Arrow, Feather,
-SQLite query results, DuckDB query results, and third-party data sources.
-
-A format should not be considered supported until a released adapter is backed
-by compatibility tests.
-
-## Non-goals
-
-Tabulark is not intended to be:
-
-- A spreadsheet editor or Excel replacement.
-- A formula calculation or workbook recalculation engine.
-- A VBA, macro, or arbitrary workbook-code runtime.
-- A pixel-perfect implementation of every Office document feature.
-- A pivot table, chart authoring, BI, or database product.
-- A mandatory all-formats bundle or complete application framework.
-
-Editing, analysis, and application-specific UI may be built on top of Tabulark,
-but they are outside the core project's scope.
-
-## Development
-
-Requirements:
-
-- Rust 1.85 or later.
-- Node.js 20 or later.
-- npm 10 or later.
-- `wasm-bindgen-cli` matching the `wasm-bindgen` version in `Cargo.lock`.
-- Playwright Chromium for browser integration tests.
-
-Run the local checks:
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features --locked
-cargo check --target wasm32-unknown-unknown --no-default-features --features wasm --locked
-cargo package --allow-dirty --locked
-npm ci
-npm run build
+```sh
+# Type, unit, fixture/protocol, and package-consumer checks
 npm run check
+
+# Browser Worker, Canvas, ARIA, forced-colors, mobile, and Arrow checks
 npm run test:browser
-npm run benchmark:smoke
+
+# Build the static artifact and inspect its delivery contents
+npm run build:pages
+
+# Enforce independent core/Arrow/npm/Pages size budgets
 npm run benchmark:size
+
+# Exercise Arrow File/Stream × none/LZ4/Zstd cold-open, range, real-scroll,
+# transfer, and memory baselines against committed multi-batch fixtures
+npm run benchmark:arrow
+
+# M3 CSV canonical performance evidence
+npm run benchmark:canonical
 ```
 
-Run the deterministic parser-lifecycle smoke path on stable Rust with:
+The Pages workflow tests the assembled artifact before upload and then runs a
+CSV/TSV/Arrow/copy/console smoke test against the URL returned by GitHub Pages.
+Until that post-deploy job has succeeded for a revision, deployed-site evidence
+is pending rather than implied by local tests.
 
-```bash
-cargo run --manifest-path fuzz/Cargo.toml --bin csv_lifecycle --locked
-```
+## Boundaries and limits
 
-This repository's sanitizer-backed libFuzzer campaigns currently run on Linux
-or WSL with nightly Rust and `cargo-fuzz`.
-[The scheduled Linux workflow](.github/workflows/fuzz.yml) runs the checked-in
-corpus for 10 minutes each week and can also be started manually. See the
-[testing guide](docs/testing.md) for the exact local commands and platform
-boundary.
+- No public arbitrary JavaScript adapters, module URLs, global adapter registry,
+  remote range provider, `ReadableStream`, Arrow JS table, or C Data Interface.
+- Arrow tensor, sparse tensor, and non-native-endian messages fail with a
+  structured `UNSUPPORTED_FEATURE` error.
+- The runtime enforces a nesting depth of 64, up to 16,384 fields, and at most
+  250,000 cells per range. Other index, decoding, caching, and display limits
+  are derived from the engine memory budget.
+- The M4 candidate remains Chromium-first. Firefox/WebKit support, persistent
+  caches, additional formats, and framework bindings are future work.
 
-Run the browser example acceptance spec on its own with:
-
-```bash
-npm run test:browser -- test/browser/example.spec.mjs
-```
-
-After the first registry release, consumers will be able to install the base
-packages with:
-
-```bash
-cargo add tabulark
-npm install tabulark
-```
-
-## Repository layout
+## Repository map
 
 ```text
-tabulark/
-├── src/                  # Rust crate
-├── js/                   # Browser facade, Worker, controller, and Canvas view
-├── test/                 # Contract, browser, and performance test harnesses
-├── examples/csv-preview/ # Browser Canvas-preview example
-├── fuzz/                 # csv_lifecycle target and checked-in seed corpus
-├── scripts/              # Repository validation scripts
-├── docs/                 # Vision and release documentation
-└── .github/workflows/    # CI and registry publication
+src/                         shared Rust model, protocol, and adapters
+crates/tabulark-*-wasm/      thin independently-built WASM entry crates
+js/                          public runtime, Worker, typed batch, and view
+examples/csv-preview/        static Playground controller
+test/fixtures/arrow/         pinned Arrow IPC fixtures and provenance
+test/browser/                browser, accessibility, visual, Pages smoke tests
+test/performance/            CSV and Arrow performance/size harnesses
+docs/                        architecture, testing, milestone, and migration docs
 ```
-
-See the [project vision](docs/vision.md) for the long-term design intent, the
-[architecture notes](docs/architecture.md) for implemented and planned system
-boundaries, the
-[MVP roadmap](docs/mvp.md) for the first vertical slice, and the
-[testing guide](docs/testing.md) for protocol, Chromium, and large-file checks.
-See the
-[release guide](docs/releasing.md) for registry setup and publishing.
-
-## Project status
-
-- [x] Draft the overall architecture and MVP boundary.
-- [x] Implement the experimental unified `Table` model.
-- [x] Define the version-one Worker protocol.
-- [x] Implement the first CSV/TSV Worker and WebAssembly vertical slice.
-- [x] Prototype viewport-driven accessible Canvas rendering.
-- [x] Complete the first M3.1 lifecycle, protocol, diagnostics, and
-  example-hardening slice.
-- [x] Add the M3.2 versioned CSV/TSV corpus and parser-fuzzing baseline.
-- [x] Add the M3.3 Linux-Chromium visual-regression and axe automation baseline.
-- [x] Add the M3.4 CJK corpus, Canvas, semantic-grid, and TSV-copy regressions.
-- [x] Complete the remaining M3 compatibility, inclusive interaction, and
-  measurement work.
-- [ ] Validate the extension boundary with an M4 second adapter.
-- [ ] Publish the first crates.io and npm packages.
-- [ ] Stabilize extension APIs.
-
-## Contributing
-
-Tabulark is not yet ready for broad feature contributions. Design discussion,
-representative datasets, and concrete browser-preview use cases are welcome in
-[GitHub Issues](https://github.com/Ronbb/tabulark/issues).
-
-## AI-assisted development
-
-Tabulark makes extensive use of generative AI throughout project design,
-implementation, testing, documentation, and code review. AI-generated output is
-treated as a draft rather than trusted work: maintainers remain responsible for
-every change, and the same review, testing, security, and licensing standards
-apply regardless of how a contribution was produced.
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT License ([LICENSE-MIT](LICENSE-MIT))
-
-at your option.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
+Shipped third-party material is listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

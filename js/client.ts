@@ -1,8 +1,17 @@
 import { TabularkError, cancelledError, closedError, invalidArgument } from "./errors.js";
 import {
+  resolveOfficialAdapter,
+  type AdapterDescriptor,
+  type AdapterRegistration,
+  type ArrowIpcAdapterOptions,
+  type DelimitedAdapterOptions,
+  type OfficialAdapterId,
+} from "./adapters.js";
+import {
   DEFAULT_MEMORY_BUDGET_BYTES,
   ColumnarTableBatch,
   deriveMemoryBudgetLimits,
+  normalizeDataType,
   normalizeMetadata,
   validateRange,
   type RangeRequest,
@@ -12,7 +21,13 @@ import {
   type WireTableBatch,
   type MemoryBudgetLimits,
 } from "./model.js";
-import { PROTOCOL_VERSION, isRecord, type ProtocolEvent } from "./protocol.js";
+import {
+  ADAPTER_API_VERSION,
+  BATCH_LAYOUT_VERSION,
+  PROTOCOL_VERSION,
+  isRecord,
+  type ProtocolEvent,
+} from "./protocol.js";
 import {
   ByteLruCache,
   cloneWireTableBatch,
@@ -28,29 +43,20 @@ const MAX_ORPHAN_HANDLES = 32;
 const MAX_ORPHAN_EVENTS_PER_HANDLE = 16;
 const MAX_ORPHAN_EVENTS = 256;
 
-export type DelimitedFormat = "csv" | "tsv";
-export type HeaderMode = "first-row" | "none";
-export type ParseMode = "lenient" | "strict";
-
-export interface OpenSourceOptions {
-  /** The format is explicit; automatic format detection is intentionally absent. */
-  readonly format: DelimitedFormat;
-  readonly header?: HeaderMode;
-  readonly mode?: ParseMode;
-  /** One ASCII delimiter byte. Defaults to comma or tab from format. */
-  readonly delimiter?: string;
-  /** Display name for the source. Defaults to File.name when a File is supplied. */
-  readonly sourceName?: string;
+export interface OpenSourceOptions<Options = unknown> {
+  /** One of the official descriptors registered when the engine was created. */
+  readonly adapter: AdapterDescriptor<OfficialAdapterId, Options>;
+  readonly adapterOptions?: Options;
+  /** Detaches an ArrayBuffer input. Defaults to false; Blob input cannot be transferred. */
+  readonly transferInput?: boolean;
   /** Cancels opening and releases any Worker-side source created by the request. */
   readonly signal?: AbortSignal;
 }
 
 export interface EngineOptions {
+  /** The engine's immutable allow-list. At least one official adapter is required. */
+  readonly adapters: readonly AdapterDescriptor[];
   readonly memoryBudgetBytes?: number;
-  /** Advanced override for a separately hosted wasm-bindgen module. */
-  readonly wasmModuleUrl?: string | URL;
-  /** Advanced override for a separately hosted Tabulark module Worker. */
-  readonly workerUrl?: string | URL;
   readonly workerName?: string;
 }
 
@@ -99,7 +105,7 @@ export interface TableHandle {
 }
 
 export interface TabularkEngine {
-  open(source: Blob | ArrayBuffer, options: OpenSourceOptions): Promise<DatasetSession>;
+  open<Options>(source: Blob | ArrayBuffer, options: OpenSourceOptions<Options>): Promise<DatasetSession>;
   close(): Promise<void>;
   dispose(): Promise<void>;
 }
@@ -107,34 +113,35 @@ export interface TabularkEngine {
 interface NormalizedEngineOptions {
   readonly memoryBudgetBytes: number;
   readonly limits: MemoryBudgetLimits;
-  readonly wasmModuleUrl: string;
+  readonly adapters: readonly AdapterRegistration[];
   readonly workerUrl: string;
   readonly workerName: string;
 }
 
 interface NormalizedOpenOptions {
-  readonly format: DelimitedFormat;
-  readonly options: Readonly<{
-    header: HeaderMode;
-    mode: ParseMode;
-    delimiter: string;
-    sourceName?: string;
-  }>;
+  readonly adapter: AdapterRegistration;
+  readonly options: Readonly<Record<string, unknown>>;
 }
 
 class Engine implements TabularkEngine {
   readonly #rpc: WorkerRpcClient;
   readonly #rangeCache: ByteLruCache<WireTableBatch>;
   readonly #maxArrayBufferBytes: number;
+  readonly #adapters: ReadonlyMap<OfficialAdapterId, AdapterRegistration>;
   readonly #sessions = new Map<string, DatasetSessionImpl>();
   readonly #orphanEvents = new Map<string, ProtocolEvent[]>();
   #orphanEventCount = 0;
   #closed = false;
 
-  constructor(rpc: WorkerRpcClient, limits: MemoryBudgetLimits) {
+  constructor(
+    rpc: WorkerRpcClient,
+    limits: MemoryBudgetLimits,
+    adapters: readonly AdapterRegistration[],
+  ) {
     this.#rpc = rpc;
     this.#rangeCache = new ByteLruCache(limits.mainThreadRangeCacheBytes);
     this.#maxArrayBufferBytes = limits.maxArrayBufferBytes;
+    this.#adapters = new Map(adapters.map((adapter) => [adapter.id, adapter]));
   }
 
   static async create(options: EngineOptions): Promise<Engine> {
@@ -164,18 +171,29 @@ class Engine implements TabularkEngine {
         engine.#handleRuntimeFailure(error);
       }
     });
-    engine = new Engine(rpc, normalized.limits);
+    engine = new Engine(rpc, normalized.limits, normalized.adapters);
     try {
       const hello = await rpc.request<unknown>(
         "hello",
         {
           clientName: "tabulark-js",
-          wasmModuleUrl: normalized.wasmModuleUrl,
+          adapters: normalized.adapters,
           memoryBudgetBytes: normalized.memoryBudgetBytes,
         },
         "hello",
       );
-      if (!isRecord(hello) || hello.protocolVersion !== PROTOCOL_VERSION) {
+      const helloAdapters = isRecord(hello) && Array.isArray(hello.adapters)
+        ? hello.adapters
+        : undefined;
+      if (
+        !isRecord(hello)
+        || hello.protocolVersion !== PROTOCOL_VERSION
+        || hello.adapterApiVersion !== ADAPTER_API_VERSION
+        || hello.batchLayoutVersion !== BATCH_LAYOUT_VERSION
+        || !helloAdapters
+        || helloAdapters.length !== normalized.adapters.length
+        || normalized.adapters.some((adapter) => !helloAdapters.includes(adapter.id))
+      ) {
         throw new TabularkError(
           "PROTOCOL_INCOMPATIBLE",
           "The Worker did not accept the current Tabulark protocol version",
@@ -188,9 +206,12 @@ class Engine implements TabularkEngine {
     }
   }
 
-  async open(source: Blob | ArrayBuffer, options: OpenSourceOptions): Promise<DatasetSession> {
+  async open<Options>(
+    source: Blob | ArrayBuffer,
+    options: OpenSourceOptions<Options>,
+  ): Promise<DatasetSession> {
     this.#assertOpen();
-    const normalizedOptions = normalizeOpenOptions(options, inferSourceName(source));
+    const normalizedOptions = normalizeOpenOptions(options, this.#adapters, inferSourceName(source));
     const transfer: Transferable[] = [];
     if (source instanceof ArrayBuffer) {
       if (source.byteLength > this.#maxArrayBufferBytes) {
@@ -200,16 +221,20 @@ class Engine implements TabularkEngine {
           { details: { limit: this.#maxArrayBufferBytes, byteLength: source.byteLength } },
         );
       }
-      transfer.push(source);
+      if (options.transferInput === true) {
+        transfer.push(source);
+      }
     } else if (!(source instanceof Blob)) {
       throw invalidArgument("source must be a Blob, File, or ArrayBuffer");
+    } else if (options.transferInput === true) {
+      throw invalidArgument("transferInput may only be true for an ArrayBuffer source");
     }
 
     const dataset = await this.#rpc.request<{ datasetHandle: string }>(
       "openSource",
       {
         source,
-        format: normalizedOptions.format,
+        adapterId: normalizedOptions.adapter.id,
         options: normalizedOptions.options,
       },
       "dataset",
@@ -346,12 +371,17 @@ class Engine implements TabularkEngine {
     );
     this.#assertOpen();
     table.assertOpen();
-    const cachedBatch = cloneWireTableBatch(batch);
-    this.#rangeCache.set(
-      rangeCacheKey(table.handle, batch.revision, batch.schemaVersion, normalized),
-      cachedBatch,
-      wireBatchByteLength(cachedBatch),
-    );
+    // Incomplete batches end at a progressive indexed-prefix boundary. They
+    // are valid results for this instant, but caching them would hide rows
+    // discovered by subsequent Arrow Stream or delimited scan progress.
+    if (batch.complete) {
+      const cachedBatch = cloneWireTableBatch(batch);
+      this.#rangeCache.set(
+        rangeCacheKey(table.handle, batch.revision, batch.schemaVersion, normalized),
+        cachedBatch,
+        wireBatchByteLength(cachedBatch),
+      );
+    }
     return new ColumnarTableBatch(batch);
   }
 
@@ -817,6 +847,28 @@ class TableHandleImpl implements TableHandle {
 }
 
 function normalizeEngineOptions(options: EngineOptions): NormalizedEngineOptions {
+  if (!options || typeof options !== "object") {
+    throw invalidArgument("createEngine options are required");
+  }
+  if ("wasmModuleUrl" in options || "workerUrl" in options) {
+    throw invalidArgument("wasmModuleUrl and workerUrl were removed; register an official adapter instead");
+  }
+  if (!Array.isArray(options.adapters) || options.adapters.length === 0) {
+    throw invalidArgument("adapters must contain at least one official adapter descriptor");
+  }
+  const adapters: AdapterRegistration[] = [];
+  const ids = new Set<OfficialAdapterId>();
+  for (const [index, descriptor] of options.adapters.entries()) {
+    const registration = resolveOfficialAdapter(descriptor);
+    if (!registration) {
+      throw invalidArgument(`adapters[${index}] is not an official frozen adapter descriptor`);
+    }
+    if (ids.has(registration.id)) {
+      throw invalidArgument(`Adapter ${registration.id} is registered more than once`);
+    }
+    ids.add(registration.id);
+    adapters.push(Object.freeze({ ...registration }));
+  }
   const memoryBudgetBytes = options.memoryBudgetBytes ?? DEFAULT_MEMORY_BUDGET_BYTES;
   if (!Number.isSafeInteger(memoryBudgetBytes) || memoryBudgetBytes <= 0) {
     throw invalidArgument("memoryBudgetBytes must be a positive safe integer");
@@ -830,50 +882,108 @@ function normalizeEngineOptions(options: EngineOptions): NormalizedEngineOptions
   return {
     memoryBudgetBytes,
     limits: deriveMemoryBudgetLimits(memoryBudgetBytes),
-    wasmModuleUrl: resolveUrl(
-      options.wasmModuleUrl,
-      new URL("./wasm/tabulark.js", import.meta.url).href,
-    ),
-    workerUrl: resolveUrl(options.workerUrl, new URL("./worker.js", import.meta.url).href),
+    adapters: Object.freeze(adapters),
+    workerUrl: new URL("./worker.js", import.meta.url).href,
     workerName: options.workerName ?? "tabulark",
   };
 }
 
-function normalizeOpenOptions(
-  options: OpenSourceOptions,
+function normalizeOpenOptions<Options>(
+  options: OpenSourceOptions<Options>,
+  adapters: ReadonlyMap<OfficialAdapterId, AdapterRegistration>,
   inferredSourceName?: string,
 ): NormalizedOpenOptions {
-  if (!options || (options.format !== "csv" && options.format !== "tsv")) {
-    throw invalidArgument("format must be either csv or tsv");
+  if (!options || typeof options !== "object") {
+    throw invalidArgument("open options are required");
   }
-  const header = options.header ?? "first-row";
-  const mode = options.mode ?? "lenient";
+  if (options.transferInput !== undefined && typeof options.transferInput !== "boolean") {
+    throw invalidArgument("transferInput must be a boolean");
+  }
+  const selected = resolveOfficialAdapter(options.adapter);
+  if (!selected) {
+    throw invalidArgument("adapter must be an official frozen adapter descriptor");
+  }
+  const registered = adapters.get(selected.id);
+  if (!registered || registered.moduleUrl !== selected.moduleUrl) {
+    throw invalidArgument(`Adapter ${selected.id} was not registered with this engine`);
+  }
+  const rawOptions = options.adapterOptions;
+  if (rawOptions !== undefined && (!isRecord(rawOptions) || Array.isArray(rawOptions))) {
+    throw invalidArgument("adapterOptions must be an object");
+  }
+  const normalized = selected.id === "tabulark:delimited"
+    ? normalizeDelimitedOptions(rawOptions as DelimitedAdapterOptions | undefined, inferredSourceName)
+    : normalizeArrowOptions(rawOptions as ArrowIpcAdapterOptions | undefined, inferredSourceName);
+  return {
+    adapter: registered,
+    options: normalized,
+  };
+}
+
+function normalizeDelimitedOptions(
+  options: DelimitedAdapterOptions | undefined,
+  inferredSourceName?: string,
+): Readonly<Record<string, unknown>> {
+  const raw = options ?? {};
+  assertOnlyKeys(raw, ["dialect", "header", "mode", "delimiter", "sourceName"]);
+  const dialect = raw.dialect ?? "csv";
+  const header = raw.header ?? "first-row";
+  const mode = raw.mode ?? "lenient";
+  if (dialect !== "csv" && dialect !== "tsv") {
+    throw invalidArgument("dialect must be csv or tsv");
+  }
   if (header !== "first-row" && header !== "none") {
     throw invalidArgument("header must be first-row or none");
   }
   if (mode !== "lenient" && mode !== "strict") {
     throw invalidArgument("mode must be lenient or strict");
   }
-  const delimiter = options.delimiter ?? (options.format === "csv" ? "," : "\t");
-  if (delimiter.length !== 1 || delimiter.charCodeAt(0) > 0x7f) {
-    throw invalidArgument("delimiter must contain exactly one ASCII byte");
+  const delimiter = raw.delimiter ?? (dialect === "csv" ? "," : "\t");
+  if (!isValidDelimiter(delimiter)) {
+    throw invalidArgument("delimiter must be one non-NUL ASCII byte other than CR, LF, or quote");
   }
-  const sourceName = options.sourceName ?? inferredSourceName;
-  if (
-    sourceName !== undefined
-    && (typeof sourceName !== "string" || sourceName.length === 0 || sourceName.length > 1_024)
-  ) {
+  const sourceName = normalizeSourceName(raw.sourceName ?? inferredSourceName);
+  return Object.freeze({
+    dialect,
+    header,
+    mode,
+    delimiter,
+    ...(sourceName === undefined ? {} : { sourceName }),
+  });
+}
+
+function normalizeArrowOptions(
+  options: ArrowIpcAdapterOptions | undefined,
+  inferredSourceName?: string,
+): Readonly<Record<string, unknown>> {
+  const raw = options ?? {};
+  assertOnlyKeys(raw, ["container", "sourceName"]);
+  const container = raw.container ?? "auto";
+  if (container !== "auto" && container !== "file" && container !== "stream") {
+    throw invalidArgument("container must be auto, file, or stream");
+  }
+  const sourceName = normalizeSourceName(raw.sourceName ?? inferredSourceName);
+  return Object.freeze({
+    container,
+    ...(sourceName === undefined ? {} : { sourceName }),
+  });
+}
+
+function normalizeSourceName(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || value.length === 0 || value.length > 1_024) {
     throw invalidArgument("sourceName must contain between 1 and 1024 characters");
   }
-  return {
-    format: options.format,
-    options: Object.freeze({
-      header,
-      mode,
-      delimiter,
-      ...(sourceName === undefined ? {} : { sourceName }),
-    }),
-  };
+  return value;
+}
+
+function assertOnlyKeys(value: object, allowed: readonly string[]): void {
+  const allowedSet = new Set(allowed);
+  for (const key of Object.keys(value)) {
+    if (!allowedSet.has(key)) {
+      throw invalidArgument(`Unknown adapter option: ${key}`);
+    }
+  }
 }
 
 function normalizeDescriptors(value: unknown): readonly TableDescriptor[] {
@@ -911,13 +1021,13 @@ function normalizeMetadataWire(value: unknown): Readonly<TableMetadata> {
     },
     schema: { version: numeric(rawSchema.version, 0), columns },
     capabilities: {
+      ...rawCapabilities,
       randomAccess: rawCapabilities.randomAccess === "full" ? "full" : "indexed-prefix",
       typedValues: rawCapabilities.typedValues === true,
       search: rawCapabilities.search === true,
       sort: rawCapabilities.sort === true,
       filter: rawCapabilities.filter === true,
       multiTable: rawCapabilities.multiTable === true,
-      ...rawCapabilities,
     },
   });
 }
@@ -928,11 +1038,13 @@ function normalizeColumn(value: unknown, index: number): TableMetadata["schema"]
     id: typeof raw.id === "string" ? raw.id : `c${index}`,
     name: typeof raw.name === "string" ? raw.name : `column_${index + 1}`,
     index: numeric(raw.index, index),
-    logicalType: typeof raw.logicalType === "string"
-      ? raw.logicalType as TableMetadata["schema"]["columns"][number]["logicalType"]
-      : "utf8",
+    dataType: normalizeDataType(raw.dataType ?? { type: "unknown" }),
     nullable: raw.nullable !== false,
-    ...(isRecord(raw.extensions) ? { extensions: raw.extensions } : {}),
+    ...(isRecord(raw.metadata)
+      ? { metadata: Object.freeze(Object.fromEntries(
+          Object.entries(raw.metadata).map(([key, entry]) => [key, String(entry)]),
+        )) }
+      : {}),
   };
 }
 
@@ -945,11 +1057,23 @@ function normalizeAxis(
     if (value.kind === "unknown") {
       return { kind: "unknown" };
     }
-    if ((value.kind === "exact" || value.kind === "at-least") && Number.isSafeInteger(value.value)) {
+    if (
+      (value.kind === "exact" || value.kind === "at-least")
+      && Number.isSafeInteger(value.value)
+      && (value.value as number) >= 0
+    ) {
       return { kind: value.kind, value: value.value as number };
     }
   }
   return { kind: fallbackKind, value: fallbackValue };
+}
+
+function isValidDelimiter(value: unknown): value is string {
+  if (typeof value !== "string" || value.length !== 1) {
+    return false;
+  }
+  const byte = value.charCodeAt(0);
+  return byte <= 0x7f && byte !== 0 && byte !== 0x0d && byte !== 0x0a && byte !== 0x22;
 }
 
 function normalizeProgress(value: unknown): RuntimeProgress {
@@ -1000,13 +1124,6 @@ function asTabularkError(error: unknown, message: string): TabularkError {
     : new TabularkError("RUNTIME_FAILURE", message, { cause: error });
 }
 
-function resolveUrl(value: string | URL | undefined, fallback: string): string {
-  if (value === undefined) {
-    return fallback;
-  }
-  return typeof value === "string" ? new URL(value, import.meta.url).href : value.href;
-}
-
 function numeric(value: unknown, fallback: number): number {
   return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : fallback;
 }
@@ -1022,6 +1139,6 @@ function safelyCall<T>(listener: (value: T) => void, value: T): void {
 }
 
 /** Creates one dedicated Worker-backed Tabulark engine. */
-export function createEngine(options: EngineOptions = {}): Promise<TabularkEngine> {
+export function createEngine(options: EngineOptions): Promise<TabularkEngine> {
   return Engine.create(options);
 }

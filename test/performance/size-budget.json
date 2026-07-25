@@ -1,11 +1,13 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "maximumBytes": {
-    "runtimeRaw": 524288,
-    "runtimeBrotli": 147456,
-    "npmPacked": 294912,
-    "npmUnpacked": 1048576,
-    "pagesRaw": 1114112,
-    "pagesBrotli": 262144
+    "coreRaw": 524288,
+    "coreBrotli": 147456,
+    "arrowRaw": 2555904,
+    "arrowBrotli": 393216,
+    "npmPacked": 917504,
+    "npmUnpacked": 3735552,
+    "pagesRaw": 3866624,
+    "pagesBrotli": 720896
   }
 }

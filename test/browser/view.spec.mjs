@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 
 async function openSample(page) {
   await page.goto("/examples/csv-preview/");
-  await page.getByRole("button", { name: "Try sample data" }).click();
+  await page.getByRole("button", { name: "Try CSV sample" }).click();
 
   const view = page.locator("[data-tabulark-view]");
   const grid = page.locator("[data-tabulark-a11y-grid]");
@@ -146,9 +146,13 @@ test.describe("Canvas table view", () => {
       .poll(async () => (await firstHandle.boundingBox())?.x ?? Number.POSITIVE_INFINITY)
       .toBeLessThan(defaultBox.x - 70);
 
+    // The table lives inside a scrollable document and its sticky resize
+    // layer can be partially clipped after autosizing. Let Playwright resolve
+    // a genuinely visible point before reading the coordinates used for the
+    // captured pointer drag.
+    await firstHandle.hover({ position: { x: 22, y: 12 } });
     const before = await firstHandle.boundingBox();
     expect(before).not.toBeNull();
-    await page.mouse.move(before.x + before.width / 2, before.y + Math.min(before.height / 2, 12));
     await page.mouse.down();
     await page.mouse.move(before.x + before.width / 2 + 48, before.y + Math.min(before.height / 2, 12));
     await page.mouse.up();
@@ -180,8 +184,8 @@ test.describe("Canvas table view", () => {
           schema: {
             version: 0,
             columns: [
-              { id: "c0", name: "First", index: 0, logicalType: "utf8", nullable: true },
-              { id: "c1", name: "Second", index: 1, logicalType: "utf8", nullable: true },
+              { id: "c0", name: "First", index: 0, dataType: { type: "utf8" }, nullable: true },
+              { id: "c1", name: "Second", index: 1, dataType: { type: "utf8" }, nullable: true },
             ],
           },
           capabilities: {

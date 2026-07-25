@@ -42,10 +42,14 @@ jobs:
         run: cargo test --manifest-path fuzz/Cargo.toml --locked
 
       - name: Replay fuzz seeds
-        run: cargo run --manifest-path fuzz/Cargo.toml --bin csv_lifecycle --locked
+        run: |
+          cargo run --manifest-path fuzz/Cargo.toml --bin csv_lifecycle --locked
+          cargo run --manifest-path fuzz/Cargo.toml --bin arrow_lifecycle --locked
 
       - name: Check WebAssembly target
-        run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm --locked
+        run: |
+          cargo check --package tabulark-delimited-wasm --target wasm32-unknown-unknown --locked
+          cargo check --package tabulark-arrow-wasm --target wasm32-unknown-unknown --locked
 
       - name: Check crate package
         run: cargo package --locked
@@ -106,7 +110,7 @@ jobs:
         run: node test/performance/generate-csv.mjs --size 2MiB --output target/bench/smoke.csv
 
       - name: Check npm package
-        run: npm pack --dry-run
+        run: npm run package:check
 
   browser:
     name: Chromium Worker, accessibility, and visual integration
@@ -161,6 +165,9 @@ jobs:
       - name: Run performance invariant smoke
         run: npm run benchmark:smoke
 
+      - name: Run Arrow delivery performance smoke
+        run: npm run benchmark:arrow
+
       - name: Enforce package and site size budgets
         run: npm run benchmark:size
 
@@ -171,6 +178,7 @@ jobs:
           name: performance-smoke-${{ github.sha }}
           path: |
             target/bench/performance-smoke.json
+            target/bench/performance-arrow-*.json
             target/bench/package-sizes.json
           if-no-files-found: ignore
           retention-days: 14

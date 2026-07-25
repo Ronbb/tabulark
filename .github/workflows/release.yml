@@ -74,7 +74,9 @@ jobs:
         run: cargo test --workspace --all-features --locked
 
       - name: Check WebAssembly target
-        run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm --locked
+        run: |
+          cargo check --package tabulark-delimited-wasm --target wasm32-unknown-unknown --locked
+          cargo check --package tabulark-arrow-wasm --target wasm32-unknown-unknown --locked
 
       - name: Build JavaScript and WebAssembly
         run: npm run build
@@ -94,6 +96,9 @@ jobs:
       - name: Run performance invariant smoke
         run: npm run benchmark:smoke
 
+      - name: Run Arrow delivery performance smoke
+        run: npm run benchmark:arrow
+
       - name: Enforce package and site size budgets
         run: npm run benchmark:size
 
@@ -111,7 +116,7 @@ jobs:
       - name: Check registry packages
         run: |
           cargo package --locked
-          npm pack --dry-run
+          npm run package:check
 
   publish-crate:
     name: Publish crate

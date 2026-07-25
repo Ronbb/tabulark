@@ -215,7 +215,7 @@ function createMockTable({
         id: `column-${index}`,
         name: `Column ${index + 1}`,
         index,
-        logicalType: "utf8",
+        dataType: { type: "utf8" },
         nullable: true,
       }))),
     }),
@@ -262,7 +262,7 @@ function createBatch(metadata, request, valueAt) {
     columns: Object.freeze([]),
     complete: true,
     byteLength: 0,
-    toRows() {
+    toDisplayRows() {
       return Array.from({ length: request.rowCount }, (_, rowOffset) =>
         Array.from({ length: request.columnCount }, (_, columnOffset) =>
           valueAt(request.rowStart + rowOffset, request.columnStart + columnOffset),

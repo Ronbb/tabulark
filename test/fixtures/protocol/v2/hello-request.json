@@ -1,0 +1,19 @@
+{
+  "protocolVersion": 2,
+  "requestId": "request-hello-002",
+  "op": "hello",
+  "payload": {
+    "clientName": "tabulark-js",
+    "adapters": [
+      {
+        "id": "tabulark:delimited",
+        "moduleUrl": "https://example.invalid/dist/wasm/delimited/tabulark_delimited.js"
+      },
+      {
+        "id": "tabulark:arrow-ipc",
+        "moduleUrl": "https://example.invalid/dist/wasm/arrow/tabulark_arrow.js"
+      }
+    ],
+    "memoryBudgetBytes": 268435456
+  }
+}

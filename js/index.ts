@@ -1,5 +1,5 @@
-/** The current maturity of the published API. */
-export const PROJECT_STATUS = "prototype" as const;
+/** The current maturity of the experimental M4 API. */
+export const PROJECT_STATUS = "pre-alpha" as const;
 
 /** Immutable row and column counts for an exact table. */
 export interface TableShape {
@@ -22,14 +22,12 @@ function assertCount(value: number, name: string): void {
 }
 
 export { createEngine } from "./client.js";
+export { delimitedAdapter } from "./adapters.js";
 export type {
   DatasetEvent,
   DatasetSession,
-  DelimitedFormat,
   EngineOptions,
-  HeaderMode,
   OpenSourceOptions,
-  ParseMode,
   ReadRangeOptions,
   RuntimeProgress,
   SourceWarning,
@@ -38,29 +36,51 @@ export type {
   TabularkEngine,
   Unsubscribe,
 } from "./client.js";
+export type {
+  AdapterDescriptor,
+  ArrowIpcAdapterOptions,
+  ArrowIpcContainer,
+  DelimitedAdapterOptions,
+  DelimitedDialect,
+  HeaderMode,
+  OfficialAdapterId,
+  ParseMode,
+} from "./adapters.js";
 export { TabularkError } from "./errors.js";
 export type { TabularkErrorCode } from "./errors.js";
 export {
   DEFAULT_MEMORY_BUDGET_BYTES,
   DEFAULT_TO_ROWS_CELL_LIMIT,
+  MAX_NESTING_DEPTH,
   MAX_ARRAY_BUFFER_BYTES,
   MAX_RANGE_CELLS,
 } from "./model.js";
 export type {
+  ArrowDataType,
+  ArrowField,
   AxisExtent,
+  BatchBufferRegion,
   ColumnSchema,
-  LogicalType,
+  DecimalValue,
+  DisplayColumnDescriptor,
+  IntervalValue,
+  MapEntryValue,
+  NativeColumnDescriptor,
+  NativeValue,
   RangeRequest,
   ReturnedRange,
   TableBatch,
+  TableBatchColumn,
   TableCapabilities,
   TableDescriptor,
   TableExtent,
   TableMetadata,
   ToRowsOptions,
-  Utf8Column,
+  TemporalValue,
+  TimeUnit,
+  UnionValue,
 } from "./model.js";
-export { PROTOCOL_VERSION } from "./protocol.js";
+export { ADAPTER_API_VERSION, BATCH_LAYOUT_VERSION, PROTOCOL_VERSION } from "./protocol.js";
 
 export { createCanvasTableView } from "./view/canvas-table-view.js";
 export type {

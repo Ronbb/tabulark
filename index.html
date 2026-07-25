@@ -6,14 +6,14 @@
     <meta name="color-scheme" content="light dark" />
     <meta
       name="description"
-      content="Tabulark is a WebAssembly-first engine for fast, local CSV and TSV preview in the browser. Try the interactive Canvas playground."
+      content="Tabulark is a WebAssembly-first engine for fast, local CSV, TSV, and Apache Arrow IPC preview in the browser. Try the interactive Canvas playground."
     />
     <meta name="theme-color" content="#f4f6fb" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#111827" media="(prefers-color-scheme: dark)" />
     <meta property="og:title" content="Tabulark · Local table preview infrastructure" />
     <meta
       property="og:description"
-      content="Open CSV and TSV files locally with a Worker, WebAssembly, Canvas rendering, and an accessible semantic viewport."
+      content="Open CSV, TSV, and Apache Arrow IPC files locally with a Worker, WebAssembly, Canvas rendering, and an accessible semantic viewport."
     />
     <meta property="og:type" content="website" />
     <title>Tabulark · Local table preview infrastructure</title>
@@ -323,6 +323,9 @@
         z-index: 20;
         top: 0.75rem;
         left: 0.75rem;
+        display: inline-flex;
+        min-height: 2.75rem;
+        align-items: center;
         transform: translateY(-150%);
         border-radius: 0.5rem;
         padding: 0.65rem 0.85rem;
@@ -353,6 +356,7 @@
       .brand {
         align-items: center;
         gap: 0.6rem;
+        min-height: 2.75rem;
         color: #172033;
         text-decoration: none;
       }
@@ -391,6 +395,8 @@
       .header-nav a:hover,
       .header-github:hover { background: #e9edff; color: #3730a3; }
 
+      .skip-link:focus-visible,
+      .brand:focus-visible,
       .header-nav a:focus-visible,
       .header-github:focus-visible,
       .hero-actions a:focus-visible,
@@ -680,7 +686,13 @@
         font-size: 0.85rem;
       }
 
-      .footer-link { color: #475467; font-weight: 700; }
+      .footer-link {
+        display: inline-flex;
+        min-height: 2.75rem;
+        align-items: center;
+        color: #475467;
+        font-weight: 700;
+      }
 
       @media (max-width: 48rem) {
         .hero { grid-template-columns: 1fr; min-height: auto; }
@@ -745,6 +757,8 @@
         #status:focus,
         #status:focus-visible,
         .file-label:focus-within,
+        .skip-link:focus-visible,
+        .brand:focus-visible,
         .header-nav a:focus-visible,
         .header-github:focus-visible,
         .hero-actions a:focus-visible,
@@ -816,7 +830,7 @@
             <path d="M12 19.5h8" fill="none" stroke="currentColor" stroke-width="2" />
           </svg>
           <strong>Tabulark</strong>
-          <span class="badge">M3 COMPLETE</span>
+          <span class="badge">M4 EXPERIMENTAL</span>
         </a>
         <nav class="header-nav" aria-label="Primary navigation">
           <a href="#why">Why Tabulark</a>
@@ -925,9 +939,9 @@
       <section id="playground" class="section" aria-labelledby="playground-title" tabindex="-1">
         <div class="section-heading">
           <span class="playground-label">Runs entirely in this browser</span>
-          <h2 id="playground-title">Try the CSV / TSV playground.</h2>
+          <h2 id="playground-title">Try the CSV / TSV / Arrow IPC playground.</h2>
           <p>
-            Choose a local file or generate a 2,000-row sample. Nothing is uploaded, and the
+            Choose a local file or open a committed sample. Nothing is uploaded, and the
             preview remains usable with keyboard navigation and a bounded semantic grid.
           </p>
         </div>
@@ -936,7 +950,7 @@
           <section id="app" data-state="idle" data-testid="app" aria-label="Interactive table playground">
             <h3 class="playground-title">Explore a local table instantly.</h3>
             <p class="lede">
-              Pick the source format, tune parsing behavior when needed, then open the preview.
+              Choose an adapter explicitly, tune its options when needed, then open the preview.
             </p>
             <form id="open-form" class="toolbar" data-testid="open-form">
               <label id="file-picker" data-testid="file-picker" class="file-label">
@@ -945,18 +959,20 @@
                   id="source"
                   data-testid="source-input"
                   type="file"
-                  accept=".csv,.tsv,text/csv,text/tab-separated-values"
+                  accept=".csv,.tsv,.arrow,.arrows,.feather,text/csv,text/tab-separated-values,application/vnd.apache.arrow.file,application/vnd.apache.arrow.stream"
                 />
               </label>
               <label class="field">
-                <span>Format</span>
+                <span>Adapter</span>
                 <select id="format" data-testid="format" aria-label="File format">
                   <option value="csv">CSV</option>
                   <option value="tsv">TSV</option>
+                  <option value="arrow">Arrow IPC</option>
                 </select>
               </label>
               <button id="open" data-testid="open-button" class="primary" type="submit">Open preview</button>
-              <button id="sample" data-testid="sample-button" type="button">Try sample data</button>
+              <button id="sample" data-testid="sample-button" type="button">Try CSV sample</button>
+              <button id="arrow-sample" data-testid="arrow-sample-button" type="button">Try Arrow sample</button>
               <button
                 id="cancel"
                 data-testid="cancel-button"
@@ -972,7 +988,7 @@
                 hidden
               >Retry last source</button>
               <details id="advanced" data-testid="advanced-options" class="advanced">
-                <summary>Parsing options</summary>
+                <summary>Delimited parsing options</summary>
                 <div class="advanced-grid">
                   <label class="field">
                     <span>Header row</span>
@@ -1004,6 +1020,19 @@
                   </label>
                 </div>
               </details>
+              <div id="arrow-options" data-testid="arrow-options" class="advanced" hidden>
+                <div class="advanced-grid">
+                  <label class="field">
+                    <span>IPC container</span>
+                    <select id="arrow-container" data-testid="arrow-container">
+                      <option value="auto">Auto-detect File or Stream</option>
+                      <option value="file">Arrow IPC File</option>
+                      <option value="stream">Arrow IPC Stream</option>
+                    </select>
+                    <span class="helper">Choose explicitly only when a malformed source needs a diagnostic boundary.</span>
+                  </label>
+                </div>
+              </div>
             </form>
             <section
               id="operation-panel"
@@ -1015,7 +1044,7 @@
               <div class="state-line">
                 <span class="state-badge" data-testid="state-label">Idle</span>
                 <p id="status" data-testid="status" role="status" aria-live="polite" aria-atomic="true" tabindex="-1">
-                  Choose a local CSV or TSV file, or load the generated sample.
+                  Choose CSV, TSV, or Arrow IPC explicitly, then open a local source or sample.
                 </p>
               </div>
               <div class="source-meta">
@@ -1037,7 +1066,7 @@
                 </svg>
                 <strong id="empty-title" data-testid="empty-title">No table open</strong>
                 <p id="empty-message" data-testid="empty-message">
-                  Choose a local CSV or TSV, or load the generated sample. Nothing is uploaded.
+                  Choose a local CSV, TSV, or Arrow IPC source. Nothing is uploaded.
                 </p>
               </div>
             </section>
@@ -1054,14 +1083,18 @@
           <p class="eyebrow">Prototype boundary</p>
           <h2 id="architecture-title">What is working today.</h2>
           <p>
-            The current release is intentionally pre-alpha and CSV/TSV-only, but the vertical
-            slice already exercises the contracts needed for future adapters.
+            The current release is intentionally pre-alpha. CSV/TSV and Apache Arrow IPC now
+            exercise the same explicit adapter, Worker, typed-batch, and lifecycle boundaries.
           </p>
         </div>
         <ul class="capability-list">
           <li>
             <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m5 12 4 4 10-10" fill="none" stroke="currentColor" stroke-width="2" /></svg>
-            <span><strong>Incremental CSV / TSV parsing</strong><br />BOM, CRLF, quoted fields, malformed-row modes, and structured diagnostics.</span>
+            <span><strong>Explicit CSV / TSV adapter</strong><br />BOM, CRLF, quoted fields, malformed-row modes, and structured diagnostics.</span>
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 5.5h16v13H4zM4 10h16M9 5.5v13M15 5.5v13" fill="none" stroke="currentColor" stroke-width="1.7" /></svg>
+            <span><strong>Apache Arrow IPC adapter</strong><br />File and Stream containers, typed values, nested schema descriptors, dictionary preservation, and deterministic display text.</span>
           </li>
           <li>
             <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m5 12 4 4 10-10" fill="none" stroke="currentColor" stroke-width="2" /></svg>
