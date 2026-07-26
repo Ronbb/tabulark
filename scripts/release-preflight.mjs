@@ -132,11 +132,13 @@ async function assertCratesOwner() {
 }
 
 async function assertSuccessfulWorkflow(name, sha) {
+  const githubToken = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
   const response = await fetch(
     `https://api.github.com/repos/${repository}/actions/runs?head_sha=${sha}&per_page=100`,
     {
       headers: {
         accept: "application/vnd.github+json",
+        ...(githubToken ? { authorization: `Bearer ${githubToken}` } : {}),
         "user-agent": "tabulark-release-preflight",
         "x-github-api-version": "2022-11-28",
       },

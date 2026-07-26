@@ -59,6 +59,7 @@ test("pre-tag checks require a finalized clean candidate and external release fa
     "owners",
     'assertSuccessfulWorkflow("CI", head)',
     'assertSuccessfulWorkflow("GitHub Pages", head)',
+    "GH_TOKEN",
   ]) {
     assert.ok(preflight.includes(required), `preflight must retain ${required}`);
   }
