@@ -236,6 +236,197 @@ fn assert_arrow_fuzz_error(code: ErrorCode) {
     );
 }
 
+/// Exercises bounded sparse Parquet open/read and lifecycle cleanup.
+pub fn exercise_parquet(input: &[u8]) {
+    use tabulark::parquet::{
+        ParquetLimits, ParquetOpenOperation, ParquetOptions, ParquetReadStart, ParquetRuntime,
+        ParquetRuntimeConfig,
+    };
+
+    const MAX_PARQUET_SOURCE_BYTES: usize = 64 * 1024;
+    const MEMORY_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+    let source = &input[..input.len().min(MAX_PARQUET_SOURCE_BYTES)];
+    let limits = ParquetLimits::from_memory_budget(MEMORY_BUDGET_BYTES)
+        .expect("bounded Parquet fuzz limits");
+    let mut open =
+        match ParquetOpenOperation::new(source.len() as u64, ParquetOptions::default(), limits) {
+            Ok(open) => open,
+            Err(error) => return assert_format_fuzz_error(error.code()),
+        };
+    let opened = loop {
+        let Some(action) = open.next_action() else {
+            panic!("pending Parquet open has no byte action");
+        };
+        let start = usize::try_from(action.offset).expect("bounded Parquet offset");
+        let length = usize::try_from(action.length).expect("bounded Parquet length");
+        let Some(end) = start.checked_add(length) else {
+            panic!("bounded Parquet range overflowed");
+        };
+        assert!(end <= source.len());
+        match open.feed_owned(
+            action.offset,
+            source[start..end].to_vec(),
+            end == source.len(),
+        ) {
+            Ok(Some(opened)) => break opened,
+            Ok(None) => {}
+            Err(error) => return assert_format_fuzz_error(error.code()),
+        }
+    };
+
+    let mut runtime = ParquetRuntime::new(ParquetRuntimeConfig {
+        memory_budget_bytes: MEMORY_BUDGET_BYTES,
+        max_sources: 2,
+    })
+    .expect("bounded Parquet fuzz runtime");
+    let source_handle = match runtime.open_source(opened) {
+        Ok(handle) => handle,
+        Err(error) => return assert_format_fuzz_error(error.code()),
+    };
+    let table = runtime
+        .open_table(source_handle, "table-0")
+        .expect("valid Parquet source exposes table-0");
+    let metadata = runtime.metadata(table).expect("Parquet metadata");
+    let rows = metadata.extent().rows().value().unwrap_or(0);
+    let columns = metadata.extent().columns().value().unwrap_or(0);
+    if columns > 0 {
+        let row_count = rows.min(4);
+        let column_count = columns.min(4);
+        let request =
+            RangeRequest::new(0, row_count, 0, column_count).expect("bounded Parquet fuzz range");
+        match runtime.begin_read(table, request) {
+            Ok(ParquetReadStart::Complete(batch)) => {
+                assert!(batch.range().row_count() <= row_count);
+                assert_eq!(batch.range().column_count(), column_count);
+            }
+            Ok(ParquetReadStart::Pending(mut read)) => {
+                for _ in 0..4_096 {
+                    let Some(action) = read.next_action() else {
+                        panic!("pending Parquet read has no byte action");
+                    };
+                    let start = usize::try_from(action.offset).expect("bounded read offset");
+                    let length = usize::try_from(action.length).expect("bounded read length");
+                    let end = start.checked_add(length).expect("bounded read range");
+                    assert!(end <= source.len());
+                    match read.feed_owned(
+                        action.offset,
+                        source[start..end].to_vec(),
+                        end == source.len(),
+                    ) {
+                        Ok(Some(batch)) => {
+                            assert!(batch.range().row_count() <= row_count);
+                            assert_eq!(batch.range().column_count(), column_count);
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            assert_format_fuzz_error(error.code());
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(error) => assert_format_fuzz_error(error.code()),
+        }
+    }
+    assert!(runtime.close_table(table));
+    assert!(!runtime.close_table(table));
+    assert!(runtime.close_source(source_handle));
+    assert!(!runtime.close_source(source_handle));
+    assert_eq!(runtime.source_count(), 0);
+    assert_eq!(runtime.table_count(), 0);
+    runtime.shutdown();
+}
+
+/// Exercises bounded XLS/XLSX recognition, worksheet reads, and cleanup.
+pub fn exercise_excel(input: &[u8]) {
+    use tabulark_excel::{ExcelLimits, ExcelOptions, ExcelRuntime, ExcelRuntimeConfig};
+
+    const MAX_EXCEL_SOURCE_BYTES: usize = 64 * 1024;
+    const MEMORY_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+    let source = &input[..input.len().min(MAX_EXCEL_SOURCE_BYTES)];
+    let mut runtime = ExcelRuntime::new(ExcelRuntimeConfig {
+        memory_budget_bytes: MEMORY_BUDGET_BYTES,
+        max_sources: 2,
+        limits: ExcelLimits {
+            max_source_bytes: MAX_EXCEL_SOURCE_BYTES,
+            max_zip_entries: 512,
+            max_zip_entry_bytes: 1024 * 1024,
+            max_zip_uncompressed_bytes: 2 * 1024 * 1024,
+            max_cfb_entries: 512,
+            max_cfb_stream_bytes: 2 * 1024 * 1024,
+            max_worksheets: 64,
+            max_worksheet_rows: 65_536,
+            max_worksheet_columns: 1_024,
+            max_worksheet_cells: 65_536,
+            max_range_cells: 256,
+            max_batch_bytes: 512 * 1024,
+            max_warnings: 64,
+            max_styles: 4_096,
+            max_merged_cells: 4_096,
+            max_layout_entries: 4_096,
+            max_styled_cells: 65_536,
+        },
+    })
+    .expect("bounded Excel fuzz runtime");
+    let source_handle = match runtime.open_source(source.to_vec(), ExcelOptions::default()) {
+        Ok(handle) => handle,
+        Err(error) => {
+            assert_format_fuzz_error(error.code());
+            assert_eq!(runtime.source_count(), 0);
+            assert_eq!(runtime.retained_bytes(), 0);
+            return;
+        }
+    };
+    let first_table = runtime
+        .list_tables(source_handle)
+        .expect("valid Excel source tables")
+        .first()
+        .map(|table| table.id().to_owned());
+    if let Some(table_id) = first_table {
+        match runtime.open_table(source_handle, &table_id) {
+            Ok(opened) => {
+                let rows = opened.metadata.extent().rows().value().unwrap_or(0);
+                let columns = opened.metadata.extent().columns().value().unwrap_or(0);
+                if columns > 0 {
+                    let request = RangeRequest::new(0, rows.min(4), 0, columns.min(4))
+                        .expect("bounded Excel fuzz range");
+                    match runtime.read_range(opened.table_handle, request) {
+                        Ok(batch) => {
+                            assert!(batch.range().row_count() <= rows.min(4));
+                            assert!(batch.range().column_count() <= columns.min(4));
+                        }
+                        Err(error) => assert_format_fuzz_error(error.code()),
+                    }
+                }
+                assert!(runtime.close_table(opened.table_handle));
+                assert!(!runtime.close_table(opened.table_handle));
+            }
+            Err(error) => assert_format_fuzz_error(error.code()),
+        }
+    }
+    assert!(runtime.close_source(source_handle));
+    assert!(!runtime.close_source(source_handle));
+    assert_eq!(runtime.source_count(), 0);
+    assert_eq!(runtime.table_count(), 0);
+    assert_eq!(runtime.retained_bytes(), 0);
+    runtime.shutdown();
+}
+
+fn assert_format_fuzz_error(code: ErrorCode) {
+    assert!(
+        matches!(
+            code,
+            ErrorCode::ParseFailed
+                | ErrorCode::UnsupportedFeature
+                | ErrorCode::ResourceLimit
+                | ErrorCode::InvalidRange
+                | ErrorCode::InvalidArgument
+        ),
+        "bounded format lifecycle returned unexpected {code:?}"
+    );
+}
+
 #[derive(Clone, Copy)]
 struct Controls {
     scan_salt: usize,

@@ -60,6 +60,32 @@ export interface VisibleColumn {
   /** Viewport-relative left edge in CSS pixels. */
   readonly x: number;
   readonly width: number;
+  /** True when the column is pinned at the workbook's frozen boundary. */
+  readonly frozen: boolean;
+}
+
+export interface VisibleRow {
+  readonly index: number;
+  /** Viewport-relative top edge in CSS pixels. */
+  readonly y: number;
+  readonly height: number;
+  /** True when the row is pinned at the workbook's frozen boundary. */
+  readonly frozen: boolean;
+}
+
+export interface SparseAxisOverride {
+  readonly index: number;
+  readonly size: number;
+  /** Cumulative size delta through and including this override. */
+  readonly cumulativeDelta: number;
+}
+
+/** Compact geometry for a potentially million-row spreadsheet axis. */
+export interface SparseAxisGeometry {
+  readonly count: number;
+  readonly defaultSize: number;
+  readonly contentSize: number;
+  readonly overrides: readonly Readonly<SparseAxisOverride>[];
 }
 
 export interface TableLayout {
@@ -83,6 +109,18 @@ export interface TableLayout {
   }>;
   readonly visibleColumns: readonly Readonly<VisibleColumn>[];
   readonly overscanColumns: readonly Readonly<VisibleColumn>[];
+  readonly visibleRows: readonly Readonly<VisibleRow>[];
+  readonly overscanRows: readonly Readonly<VisibleRow>[];
+  /** Effective widths use zero for workbook-hidden columns. */
+  readonly effectiveColumnWidths: readonly number[];
+  readonly rowGeometry: Readonly<SparseAxisGeometry>;
+  readonly frozenRowCount: number;
+  readonly frozenColumnCount: number;
+  readonly frozenRowExtent: number;
+  readonly frozenColumnExtent: number;
+  /** Frozen segments are loaded separately when the scroll window is distant. */
+  readonly frozenRowRange: Readonly<IndexRange>;
+  readonly frozenColumnRange: Readonly<IndexRange>;
   readonly horizontal: Readonly<ScrollAxisLayout>;
   readonly vertical: Readonly<ScrollAxisLayout>;
   /** Spacer dimensions for a native scroll host, including sticky headers. */

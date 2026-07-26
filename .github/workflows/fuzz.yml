@@ -25,6 +25,10 @@ jobs:
             label: CSV
           - target: arrow_lifecycle
             label: Arrow IPC
+          - target: parquet_lifecycle
+            label: Parquet
+          - target: excel_lifecycle
+            label: Excel
     env:
       CARGO_FUZZ_VERSION: "0.12.0"
       FUZZ_TIME_SECONDS: "600"

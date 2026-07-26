@@ -1,5 +1,12 @@
 import type { TableHandle } from "../client.js";
-import { invalidArgument } from "../errors.js";
+import type {
+  MergedCellRegion,
+  PresentationRange,
+  PresentationStyle,
+  RangeRequest,
+  SpreadsheetPresentation,
+} from "../model.js";
+import { TabularkError, invalidArgument } from "../errors.js";
 import { containsCell } from "./selection.js";
 import { AccessibleViewportGrid, type AccessibleGridRow } from "./accessible-grid.js";
 import {
@@ -7,6 +14,7 @@ import {
   DEFAULT_CANVAS_TABLE_THEME,
   forcedColorsCanvasTableTheme,
   type CanvasPaintColumn,
+  type CanvasPaintMergedCell,
   type CanvasPaintRow,
   type CanvasTableTheme,
 } from "./canvas-painter.js";
@@ -23,6 +31,7 @@ const RESIZE_TARGET_SIZE = 44;
 const KEYBOARD_RESIZE_STEP = 8;
 const KEYBOARD_RESIZE_COARSE_STEP = 32;
 const AUTOSIZE_HORIZONTAL_PADDING = 24;
+const MAX_PRESENTATION_WINDOW_CELLS = 100_000;
 
 let nextViewId = 1;
 
@@ -33,6 +42,11 @@ export interface CanvasTableViewOptions {
   /** Provide either a controller or a table, never both. */
   readonly controller?: TableViewController;
   readonly controllerOptions?: TableControllerOptions;
+  /**
+   * Applies static spreadsheet sizing metadata when a TableHandle provides it.
+   * Workbook colors never override the system palette in forced-colors mode.
+   */
+  readonly presentation?: "auto" | "ignore";
   readonly ariaLabel?: string;
   readonly theme?: Partial<CanvasTableTheme>;
   readonly maxDevicePixelRatio?: number;
@@ -81,6 +95,7 @@ class View implements CanvasTableView {
   readonly #writeClipboard: ((text: string) => Promise<void> | void) | undefined;
   readonly #onError: ((error: unknown) => void) | undefined;
   readonly #baseTheme: Readonly<CanvasTableTheme>;
+  readonly #presentationTable: TableHandle | undefined;
   #theme: Readonly<CanvasTableTheme>;
   readonly #forcedColorsQuery: MediaQueryList;
   readonly #unsubscribe: () => void;
@@ -93,6 +108,11 @@ class View implements CanvasTableView {
   #copyAbort: AbortController | null = null;
   #announcementFrame = 0;
   #forcedColors = false;
+  #presentation: SpreadsheetPresentation | null = null;
+  #presentationRanges: readonly PresentationRange[] = [];
+  #mergedCells: readonly MergedCellRegion[] = [];
+  #presentationRequestKey = "";
+  #presentationAbort: AbortController | null = null;
   #destroyed = false;
 
   constructor(options: CanvasTableViewOptions) {
@@ -102,12 +122,17 @@ class View implements CanvasTableView {
       throw invalidArgument("container must belong to an active browser document");
     }
     this.#ownerWindow = ownerWindow;
+    const presentation = options.presentation ?? "auto";
+    if (presentation !== "auto" && presentation !== "ignore") {
+      throw invalidArgument("presentation must be auto or ignore");
+    }
     this.#ownsController = options.table !== undefined;
     this.controller = options.controller
       ?? createTableController(options.table!, options.controllerOptions);
     this.#snapshot = this.controller.getSnapshot();
     this.#writeClipboard = options.writeClipboard;
     this.#onError = options.onError;
+    this.#presentationTable = presentation === "auto" ? options.table : undefined;
     this.#baseTheme = Object.freeze({ ...DEFAULT_CANVAS_TABLE_THEME, ...options.theme });
     this.#forcedColorsQuery = ownerWindow.matchMedia("(forced-colors: active)");
     this.#forcedColors = this.#forcedColorsQuery.matches;
@@ -248,6 +273,7 @@ class View implements CanvasTableView {
         this.#copyAbort?.abort();
         this.#copyAbort = null;
       }
+      this.#schedulePresentationRanges();
       this.#scheduleFrame();
     });
     this.#scrollHost.addEventListener("scroll", this.#onScroll, { passive: true });
@@ -270,6 +296,9 @@ class View implements CanvasTableView {
 
     this.#updateViewport();
     this.#scheduleFrame();
+    if (this.#presentationTable !== undefined) {
+      void this.#applyPresentation(this.#presentationTable);
+    }
   }
 
   focus(options?: FocusOptions): void {
@@ -282,6 +311,8 @@ class View implements CanvasTableView {
       return;
     }
     this.#destroyed = true;
+    this.#presentationAbort?.abort();
+    this.#presentationAbort = null;
     this.#copyAbort?.abort();
     this.#copyAbort = null;
     if (this.#frame !== 0) {
@@ -581,6 +612,103 @@ class View implements CanvasTableView {
     });
   }
 
+  async #applyPresentation(table: TableHandle): Promise<void> {
+    try {
+      const presentation = await table.getPresentation();
+      if (this.#destroyed || presentation === null) {
+        return;
+      }
+      this.#presentation = presentation;
+      this.#applySpreadsheetPresentation(presentation);
+    } catch (error) {
+      // Presentation is an enhancement over the logical table contract. A
+      // malformed or unavailable layout must not make the table inaccessible.
+      if (!this.#destroyed) {
+        this.#onError?.(error);
+      }
+    }
+  }
+
+  #applySpreadsheetPresentation(presentation: SpreadsheetPresentation): void {
+    this.element.dataset.tabularkPresentation = presentation.kind;
+    this.element.dataset.tabularkWorksheetVisibility = presentation.visibility;
+    this.element.dataset.tabularkFrozenRows = String(presentation.frozenRows);
+    this.element.dataset.tabularkFrozenColumns = String(presentation.frozenColumns);
+
+    this.controller.applySpreadsheetPresentation(presentation);
+    this.#schedulePresentationRanges();
+    this.#scheduleFrame();
+  }
+
+  #schedulePresentationRanges(): void {
+    const table = this.#presentationTable;
+    const presentation = this.#presentation;
+    if (this.#destroyed || table === undefined || presentation === null) return;
+    const requests = presentationRequests(this.#snapshot.layout);
+    const key = `${presentation.tableId}:${presentation.revision}:${requests.map(rangeKey).join("|")}`;
+    if (key === this.#presentationRequestKey) return;
+    this.#presentationRequestKey = key;
+    this.#presentationAbort?.abort();
+    this.#presentationAbort = null;
+    if (requests.length === 0) {
+      this.#presentationRanges = [];
+      this.#mergedCells = [];
+      this.controller.setMergedCells([]);
+      this.#scheduleFrame();
+      return;
+    }
+    const abort = new AbortController();
+    this.#presentationAbort = abort;
+    void (async () => {
+      const viewportRanges = await Promise.all(requests.map((request) => (
+        table.readPresentationRange(request, { signal: abort.signal })
+      )));
+      const currentRanges = viewportRanges.filter(
+        (range): range is PresentationRange => range !== null
+          && range.revision === presentation.revision,
+      );
+      const anchorRequests = missingMergeAnchorRequests(
+        collectMergedRegions(currentRanges),
+        currentRanges,
+      );
+      const anchorRanges = await Promise.all(anchorRequests.map((request) => (
+        table.readPresentationRange(request, { signal: abort.signal })
+      )));
+      return [...viewportRanges, ...anchorRanges];
+    })().then((ranges) => {
+      if (
+        this.#destroyed
+        || abort.signal.aborted
+        || this.#presentationAbort !== abort
+        || this.#presentationRequestKey !== key
+      ) {
+        return;
+      }
+      this.#presentationAbort = null;
+      this.#presentationRanges = Object.freeze(ranges.filter(
+        (range): range is PresentationRange => range !== null
+          && range.revision === presentation.revision,
+      ));
+      this.#mergedCells = collectMergedRegions(this.#presentationRanges);
+      this.controller.setMergedCells(this.#mergedCells);
+      this.#scheduleFrame();
+    }).catch((error) => {
+      if (this.#presentationAbort === abort) this.#presentationAbort = null;
+      if (
+        this.#destroyed
+        || abort.signal.aborted
+        || (error instanceof TabularkError && error.code === "CANCELLED")
+      ) {
+        return;
+      }
+      this.#onError?.(error);
+    });
+  }
+
+  #mergedRegions(): readonly MergedCellRegion[] {
+    return this.#mergedCells;
+  }
+
   #render(): void {
     if (this.#destroyed) {
       return;
@@ -598,8 +726,10 @@ class View implements CanvasTableView {
       name: column.name,
       x: column.x,
       width: column.width,
+      frozen: column.frozen,
     }));
     const rows = this.#paintRows(snapshot, columns);
+    const mergedCells = this.#paintMergedCells();
     this.#painter.paint({
       width: layout.width,
       height: layout.height,
@@ -607,6 +737,7 @@ class View implements CanvasTableView {
       rowGutterWidth: layout.rowHeaderWidth,
       columns,
       rows,
+      mergedCells,
       ...(snapshot.selection === null ? {} : { selection: snapshot.selection.range }),
       ...(snapshot.activeCell === null
         ? {}
@@ -629,21 +760,100 @@ class View implements CanvasTableView {
   ): readonly CanvasPaintRow[] {
     const layout = snapshot.layout;
     const rows: CanvasPaintRow[] = [];
-    for (let rowIndex = layout.rows.overscan.start; rowIndex < layout.rows.overscan.end; rowIndex += 1) {
+    for (const row of layout.overscanRows) {
+      const rowIndex = row.index;
       rows.push({
         index: rowIndex,
-        y: layout.headerHeight + rowIndex * layout.rowHeight - layout.vertical.logicalOffset,
-        height: layout.rowHeight,
+        y: row.y,
+        height: row.height,
+        frozen: row.frozen,
         cells: columns.map((column) => {
           const cell = this.controller.getCell(rowIndex, column.index);
           return {
             columnIndex: column.index,
             value: cell.status === "loaded" ? cell.value : undefined,
+            ...(this.#styleAt(rowIndex, column.index) === undefined
+              ? {}
+              : { style: this.#styleAt(rowIndex, column.index)! }),
+            ...(this.#mergeContaining(rowIndex, column.index) === undefined
+              ? {}
+              : { coveredByMerge: true }),
           };
         }),
       });
     }
     return rows;
+  }
+
+  #paintMergedCells(): readonly CanvasPaintMergedCell[] {
+    const result: CanvasPaintMergedCell[] = [];
+    const layout = this.#snapshot.layout;
+    for (const region of this.#mergedRegions()) {
+      const cell = this.controller.getCell(region.rowStart, region.columnStart);
+      const style = this.#styleAt(region.rowStart, region.columnStart);
+      for (const fragment of splitMergedRegion(
+        region,
+        layout.frozenRowCount,
+        layout.frozenColumnCount,
+      )) {
+        const first = this.controller.cellRect({
+          rowIndex: fragment.rowStart,
+          columnIndex: fragment.columnStart,
+        });
+        const last = this.controller.cellRect({
+          rowIndex: fragment.rowEnd - 1,
+          columnIndex: fragment.columnEnd - 1,
+        });
+        const clip = mergePaneClip(layout, fragment);
+        const x = Math.max(first.x, clip.left);
+        const y = Math.max(first.y, clip.top);
+        const right = Math.min(last.x + last.width, clip.right);
+        const bottom = Math.min(last.y + last.height, clip.bottom);
+        if (right <= x || bottom <= y) continue;
+        result.push(Object.freeze({
+          region,
+          x,
+          y,
+          width: right - x,
+          height: bottom - y,
+          value: cell.status === "loaded" ? cell.value : undefined,
+          ...(style === undefined ? {} : { style }),
+          ...(fragment.rowStart === region.rowStart
+            && fragment.columnStart === region.columnStart
+            ? {}
+            : { continuation: true }),
+        }));
+      }
+    }
+    return Object.freeze(result);
+  }
+
+  #styleAt(rowIndex: number, columnIndex: number): PresentationStyle | undefined {
+    const presentation = this.#presentation;
+    if (presentation === null) return undefined;
+    for (const window of this.#presentationRanges) {
+      const range = window.range;
+      if (
+        rowIndex < range.rowStart
+        || rowIndex >= range.rowStart + range.rowCount
+        || columnIndex < range.columnStart
+        || columnIndex >= range.columnStart + range.columnCount
+      ) {
+        continue;
+      }
+      const id = window.styleIds[rowIndex - range.rowStart]?.[columnIndex - range.columnStart];
+      return id === null || id === undefined ? undefined : presentation.styles[id];
+    }
+    return undefined;
+  }
+
+  #mergeContaining(rowIndex: number, columnIndex: number): MergedCellRegion | undefined {
+    return this.#mergedRegions().find((region) => (
+      rowIndex >= region.rowStart
+      && rowIndex < region.rowEnd
+      && columnIndex >= region.columnStart
+      && columnIndex < region.columnEnd
+    ));
   }
 
   #renderResizeHandles(snapshot: Readonly<TableViewSnapshot>): void {
@@ -730,27 +940,63 @@ class View implements CanvasTableView {
 
   #renderAccessibleGrid(snapshot: Readonly<TableViewSnapshot>): void {
     const layout = snapshot.layout;
-    const columns = layout.visibleColumns.map((column) => ({
-      index: column.index,
-      name: column.name,
-    }));
+    const visibleRowIndexes = new Set(layout.visibleRows.map((row) => row.index));
+    const visibleColumnIndexes = new Set(layout.visibleColumns.map((column) => column.index));
+    const accessibleMerges = this.#mergedRegions().filter((region) => (
+      layout.visibleRows.some((row) => row.index >= region.rowStart && row.index < region.rowEnd)
+      && layout.visibleColumns.some(
+        (column) => column.index >= region.columnStart && column.index < region.columnEnd,
+      )
+    ));
+    const columnIndexes = new Set(visibleColumnIndexes);
+    const rowIndexes = new Set(visibleRowIndexes);
+    for (const merge of accessibleMerges) {
+      columnIndexes.add(merge.columnStart);
+      rowIndexes.add(merge.rowStart);
+    }
+    const columns = [...columnIndexes]
+      .sort((left, right) => left - right)
+      .map((index) => ({
+        index,
+        name: snapshot.metadata.schema.columns[index]?.name ?? `Column ${index + 1}`,
+      }));
     const rows: AccessibleGridRow[] = [];
-    for (let rowIndex = layout.rows.visible.start; rowIndex < layout.rows.visible.end; rowIndex += 1) {
+    for (const rowIndex of [...rowIndexes].sort((left, right) => left - right)) {
+      const candidateColumns = new Set<number>();
+      if (visibleRowIndexes.has(rowIndex)) {
+        for (const columnIndex of visibleColumnIndexes) candidateColumns.add(columnIndex);
+      }
+      for (const merge of accessibleMerges) {
+        if (merge.rowStart === rowIndex) candidateColumns.add(merge.columnStart);
+      }
       rows.push({
         index: rowIndex,
-        cells: columns.map((column) => {
-          const cell = this.controller.getCell(rowIndex, column.index);
-          return {
+        cells: [...candidateColumns]
+          .sort((left, right) => left - right)
+          .flatMap((columnIndex) => {
+          const merge = this.#mergeContaining(rowIndex, columnIndex);
+          if (
+            merge !== undefined
+            && (rowIndex !== merge.rowStart || columnIndex !== merge.columnStart)
+          ) {
+            return [];
+          }
+          const cell = this.controller.getCell(rowIndex, columnIndex);
+          return [{
             rowIndex,
-            columnIndex: column.index,
+            columnIndex,
             value: cell.status === "loaded" ? cell.value : undefined,
             selected: snapshot.selection !== null && containsCell(
               snapshot.selection.range,
-              { rowIndex, columnIndex: column.index },
+              { rowIndex, columnIndex },
             ),
             active: snapshot.activeCell?.rowIndex === rowIndex
-              && snapshot.activeCell.columnIndex === column.index,
-          };
+              && snapshot.activeCell.columnIndex === columnIndex,
+            ...(merge === undefined ? {} : {
+              rowSpan: merge.rowEnd - merge.rowStart,
+              columnSpan: merge.columnEnd - merge.columnStart,
+            }),
+          }];
         }),
       });
     }
@@ -983,6 +1229,152 @@ class View implements CanvasTableView {
       throw new Error("Canvas table view is destroyed");
     }
   }
+}
+
+function splitMergedRegion(
+  region: MergedCellRegion,
+  frozenRowCount: number,
+  frozenColumnCount: number,
+): readonly Readonly<MergedCellRegion>[] {
+  const rows = splitIndexRange(region.rowStart, region.rowEnd, frozenRowCount);
+  const columns = splitIndexRange(region.columnStart, region.columnEnd, frozenColumnCount);
+  return Object.freeze(rows.flatMap((row) => columns.map((column) => Object.freeze({
+    rowStart: row.start,
+    rowEnd: row.end,
+    columnStart: column.start,
+    columnEnd: column.end,
+  }))));
+}
+
+function splitIndexRange(
+  start: number,
+  end: number,
+  boundary: number,
+): readonly Readonly<{ start: number; end: number }>[] {
+  if (boundary <= start || boundary >= end) {
+    return Object.freeze([Object.freeze({ start, end })]);
+  }
+  return Object.freeze([
+    Object.freeze({ start, end: boundary }),
+    Object.freeze({ start: boundary, end }),
+  ]);
+}
+
+function mergePaneClip(
+  layout: Readonly<TableViewSnapshot>["layout"],
+  fragment: MergedCellRegion,
+): Readonly<{ left: number; top: number; right: number; bottom: number }> {
+  const frozenRight = layout.rowHeaderWidth
+    + Math.min(layout.bodyWidth, layout.frozenColumnExtent);
+  const frozenBottom = layout.headerHeight
+    + Math.min(layout.bodyHeight, layout.frozenRowExtent);
+  const frozenColumn = fragment.columnStart < layout.frozenColumnCount;
+  const frozenRow = fragment.rowStart < layout.frozenRowCount;
+  return Object.freeze({
+    left: frozenColumn ? layout.rowHeaderWidth : frozenRight,
+    right: frozenColumn ? frozenRight : layout.rowHeaderWidth + layout.bodyWidth,
+    top: frozenRow ? layout.headerHeight : frozenBottom,
+    bottom: frozenRow ? frozenBottom : layout.headerHeight + layout.bodyHeight,
+  });
+}
+
+function presentationRequests(
+  layout: Readonly<TableViewSnapshot>["layout"],
+): readonly Readonly<RangeRequest>[] {
+  const overscan = presentationRectangles(
+    layout.rows.overscan,
+    layout.columns.overscan,
+    layout.frozenRowRange,
+    layout.frozenColumnRange,
+  );
+  const overscanCells = overscan.reduce(
+    (total, range) => total + range.rowCount * range.columnCount,
+    0,
+  );
+  if (overscanCells <= MAX_PRESENTATION_WINDOW_CELLS) return overscan;
+  return presentationRectangles(
+    layout.rows.visible,
+    layout.columns.visible,
+    layout.frozenRowRange,
+    layout.frozenColumnRange,
+  );
+}
+
+function presentationRectangles(
+  rows: Readonly<{ start: number; end: number }>,
+  columns: Readonly<{ start: number; end: number }>,
+  frozenRows: Readonly<{ start: number; end: number }>,
+  frozenColumns: Readonly<{ start: number; end: number }>,
+): readonly Readonly<RangeRequest>[] {
+  const requests: RangeRequest[] = [];
+  for (const row of presentationBands(rows, frozenRows)) {
+    for (const column of presentationBands(columns, frozenColumns)) {
+      requests.push(Object.freeze({
+        rowStart: row.start,
+        rowCount: row.end - row.start,
+        columnStart: column.start,
+        columnCount: column.end - column.start,
+      }));
+    }
+  }
+  return Object.freeze(requests);
+}
+
+function presentationBands(
+  primary: Readonly<{ start: number; end: number }>,
+  frozen: Readonly<{ start: number; end: number }>,
+): readonly Readonly<{ start: number; end: number }>[] {
+  const bands = [primary, frozen]
+    .filter((range) => range.start < range.end)
+    .sort((left, right) => left.start - right.start);
+  if (bands.length < 2) return Object.freeze(bands.map((range) => Object.freeze({ ...range })));
+  const first = bands[0]!;
+  const second = bands[1]!;
+  return first.end >= second.start
+    ? Object.freeze([Object.freeze({ start: first.start, end: Math.max(first.end, second.end) })])
+    : Object.freeze(bands.map((range) => Object.freeze({ ...range })));
+}
+
+function rangeKey(range: RangeRequest): string {
+  return `${range.rowStart}:${range.rowCount}:${range.columnStart}:${range.columnCount}`;
+}
+
+function mergeKey(region: MergedCellRegion): string {
+  return `${region.rowStart}:${region.rowEnd}:${region.columnStart}:${region.columnEnd}`;
+}
+
+function collectMergedRegions(
+  ranges: readonly PresentationRange[],
+): readonly MergedCellRegion[] {
+  const unique = new Map<string, MergedCellRegion>();
+  for (const window of ranges) {
+    for (const region of window.mergedCells) unique.set(mergeKey(region), region);
+  }
+  return Object.freeze([...unique.values()]);
+}
+
+function missingMergeAnchorRequests(
+  regions: readonly MergedCellRegion[],
+  ranges: readonly PresentationRange[],
+): readonly Readonly<RangeRequest>[] {
+  const requests = new Map<string, Readonly<RangeRequest>>();
+  for (const region of regions) {
+    const anchorLoaded = ranges.some((window) => (
+      region.rowStart >= window.range.rowStart
+      && region.rowStart < window.range.rowStart + window.range.rowCount
+      && region.columnStart >= window.range.columnStart
+      && region.columnStart < window.range.columnStart + window.range.columnCount
+    ));
+    if (anchorLoaded) continue;
+    const request = Object.freeze({
+      rowStart: region.rowStart,
+      rowCount: 1,
+      columnStart: region.columnStart,
+      columnCount: 1,
+    });
+    requests.set(`${region.rowStart}:${region.columnStart}`, request);
+  }
+  return Object.freeze([...requests.values()]);
 }
 
 /** Mounts an accessible, viewport-driven Canvas preview. */

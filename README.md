@@ -1,66 +1,66 @@
 # Tabulark
 
-> **Status: pre-alpha M4 candidate.** Tabulark has an explicit built-in
-> adapter boundary for local CSV/TSV and Apache Arrow IPC. The source and local
-> test suite implement the M4 contract, but M4 must not be called complete
-> until CI, GitHub Pages deployment, and the deployed-URL smoke test have run
-> successfully for the candidate revision.
+> **Status: M4 complete; 0.1.0 release candidate in progress.** The M4
+> CSV/TSV and Apache Arrow IPC milestone completed at `1d79837`, including CI,
+> GitHub Pages, and a deployed-URL smoke. The package has not yet been published
+> as 0.1.0; see the [M4 completion record](docs/m4-completion.md) and the
+> [release policy](docs/releasing.md).
 
 Tabulark is a WebAssembly-first browser primitive for previewing local tabular
-data without uploading it. A module Worker owns parsing, byte access, adapter
-state, cancellation, and cleanup; a Canvas viewport renders visible cells; a
-bounded semantic grid supplies keyboard and screen-reader access.
+data without uploading it. A module Worker owns parsing, bounded byte access,
+adapter state, cancellation, and cleanup. A Canvas viewport renders visible
+cells while a bounded semantic grid supplies keyboard and screen-reader access.
 
-[Try the playground](https://ronbb.github.io/tabulark/) · [Architecture](docs/architecture.md) · [M4 migration](docs/m4-migration.md) · [Testing](docs/testing.md)
+[Try the playground](https://ronbb.github.io/tabulark/) · [Architecture](docs/architecture.md) · [API stability](docs/api-stability.md) · [Testing](docs/testing.md)
 
-## What the M4 candidate contains
+## Supported local formats
 
-- Explicit, immutable registration of the built-in CSV/TSV and Arrow IPC
-  adapters.
-- Separate lazily loaded WebAssembly artifacts. Creating an engine loads no
-  WASM; opening CSV/TSV does not fetch Arrow; concurrent first opens share one
-  artifact load.
-- Apache Arrow IPC File and Stream decoding through Rust/WASM, including
-  uncompressed, LZ4, and Zstd IPC payloads.
-- A recursive Arrow schema and a generic typed-buffer batch layout shared by
-  both adapters.
-- Native values for programmatic consumers and stable display strings for the
-  Canvas viewport, ARIA grid, sizing, and TSV copy.
-- Static GitHub Pages packaging, a pinned Arrow fixture, source maps,
-  declarations, third-party notices, browser integration coverage, and size
-  gates.
+The 0.1.0 source tree contains four immutable official adapters. Each adapter
+is a separate, lazily loaded WebAssembly artifact; creating an engine loads no
+WASM and opening one format does not fetch unused artifacts.
 
-This is not a spreadsheet, a remote data connector, a generic third-party
-adapter marketplace, or a released compatibility promise.
+| Format | Official ID | Stable entry point | 0.1 contract |
+| --- | --- | --- | --- |
+| CSV/TSV | `tabulark:delimited` | `tabulark` | Explicit delimiter, header, and strict/lenient modes |
+| Arrow IPC | `tabulark:arrow-ipc` | `tabulark/arrow` | File/Stream; none, LZ4, and Zstd IPC compression |
+| Parquet | `tabulark:parquet` | `tabulark/parquet` | Range-driven row-group/column projection and the documented codec set |
+| Excel | `tabulark:excel` | `tabulark/excel` | Excel 97–2003 BIFF8 XLS and OOXML XLSX, including static presentation |
+
+Remote sources, arbitrary adapter/module URLs, public third-party adapters,
+persistent caches, formula calculation, editing, and document-level Excel
+round-tripping are outside 0.1.
 
 ## Install and build
 
-The package has no production npm dependencies. It targets modern Chromium
-browsers and requires Node 20+ to build from source.
+The npm package has no production JavaScript dependencies. It targets modern
+Chromium and requires Node 20 or newer to build from source. Rust 1.85 is the
+minimum supported Rust version.
 
 ```sh
 npm ci
 npm run build
-npm test
+npm run check
 npm run test:browser
 ```
 
-`npm run build` produces the root runtime, the `tabulark/arrow` entry point, a
-generic Worker, and independent Delimited and Arrow WASM artifacts under
+`npm run build` creates five public JavaScript entry points, a generic Worker,
+and independent Delimited, Arrow, Parquet, and Excel WASM artifacts under
 `dist/wasm/`.
 
-## Open a source explicitly
+## Stable JavaScript API
 
-Choose adapters when constructing the engine; the engine’s allow-list is fixed
-for its lifetime. The only accepted source inputs are `File`, `Blob`, and
-`ArrayBuffer`.
+Register only the adapters an engine may use. The allow-list is immutable for
+that engine's lifetime, and the only accepted source inputs are `File`, `Blob`,
+and `ArrayBuffer`.
 
 ```ts
 import { createEngine, delimitedAdapter } from "tabulark";
 import { arrowIpcAdapter } from "tabulark/arrow";
+import { parquetAdapter } from "tabulark/parquet";
+import { excelAdapter } from "tabulark/excel";
 
 const engine = await createEngine({
-  adapters: [delimitedAdapter, arrowIpcAdapter],
+  adapters: [delimitedAdapter, arrowIpcAdapter, parquetAdapter, excelAdapter],
 });
 
 const csv = await engine.open(csvFile, {
@@ -72,33 +72,29 @@ const csv = await engine.open(csvFile, {
   },
 });
 
-const arrow = await engine.open(arrowFile, {
-  adapter: arrowIpcAdapter,
-  adapterOptions: { container: "auto" }, // "auto" | "file" | "stream"
+const parquet = await engine.open(parquetFile, {
+  adapter: parquetAdapter,
+  adapterOptions: { sourceName: parquetFile.name },
+});
+
+const workbook = await engine.open(excelFile, {
+  adapter: excelAdapter,
+  adapterOptions: { format: "auto", sourceName: excelFile.name },
 });
 ```
 
-Adapter selection never comes from a filename or extension. `container: "auto"`
-is resolved by the Rust Arrow adapter from the IPC bytes.
+Adapter selection is explicit. Excel's `format: "auto"` and Arrow's
+`container: "auto"` inspect source bytes; filename extensions never select or
+authenticate a format.
 
-`ArrayBuffer` ownership is retained by default. Use `transferInput: true` only
+`ArrayBuffer` ownership is retained by default. Set `transferInput: true` only
 when intentionally detaching an `ArrayBuffer`; using it with a `Blob` or
-`File` fails with `INVALID_ARGUMENT`.
+`File` returns `INVALID_ARGUMENT`.
+
+### Tables, logical batches, and presentation
 
 ```ts
-const moved = await engine.open(buffer, {
-  adapter: arrowIpcAdapter,
-  transferInput: true,
-});
-```
-
-The former `format`, `wasmModuleUrl`, and `workerUrl` options are removed. See
-[the migration guide](docs/m4-migration.md) for before/after code.
-
-## Read tables and batches
-
-```ts
-const table = await arrow.openTable(arrow.tables[0].id);
+const table = await workbook.openTable(workbook.tables[0].id);
 const batch = await table.readRange({
   rowStart: 0,
   rowCount: 100,
@@ -108,100 +104,155 @@ const batch = await table.readRange({
 
 const nativeRows = batch.toRows();
 const displayRows = batch.toDisplayRows();
+const presentation = await table.getPresentation();
+const visiblePresentation = await table.readPresentationRange(batch.range);
 ```
 
-`ColumnSchema.dataType` is recursive and replaces the old coarse
-`logicalType`. `toRows()` returns native recursive values, including
-`bigint`, `Uint8Array`, decimal, temporal, interval, list, struct, map, and
-union representations. `toDisplayRows()` returns only `(string | null)[][]`.
-The visual renderer, accessible grid, width measurement, and copy path consume
-display rows only.
+The stable `TableBatch` exposes logical data, its returned range, columns, and
+logical accessors. WASM buffer regions, wire descriptors, protocol versions,
+adapter ABI versions, and physical batch layout are private implementation
+details.
 
-The Rust display contract preserves nulls, renders binary as lowercase `0x…`,
-uses `NaN`, `Infinity`, `-Infinity`, and `-0` for special floats, preserves
-decimal scale, uses stable ISO temporal text, and escapes tabs/newlines in
-nested values.
+`toRows()` preserves native values such as `bigint`, `Uint8Array`, decimals,
+temporal values, lists, structs, maps, and unions. `toDisplayRows()` returns
+only `(string | null)[][]` for rendering, accessibility, sizing, and copy.
 
-## Runtime and lifecycle
+Excel tables can return a `spreadsheet-v1` presentation. It includes sheet
+visibility, frozen rows/columns, sparse row and column sizes/hidden state, a
+deduplicated static style table, range-aligned style IDs, and intersecting
+merged cells. Styles cover number formats, fonts, colors, fills, borders, and
+alignment. The high-level Canvas view uses presentation automatically:
 
-The public protocol is version 2, the built-in adapter ABI is version 1, and
-the batch layout is version 1. Protocol v1 is explicitly rejected. A source
-exposes one logical dataset and one or more explicit table handles; callers
-close view, table, dataset, and engine resources deliberately.
+```ts
+const view = createCanvasTableView({
+  container,
+  table,
+  presentation: "auto", // default; use "ignore" for logical data only
+});
+```
+
+Forced-colors mode overrides workbook colors while retaining dimensions,
+merges, alignment, and font emphasis.
+
+Low-level painter, controller, layout, hit-testing, and selection primitives
+live under `tabulark/experimental` and carry no compatibility promise.
+
+## Format behavior
+
+### Parquet
+
+Each file exposes one table. The adapter reads the footer and metadata first,
+then only row groups and top-level projected columns intersecting a request; it
+does not stage the full file. Supported compression is uncompressed, Snappy,
+Gzip, Brotli, LZ4, LZ4_RAW, and Zstd. INT96 becomes a timezone-free nanosecond
+timestamp. LZO, encrypted Parquet, and experimental Variant/Geo types return
+`UNSUPPORTED_FEATURE`.
+
+All promised Parquet codecs in the official WebAssembly adapter use Rust
+implementations. Arrow/Parquet 59.1.0 calls the narrow `zstd` 0.13 bulk API
+directly, so the workspace supplies a Rust 1.85-compatible implementation of
+that API backed by pinned `ruzstd` 0.8.1. The release gate proves the official
+Arrow and Parquet WASM graphs contain neither `zstd-sys` nor `zstd-safe`.
+
+Cargo removes workspace patches when it publishes a crate. Therefore the
+experimental crates.io Rust features deliberately do not enable upstream's
+Zstd feature; Zstd is part of the stable JavaScript/WASM format contract, not
+the experimental Rust API contract. This prevents a crates.io consumer from
+silently receiving a C-backed implementation.
+
+### Excel
+
+Each worksheet becomes a table in workbook order with an ID such as
+`sheet-0`. Hidden and very-hidden worksheets remain addressable and preserve
+visibility. Chart, dialog, and macro sheets are skipped with a warning.
+
+Columns are named A, B, …; the first row is always data; empty cells are null.
+Excel values are display strings (`typedValues=false`). Formula cells use only
+their cached result—Tabulark never executes formulas—and missing cached values
+become null with a warning. Merged cells use the top-left value as their anchor.
+
+XLS support is deliberately limited to BIFF8. Earlier BIFF, XLSM, XLSB, ODS,
+and encrypted workbooks return `UNSUPPORTED_FEATURE`. XLS and XLSX share the
+same bounded static-presentation subset.
+
+## Memory and lifecycle
+
+One engine-wide reservation ledger accounts for adapter runtimes, source
+staging, compressed/decompressed pages, opened worksheets, batches, and caches.
+`RESOURCE_LIMIT` errors identify the resource category and the required and
+available amounts. Excel stages one bounded workbook; Parquet performs bounded
+range reads. ZIP/CFB entry counts, decompressed bytes, worksheet dimensions,
+cells, styles, layout entries, and merged regions are capped before allocation.
+
+Handles are nested and cleanup cascades downward:
+
+```text
+Engine
+  └─ DatasetSession
+       └─ TableHandle
+            └─ TableBatch
+```
+
+Close operations are idempotent. Closing a dataset closes its tables; closing
+an engine closes every dataset. Cancellation and close races settle once, and
+reservations are released on success, failure, cancellation, and close.
 
 ```ts
 view.destroy();
 await table.close();
-await dataset.close();
+await workbook.close();
 await engine.close();
 ```
-
-The Playground follows the same order before switching sources, closes its
-engine on `pagehide`, and creates a new engine after terminal Worker failure.
-
-## Playground and fixtures
-
-`npm run example` builds the static site and serves it locally. The Playground
-offers explicit CSV, TSV, and Arrow IPC modes; delimited-only controls disappear
-for Arrow, and the file picker accepts `.csv`, `.tsv`, `.arrow`, `.arrows`, and
-`.feather`.
-
-The Arrow sample is a committed IPC File fetched as a static asset, not created
-in browser JavaScript. Its SHA-256, generator provenance, and Apache
-cross-language companion fixture are recorded in
-[`test/fixtures/arrow/v1/provenance.json`](test/fixtures/arrow/v1/provenance.json).
 
 ## Verification
 
 ```sh
-# Type, unit, fixture/protocol, and package-consumer checks
+# Rust 1.85/stable, Clippy, all features, lifecycle, fixtures, fuzz seeds
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features --locked
+
+# Stable exports/declarations, clean package consumers, and Pages assembly
 npm run check
 
-# Browser Worker, Canvas, ARIA, forced-colors, mobile, and Arrow checks
+# Real module Worker/WASM, Canvas, ARIA, keyboard, copy, forced-colors, visuals
 npm run test:browser
 
-# Build the static artifact and inspect its delivery contents
-npm run build:pages
-
-# Enforce independent core/Arrow/npm/Pages size budgets
+# Independent core, Arrow, Parquet, Excel, npm, and Pages delivery budgets
 npm run benchmark:size
 
-# Exercise Arrow File/Stream × none/LZ4/Zstd cold-open, range, real-scroll,
-# transfer, and memory baselines against committed multi-batch fixtures
-npm run benchmark:arrow
-
-# M3 CSV canonical performance evidence
-npm run benchmark:canonical
+# Parquet/XLS/XLSX cold-open, range-read, and Chromium memory evidence
+npm run benchmark:formats
 ```
 
-The Pages workflow tests the assembled artifact before upload and then runs a
-CSV/TSV/Arrow/copy/console smoke test against the URL returned by GitHub Pages.
-Until that post-deploy job has succeeded for a revision, deployed-site evidence
-is pending rather than implied by local tests.
+Chromium is the sole formal 0.1.0 browser gate. CI records its exact version.
+The Pages post-deploy smoke opens CSV, Arrow IPC, Parquet, XLS, and XLSX and
+asserts that only used adapter artifacts were requested.
 
-## Boundaries and limits
+## Stability and release
 
-- No public arbitrary JavaScript adapters, module URLs, global adapter registry,
-  remote range provider, `ReadableStream`, Arrow JS table, or C Data Interface.
-- Arrow tensor, sparse tensor, and non-native-endian messages fail with a
-  structured `UNSUPPORTED_FEATURE` error.
-- The runtime enforces a nesting depth of 64, up to 16,384 fields, and at most
-  250,000 cells per range. Other index, decoding, caching, and display limits
-  are derived from the engine memory budget.
-- The M4 candidate remains Chromium-first. Firefox/WebKit support, persistent
-  caches, additional formats, and framework bindings are future work.
+The root, `/arrow`, `/parquet`, and `/excel` entry points are stable for 0.1.x:
+compatible additions are allowed, but removals and breaking changes wait for
+0.2.0. Rust APIs, the Worker protocol, adapter ABI, wire DTOs, and
+`/experimental` remain experimental/private.
+
+No `v0.1.0` tag is created until every release gate and registry/OIDC
+precondition passes. npm and crates.io publishing is serialized behind protected
+GitHub Environments with required reviewer approval. See
+[docs/releasing.md](docs/releasing.md) for the immutable-release and patch
+recovery policy.
 
 ## Repository map
 
 ```text
-src/                         shared Rust model, protocol, and adapters
-crates/tabulark-*-wasm/      thin independently-built WASM entry crates
-js/                          public runtime, Worker, typed batch, and view
-examples/csv-preview/        static Playground controller
-test/fixtures/arrow/         pinned Arrow IPC fixtures and provenance
-test/browser/                browser, accessibility, visual, Pages smoke tests
-test/performance/            CSV and Arrow performance/size harnesses
-docs/                        architecture, testing, milestone, and migration docs
+src/                         shared Rust model, protocol, and native adapters
+crates/tabulark-*-wasm/      four independently built WASM entry crates
+js/                          stable API, private Worker host, batches, and view
+examples/csv-preview/        static six-format Playground
+test/fixtures/               pinned format fixtures and provenance
+test/browser/                Chromium, accessibility, visual, and Pages smoke
+test/performance/            performance and per-artifact delivery budgets
+docs/                        architecture, testing, stability, and release policy
 ```
 
 ## License

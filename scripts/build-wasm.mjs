@@ -1,4 +1,4 @@
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, readFile, rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -6,20 +6,17 @@ const rootUrl = new URL("../", import.meta.url);
 const root = fileURLToPath(rootUrl);
 const wasmOutputRoot = fileURLToPath(new URL("dist/wasm/", rootUrl));
 
-const artifacts = [
-  {
-    packageName: "tabulark-delimited-wasm",
-    wasmName: "tabulark_delimited",
-    outputName: "tabulark_delimited",
-    outputDirectory: "dist/wasm/delimited/",
-  },
-  {
-    packageName: "tabulark-arrow-wasm",
-    wasmName: "tabulark_arrow",
-    outputName: "tabulark_arrow",
-    outputDirectory: "dist/wasm/arrow/",
-  },
-];
+const officialManifest = JSON.parse(await readFile(
+  fileURLToPath(new URL("js/official-adapters.json", rootUrl)),
+  "utf8",
+));
+const artifacts = officialManifest.adapters.map(({ wasm }) => ({
+  packageName: wasm.packageName,
+  wasmName: wasm.crateArtifact,
+  outputName: wasm.outputName,
+  outputDirectory: `${wasm.outputDirectory}/`,
+  runtimeExport: wasm.runtimeExport,
+}));
 
 for (const artifact of artifacts) {
   run("cargo", [
@@ -33,9 +30,9 @@ for (const artifact of artifacts) {
   ]);
 }
 
-// Recreate the complete WASM delivery directory only after every crate builds.
-// This prevents an incremental M3 -> M4 build from silently packaging the
-// retired dist/wasm/tabulark* artifact beside the adapter-specific outputs.
+// Recreate the complete WASM delivery directory only after every manifest
+// crate builds. This prevents an incremental build from silently packaging a
+// retired artifact beside the current adapter-specific outputs.
 await rm(wasmOutputRoot, { force: true, recursive: true });
 await mkdir(wasmOutputRoot, { recursive: true });
 
@@ -55,6 +52,15 @@ for (const artifact of artifacts) {
     "--out-name",
     artifact.outputName,
   ]);
+  const generatedModule = await readFile(fileURLToPath(new URL(
+    `${artifact.outputDirectory}${artifact.outputName}.js`,
+    rootUrl,
+  )), "utf8");
+  if (!generatedModule.includes(`export class ${artifact.runtimeExport}`)) {
+    throw new Error(
+      `${artifact.packageName} does not export manifest runtime ${artifact.runtimeExport}`,
+    );
+  }
 }
 
 function run(command, args) {

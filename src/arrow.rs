@@ -34,7 +34,7 @@ use arrow_select::concat::concat;
 use flatbuffers::{InvalidFlatbuffer, VerifierOptions};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{ErrorCode, Result, TabularkError};
+use crate::error::{ErrorCode, Result, TabularkError, zstd_decompression_limit_error};
 use crate::model::{
     ArrayDescriptor, ArrayLayout, AxisExtent, BatchBuffer, BitmapSlice, BufferSlice, Capabilities,
     ColumnSchema, IntervalUnit, RandomAccess, RangeRequest, Schema, TableDataType, TableExtent,
@@ -2055,6 +2055,68 @@ fn plan_range(
     })
 }
 
+/// Encodes projected Arrow record batches into Tabulark's private typed-buffer
+/// layout while retaining the original top-level schema column identities.
+///
+/// This narrow bridge is shared by Arrow-backed official adapters such as
+/// Parquet. Each input batch must contain exactly the projected columns in the
+/// same order as `source_column_indices`.
+pub fn encode_projected_record_batches(
+    schema: &ArrowSchemaRef,
+    batches: &[RecordBatch],
+    source_column_indices: &[usize],
+    returned_range: RangeRequest,
+    complete: bool,
+    limits: &ArrowIpcLimits,
+) -> Result<TypedTableBatch> {
+    if u64::try_from(source_column_indices.len()).ok() != Some(returned_range.column_count()) {
+        return Err(TabularkError::new(
+            ErrorCode::InvalidArgument,
+            "projected Arrow column count does not match the returned range",
+        ));
+    }
+    let row_count = batches.iter().try_fold(0_usize, |total, batch| {
+        if batch.num_columns() != source_column_indices.len() {
+            return Err(TabularkError::new(
+                ErrorCode::InvalidArgument,
+                "projected Arrow batch column count is inconsistent",
+            ));
+        }
+        total.checked_add(batch.num_rows()).ok_or_else(|| {
+            TabularkError::new(
+                ErrorCode::ResourceLimit,
+                "projected Arrow batch row count overflows",
+            )
+        })
+    })?;
+    if u64::try_from(row_count).ok() != Some(returned_range.row_count()) {
+        return Err(TabularkError::new(
+            ErrorCode::InvalidArgument,
+            "projected Arrow row count does not match the returned range",
+        ));
+    }
+
+    let mut arrays = Vec::with_capacity(source_column_indices.len());
+    for (projected_index, source_index) in source_column_indices.iter().copied().enumerate() {
+        let data_type = schema
+            .fields()
+            .get(source_index)
+            .ok_or_else(|| {
+                TabularkError::new(
+                    ErrorCode::InvalidRange,
+                    "projected Arrow column lies outside the source schema",
+                )
+            })?
+            .data_type();
+        let parts = batches
+            .iter()
+            .map(|batch| batch.column(projected_index).clone())
+            .collect::<Vec<_>>();
+        arrays.push((source_index, normalize_array_parts(parts, data_type)?));
+    }
+    encode_typed_batch(schema, arrays, returned_range, complete, limits)
+}
+
 fn encode_typed_batch(
     schema: &ArrowSchemaRef,
     arrays: Vec<(usize, ArrayRef)>,
@@ -2121,7 +2183,8 @@ fn normalize_array_parts(parts: Vec<ArrayRef>, data_type: &ArrowDataType) -> Res
     concat(&references).map_err(|error| arrow_error("concatenate range", error))
 }
 
-fn exact_metadata(
+/// Builds exact typed table metadata from an Arrow schema.
+pub fn exact_metadata(
     arrow_schema: &ArrowSchemaRef,
     rows: u64,
     table_name: String,
@@ -3850,6 +3913,9 @@ fn flatbuffer_error(stage: &str, error: InvalidFlatbuffer) -> TabularkError {
 
 fn arrow_error(stage: &str, error: ArrowError) -> TabularkError {
     let reason = error.to_string();
+    if let Some(error) = zstd_decompression_limit_error(&reason) {
+        return error;
+    }
     let lowercase = reason.to_ascii_lowercase();
     let code = if lowercase.contains("endianness")
         || lowercase.contains("tensor")
@@ -3924,15 +3990,15 @@ mod tests {
         TensorDim, Type, root_as_footer_with_opts, root_as_message_with_opts,
         writer::IpcWriteOptions,
     };
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit, UnionFields};
+    use arrow_schema::{ArrowError, DataType, Field, Schema as ArrowSchema, TimeUnit, UnionFields};
     use flatbuffers::{FlatBufferBuilder, UnionWIPOffset, WIPOffset};
 
     use super::{
         ARROW_MAGIC, ArrowIpcContainer, ArrowIpcLimits, ArrowIpcOpenOperation, ArrowIpcOptions,
         ArrowIpcRuntime, ArrowIpcSource, ArrowReadStart, ArrowRuntimeConfig, BufferPoolBuilder,
-        ResolvedArrowIpcContainer, compressed_buffer_specs, descriptor_from_array, display_array,
-        encapsulated_message, file_block_spec, flatbuffer_verifier_options, model_data_type,
-        normalize_array_parts, validate_stream_message,
+        ResolvedArrowIpcContainer, arrow_error, compressed_buffer_specs, descriptor_from_array,
+        display_array, encapsulated_message, file_block_spec, flatbuffer_verifier_options,
+        model_data_type, normalize_array_parts, validate_stream_message,
     };
     use crate::error::ErrorCode;
     use crate::model::{ArrayLayout, AxisExtent, RandomAccess, RangeRequest, TableDataType};
@@ -3941,6 +4007,26 @@ mod tests {
     enum TestContainer {
         File,
         Stream,
+    }
+
+    #[test]
+    fn maps_wrapped_zstd_capacity_errors_before_generic_arrow_classification() {
+        let error = arrow_error(
+            "decode IPC record batch",
+            ArrowError::IpcError(
+                "zstd resource limit: output required 65536 available 32768".into(),
+            ),
+        );
+        assert_eq!(error.code(), ErrorCode::ResourceLimit);
+        assert_eq!(error.details()["resource"], "decompression");
+        assert_eq!(error.details()["requiredBytes"], 65_536);
+        assert_eq!(error.details()["availableBytes"], 32_768);
+
+        let malformed = arrow_error(
+            "decode IPC record batch",
+            ArrowError::IpcError("zstd content checksum mismatch".into()),
+        );
+        assert_eq!(malformed.code(), ErrorCode::ParseFailed);
     }
 
     fn fixture_batches() -> Vec<RecordBatch> {

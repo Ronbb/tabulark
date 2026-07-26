@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createEngine, delimitedAdapter } from "../dist/index.js";
+import { createEngine, delimitedAdapter, TabularkError } from "../dist/index.js";
 
 const createTestEngine = () => createEngine({
   adapters: [delimitedAdapter],
@@ -10,6 +10,29 @@ const createTestEngine = () => createEngine({
 const csvOptions = () => ({
   adapter: delimitedAdapter,
   adapterOptions: { dialect: "csv" },
+});
+
+test("RESOURCE_LIMIT details always expose resource and required/available capacity", () => {
+  const countLimit = new TabularkError("RESOURCE_LIMIT", "too many cells", {
+    details: { cells: 11, maxCells: 10 },
+  });
+  assert.deepEqual(countLimit.details, {
+    resource: "range-cells",
+    required: 11,
+    available: 10,
+    cells: 11,
+    maxCells: 10,
+  });
+
+  const byteLimit = new TabularkError("RESOURCE_LIMIT", "field too large", {
+    details: { maxFieldBytes: 1024 },
+  });
+  assert.deepEqual(byteLimit.details, {
+    resource: "field",
+    requiredBytes: 1025,
+    availableBytes: 1024,
+    maxFieldBytes: 1024,
+  });
 });
 
 test("range cache isolates mutable batches and clears closed table entries", async () => {
@@ -29,16 +52,15 @@ test("range cache isolates mutable batches and clears closed table entries", asy
     const range = { rowStart: 0, rowCount: 1, columnStart: 0, columnCount: 1 };
 
     const first = await table.readRange(range);
-    first.buffers[0][0] = "z".charCodeAt(0);
-    first.buffers[1].fill(0);
-    first.buffers[2][0] = 0;
+    assert.equal("buffers" in first, false, "wire buffers stay private");
+    const callerRows = first.toRows();
+    callerRows[0][0] = "z";
 
     const second = await table.readRange(range);
     assert.equal(worker.readRangeCount, 1, "the second read should be served by the client cache");
     assert.deepEqual(second.toRows(), [["a"]]);
-    assert.notEqual(second.buffers[0], first.buffers[0]);
-    assert.notEqual(second.buffers[1], first.buffers[1]);
-    assert.notEqual(second.buffers[2], first.buffers[2]);
+    assert.notEqual(second, first);
+    assert.notEqual(second.columns[0], first.columns[0]);
 
     await table.close();
     const reopened = await dataset.openTable("table-0");
@@ -75,7 +97,9 @@ test("client input and range-cache limits scale down with the engine budget", as
       engine.open(new ArrayBuffer(4 * 1024 * 1024 + 1), csvOptions()),
       (error) => {
         assert.equal(error.code, "RESOURCE_LIMIT");
-        assert.equal(error.details.limit, 4 * 1024 * 1024);
+        assert.equal(error.details.resource, "source-staging");
+        assert.equal(error.details.requiredBytes, 4 * 1024 * 1024 + 1);
+        assert.equal(error.details.availableBytes, 4 * 1024 * 1024);
         return true;
       },
     );
@@ -163,6 +187,51 @@ test("ArrayBuffer input is retained by default and detached only on explicit tra
   }
 });
 
+test("table presentation methods expose a normalized range-aligned spreadsheet contract", async () => {
+  const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  Object.defineProperty(globalThis, "Worker", {
+    configurable: true,
+    writable: true,
+    value: FakeWorker,
+  });
+
+  let engine;
+  try {
+    engine = await createTestEngine();
+    const dataset = await engine.open(new Blob(["ignored"]), csvOptions());
+    const table = await dataset.openTable("table-0");
+    const presentation = await table.getPresentation();
+    assert.deepEqual(presentation, {
+      kind: "spreadsheet-v1",
+      tableId: "table-0",
+      revision: 0,
+      visibility: "hidden",
+      frozenRows: 1,
+      frozenColumns: 0,
+      rows: [{ index: 3, size: 32 }],
+      columns: [{ index: 0, size: 120 }],
+      styles: [{ font: { bold: true }, horizontalAlignment: "center" }],
+    });
+
+    const request = { rowStart: 3, rowCount: 1, columnStart: 0, columnCount: 1 };
+    const range = await table.readPresentationRange(request);
+    assert.deepEqual(range, {
+      kind: "spreadsheet-v1",
+      tableId: "table-0",
+      revision: 0,
+      range: request,
+      styleIds: [[0]],
+      mergedCells: [{ rowStart: 3, rowEnd: 4, columnStart: 0, columnEnd: 1 }],
+      rows: [{ index: 3, size: 32 }],
+      columns: [{ index: 0, size: 120 }],
+    });
+  } finally {
+    await engine?.close();
+    if (originalWorker) Object.defineProperty(globalThis, "Worker", originalWorker);
+    else delete globalThis.Worker;
+  }
+});
+
 test("layout-v1 batches decode native recursive values separately from display text", async () => {
   const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
   Object.defineProperty(globalThis, "Worker", {
@@ -202,7 +271,9 @@ test("layout-v1 batches decode native recursive values separately from display t
       ["9223372036854775000", "123.45", "[1,2]", "0xabcd"],
       ["-1", "-0.42", "[3]", "0x00"],
     ]);
-    assert.ok(batch.byteLength > 0);
+    assert.equal("byteLength" in batch, false);
+    assert.equal("native" in batch.columns[0], false);
+    assert.equal("display" in batch.columns[0], false);
   } finally {
     await engine?.close();
     if (originalWorker) Object.defineProperty(globalThis, "Worker", originalWorker);
@@ -210,7 +281,7 @@ test("layout-v1 batches decode native recursive values separately from display t
   }
 });
 
-test("layout-v1 preserves encoded recursive descriptors and counts a shared buffer pool once", async () => {
+test("layout-v1 decodes recursive descriptors behind the logical batch facade", async () => {
   const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
   Object.defineProperty(globalThis, "Worker", {
     configurable: true,
@@ -222,7 +293,6 @@ test("layout-v1 preserves encoded recursive descriptors and counts a shared buff
   try {
     engine = await createTestEngine();
     const wire = recursiveTypedBatch();
-    const expectedByteLength = wire.buffers.reduce((total, buffer) => total + buffer.byteLength, 0);
     FakeWorker.latest.batchOverride = wire;
     const dataset = await engine.open(new Blob(["ignored"]), csvOptions());
     const table = await dataset.openTable("table-0");
@@ -255,13 +325,18 @@ test("layout-v1 preserves encoded recursive descriptors and counts a shared buff
       ["red", "same", "branch", '{"a":1,"b":2}', "11", "1970-01-01T00:00:00.000000Z"],
       ["blue", "next", "42", '{"c":3}', "22", "1970-01-01T00:00:01.000000Z"],
     ]);
-    assert.equal(batch.columns[0].native.dictionary !== undefined, true);
-    assert.equal(batch.columns[1].native.runEnds !== undefined, true);
-    assert.equal(batch.columns[2].native.children?.[0].typeId, 5);
-    assert.equal(batch.byteLength, expectedByteLength);
-    assert.equal(batch.columns[0].native.validity?.buffer, 0);
-    assert.equal(batch.columns[0].display.validity?.buffer, 0);
-    assert.equal(batch.columns[1].native.validity?.buffer, 0);
+    assert.deepEqual(Object.keys(batch.columns[0]).sort(), ["columnId", "columnIndex", "rowCount"]);
+    assert.equal(typeof batch.columns[0].getValue, "function");
+    assert.equal(typeof batch.columns[0].getDisplayValue, "function");
+    assert.equal(typeof batch.columns[0].toValues, "function");
+    assert.equal(typeof batch.columns[0].toDisplayValues, "function");
+    assert.equal(batch.columns[0].getValue(1), "blue");
+    assert.equal(batch.columns[0].getDisplayValue(1), "blue");
+    assert.deepEqual(batch.columns[3].toValues(), [
+      [{ key: "a", value: 1 }, { key: "b", value: 2 }],
+      [{ key: "c", value: 3 }],
+    ]);
+    assert.equal("buffers" in batch, false);
   } finally {
     await engine?.close();
     if (originalWorker) Object.defineProperty(globalThis, "Worker", originalWorker);
@@ -301,8 +376,8 @@ class FakeWorker {
       case "hello":
         kind = "hello";
         data = {
-          protocolVersion: 2,
-          adapterApiVersion: 1,
+          protocolVersion: 3,
+          adapterApiVersion: 2,
           batchLayoutVersion: 1,
           adapters: request.payload.adapters.map((adapter) => adapter.id),
           transferableBatches: true,
@@ -324,6 +399,14 @@ class FakeWorker {
         kind = "metadata";
         data = metadata();
         break;
+      case "getPresentation":
+        kind = "presentation";
+        data = presentation();
+        break;
+      case "readPresentationRange":
+        kind = "presentationRange";
+        data = presentationRange(request.payload.range);
+        break;
       case "readRange":
         this.readRangeCount += 1;
         kind = "batch";
@@ -342,7 +425,7 @@ class FakeWorker {
     }
 
     const response = {
-      protocolVersion: 2,
+      protocolVersion: 3,
       requestId: request.requestId,
       status: "success",
       result: data === undefined ? { kind } : { kind, data },
@@ -384,6 +467,33 @@ function metadata() {
       filter: false,
       multiTable: false,
     },
+  };
+}
+
+function presentation() {
+  return {
+    kind: "spreadsheet-v1",
+    tableId: "table-0",
+    revision: 0,
+    visibility: "hidden",
+    frozenRows: 1,
+    frozenColumns: 0,
+    rows: [{ index: 3, size: 32 }],
+    columns: [{ index: 0, size: 120 }],
+    styles: [{ font: { bold: true }, horizontalAlignment: "center" }],
+  };
+}
+
+function presentationRange(range) {
+  return {
+    kind: "spreadsheet-v1",
+    tableId: "table-0",
+    revision: 0,
+    range,
+    styleIds: [[0]],
+    mergedCells: [{ rowStart: 3, rowEnd: 4, columnStart: 0, columnEnd: 1 }],
+    rows: [{ index: 3, size: 32 }],
+    columns: [{ index: 0, size: 120 }],
   };
 }
 

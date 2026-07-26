@@ -211,6 +211,12 @@ test.describe("Canvas table view", () => {
             }
           });
         },
+        async getPresentation() {
+          return null;
+        },
+        async readPresentationRange() {
+          return null;
+        },
         subscribe(listener) {
           listeners.add(listener);
           return () => listeners.delete(listener);

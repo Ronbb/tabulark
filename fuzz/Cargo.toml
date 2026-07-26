@@ -9,7 +9,13 @@ rust-version = "1.85"
 cargo-fuzz = true
 
 [dependencies]
-tabulark = { path = "..", features = ["arrow"] }
+arrow-ipc = { version = "=59.1.0", default-features = false, features = ["zstd"] }
+parquet = { version = "=59.1.0", default-features = false, features = ["zstd"] }
+tabulark = { path = "..", features = ["arrow", "parquet"] }
+tabulark-excel = { package = "tabulark-excel-wasm", path = "../crates/tabulark-excel-wasm" }
+
+[patch.crates-io]
+zstd = { path = "../crates/zstd-pure-compat" }
 
 # The production crate also emits a cdylib. Its cargo-fuzz linkage is currently
 # maintained on Linux/WSL; keeping libFuzzer Unix-scoped preserves the stable
@@ -27,6 +33,20 @@ bench = false
 [[bin]]
 name = "arrow_lifecycle"
 path = "fuzz_targets/arrow_lifecycle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parquet_lifecycle"
+path = "fuzz_targets/parquet_lifecycle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "excel_lifecycle"
+path = "fuzz_targets/excel_lifecycle.rs"
 test = false
 doc = false
 bench = false

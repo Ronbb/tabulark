@@ -1,0 +1,14 @@
+{
+  "protocolVersion": 3,
+  "requestId": "presentation-range-v3",
+  "op": "readPresentationRange",
+  "payload": {
+    "tableHandle": "t2",
+    "range": {
+      "rowStart": 4,
+      "rowCount": 2,
+      "columnStart": 1,
+      "columnCount": 3
+    }
+  }
+}

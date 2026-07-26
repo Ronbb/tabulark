@@ -1,0 +1,32 @@
+{
+  "protocolVersion": 3,
+  "requestId": "presentation-range-v3",
+  "status": "success",
+  "result": {
+    "kind": "presentationRange",
+    "data": {
+      "kind": "spreadsheet-v1",
+      "tableId": "sheet-1",
+      "revision": 7,
+      "range": {
+        "rowStart": 4,
+        "rowCount": 2,
+        "columnStart": 1,
+        "columnCount": 3
+      },
+      "styleIds": [
+        [1, 1, null],
+        [2, 2, 2]
+      ],
+      "mergedCells": [
+        { "rowStart": 4, "rowCount": 2, "columnStart": 1, "columnCount": 2 }
+      ],
+      "rows": [
+        { "index": 4, "size": 24 }
+      ],
+      "columns": [
+        { "index": 2, "size": 96, "hidden": false }
+      ]
+    }
+  }
+}

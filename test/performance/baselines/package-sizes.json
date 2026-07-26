@@ -5,145 +5,237 @@
     "quality": 11
   },
   "core": {
-    "rawBytes": 449195,
-    "brotliBytes": 108830,
+    "rawBytes": 467345,
+    "brotliBytes": 117061,
     "files": [
       {
         "path": "dist/index.js",
-        "rawBytes": 163705,
-        "brotliBytes": 28585
+        "rawBytes": 177494,
+        "brotliBytes": 34534
       },
       {
         "path": "dist/worker.js",
-        "rawBytes": 95509,
-        "brotliBytes": 17111
+        "rawBytes": 97388,
+        "brotliBytes": 18844
       },
       {
         "path": "dist/wasm/delimited/tabulark_delimited.js",
-        "rawBytes": 27516,
-        "brotliBytes": 4803
+        "rawBytes": 29111,
+        "brotliBytes": 4874
       },
       {
         "path": "dist/wasm/delimited/tabulark_delimited_bg.wasm",
-        "rawBytes": 162465,
-        "brotliBytes": 58331
+        "rawBytes": 163352,
+        "brotliBytes": 58809
       }
     ]
   },
   "arrow": {
-    "rawBytes": 2175576,
-    "brotliBytes": 335073,
+    "rawBytes": 2146199,
+    "brotliBytes": 330463,
     "files": [
       {
         "path": "dist/arrow.js",
-        "rawBytes": 906,
-        "brotliBytes": 368
+        "rawBytes": 453,
+        "brotliBytes": 236
       },
       {
         "path": "dist/wasm/arrow/tabulark_arrow.js",
-        "rawBytes": 24879,
-        "brotliBytes": 4416
+        "rawBytes": 26364,
+        "brotliBytes": 4491
       },
       {
         "path": "dist/wasm/arrow/tabulark_arrow_bg.wasm",
-        "rawBytes": 2149791,
-        "brotliBytes": 330289
+        "rawBytes": 2119382,
+        "brotliBytes": 325736
+      }
+    ]
+  },
+  "parquet": {
+    "rawBytes": 4018043,
+    "brotliBytes": 899830,
+    "files": [
+      {
+        "path": "dist/parquet.js",
+        "rawBytes": 449,
+        "brotliBytes": 220
+      },
+      {
+        "path": "dist/wasm/parquet/tabulark_parquet.js",
+        "rawBytes": 25614,
+        "brotliBytes": 4339
+      },
+      {
+        "path": "dist/wasm/parquet/tabulark_parquet_bg.wasm",
+        "rawBytes": 3991980,
+        "brotliBytes": 895271
+      }
+    ]
+  },
+  "excel": {
+    "rawBytes": 912079,
+    "brotliBytes": 336917,
+    "files": [
+      {
+        "path": "dist/excel.js",
+        "rawBytes": 437,
+        "brotliBytes": 217
+      },
+      {
+        "path": "dist/wasm/excel/tabulark_excel.js",
+        "rawBytes": 26135,
+        "brotliBytes": 4425
+      },
+      {
+        "path": "dist/wasm/excel/tabulark_excel_bg.wasm",
+        "rawBytes": 885507,
+        "brotliBytes": 332275
       }
     ]
   },
   "runtime": {
-    "rawBytes": 2624771,
-    "brotliBytes": 443903,
+    "rawBytes": 7543666,
+    "brotliBytes": 1684271,
     "files": [
       {
         "path": "dist/index.js",
-        "rawBytes": 163705,
-        "brotliBytes": 28585
+        "rawBytes": 177494,
+        "brotliBytes": 34534
       },
       {
         "path": "dist/worker.js",
-        "rawBytes": 95509,
-        "brotliBytes": 17111
+        "rawBytes": 97388,
+        "brotliBytes": 18844
       },
       {
         "path": "dist/wasm/delimited/tabulark_delimited.js",
-        "rawBytes": 27516,
-        "brotliBytes": 4803
+        "rawBytes": 29111,
+        "brotliBytes": 4874
       },
       {
         "path": "dist/wasm/delimited/tabulark_delimited_bg.wasm",
-        "rawBytes": 162465,
-        "brotliBytes": 58331
+        "rawBytes": 163352,
+        "brotliBytes": 58809
       },
       {
         "path": "dist/arrow.js",
-        "rawBytes": 906,
-        "brotliBytes": 368
+        "rawBytes": 453,
+        "brotliBytes": 236
       },
       {
         "path": "dist/wasm/arrow/tabulark_arrow.js",
-        "rawBytes": 24879,
-        "brotliBytes": 4416
+        "rawBytes": 26364,
+        "brotliBytes": 4491
       },
       {
         "path": "dist/wasm/arrow/tabulark_arrow_bg.wasm",
-        "rawBytes": 2149791,
-        "brotliBytes": 330289
+        "rawBytes": 2119382,
+        "brotliBytes": 325736
+      },
+      {
+        "path": "dist/parquet.js",
+        "rawBytes": 449,
+        "brotliBytes": 220
+      },
+      {
+        "path": "dist/wasm/parquet/tabulark_parquet.js",
+        "rawBytes": 25614,
+        "brotliBytes": 4339
+      },
+      {
+        "path": "dist/wasm/parquet/tabulark_parquet_bg.wasm",
+        "rawBytes": 3991980,
+        "brotliBytes": 895271
+      },
+      {
+        "path": "dist/excel.js",
+        "rawBytes": 437,
+        "brotliBytes": 217
+      },
+      {
+        "path": "dist/wasm/excel/tabulark_excel.js",
+        "rawBytes": 26135,
+        "brotliBytes": 4425
+      },
+      {
+        "path": "dist/wasm/excel/tabulark_excel_bg.wasm",
+        "rawBytes": 885507,
+        "brotliBytes": 332275
       }
     ]
   },
   "npm": {
-    "packedBytes": 746770,
-    "unpackedBytes": 3242685,
-    "files": 38
+    "packedBytes": 2485815,
+    "unpackedBytes": 8636643,
+    "files": 58
   },
   "pages": {
-    "rawBytes": 3316264,
-    "brotliBytes": 576609,
-    "files": 45
+    "rawBytes": 8742060,
+    "brotliBytes": 1921397,
+    "files": 75
   },
   "budget": {
     "schemaVersion": 2,
     "comparisons": {
       "coreRaw": {
-        "bytes": 449195,
+        "bytes": 467345,
         "maximumBytes": 524288,
-        "remainingBytes": 75093
+        "remainingBytes": 56943
       },
       "coreBrotli": {
-        "bytes": 108830,
+        "bytes": 117061,
         "maximumBytes": 147456,
-        "remainingBytes": 38626
+        "remainingBytes": 30395
       },
       "arrowRaw": {
-        "bytes": 2175576,
+        "bytes": 2146199,
         "maximumBytes": 2555904,
-        "remainingBytes": 380328
+        "remainingBytes": 409705
       },
       "arrowBrotli": {
-        "bytes": 335073,
+        "bytes": 330463,
         "maximumBytes": 393216,
-        "remainingBytes": 58143
+        "remainingBytes": 62753
+      },
+      "parquetRaw": {
+        "bytes": 4018043,
+        "maximumBytes": 4653056,
+        "remainingBytes": 635013
+      },
+      "parquetBrotli": {
+        "bytes": 899830,
+        "maximumBytes": 1048576,
+        "remainingBytes": 148746
+      },
+      "excelRaw": {
+        "bytes": 912079,
+        "maximumBytes": 1114112,
+        "remainingBytes": 202033
+      },
+      "excelBrotli": {
+        "bytes": 336917,
+        "maximumBytes": 393216,
+        "remainingBytes": 56299
       },
       "npmPacked": {
-        "bytes": 746770,
-        "maximumBytes": 917504,
-        "remainingBytes": 170734
+        "bytes": 2485815,
+        "maximumBytes": 2883584,
+        "remainingBytes": 397769
       },
       "npmUnpacked": {
-        "bytes": 3242685,
-        "maximumBytes": 3735552,
-        "remainingBytes": 492867
+        "bytes": 8636643,
+        "maximumBytes": 9961472,
+        "remainingBytes": 1324829
       },
       "pagesRaw": {
-        "bytes": 3316264,
-        "maximumBytes": 3866624,
-        "remainingBytes": 550360
+        "bytes": 8742060,
+        "maximumBytes": 10092544,
+        "remainingBytes": 1350484
       },
       "pagesBrotli": {
-        "bytes": 576609,
-        "maximumBytes": 720896,
-        "remainingBytes": 144287
+        "bytes": 1921397,
+        "maximumBytes": 2228224,
+        "remainingBytes": 306827
       }
     }
   }

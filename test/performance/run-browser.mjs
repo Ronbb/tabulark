@@ -267,8 +267,11 @@ function validateArrowResult(result, expected) {
   if (result.rangeRead.samples.length !== result.rangeRead.starts.length) {
     throw new Error("Arrow range measurement sample count is incomplete");
   }
-  if (result.rangeRead.samples.length < 1 || result.rangeBatchBytes.some((bytes) => bytes <= 0)) {
-    throw new Error("Arrow range measurement did not return bounded batches");
+  if (
+    result.rangeRead.samples.length < 1
+    || result.rangeBatchBytes.some((bytes) => !Number.isFinite(bytes) || bytes < 0)
+  ) {
+    throw new Error("Arrow range measurement recorded an invalid transfer size");
   }
   if (result.scroll.frames !== expected.scrollFrames) {
     throw new Error("Arrow scroll frame sample count is incomplete");

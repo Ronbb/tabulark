@@ -1,4 +1,4 @@
-//! Adapter-ABI-v1 WebAssembly exports for the dedicated delimited artifact.
+//! Adapter-ABI-v2 WebAssembly exports for the dedicated delimited artifact.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -156,7 +156,7 @@ impl WasmRuntime {
         PROTOCOL_VERSION
     }
 
-    /// Returns official adapter ABI version one.
+    /// Returns official adapter ABI version two.
     #[wasm_bindgen(js_name = adapterApiVersion)]
     pub fn adapter_api_version(&self) -> u32 {
         ADAPTER_API_VERSION
@@ -450,6 +450,29 @@ impl WasmRuntime {
         to_js(&metadata)
     }
 
+    /// Returns no static presentation for delimited text tables.
+    pub fn presentation(&self, table_handle: u32) -> std::result::Result<JsValue, JsValue> {
+        let state = self.state.borrow();
+        if !state.tables.contains_key(&table_handle) {
+            return Err(error_to_js(TabularkError::new(
+                ErrorCode::HandleClosed,
+                "delimited table handle is closed",
+            )));
+        }
+        Ok(JsValue::NULL)
+    }
+
+    /// Returns no range presentation for delimited text tables.
+    #[wasm_bindgen(js_name = readPresentationRange)]
+    pub fn read_presentation_range(
+        &self,
+        table_handle: u32,
+        request: JsValue,
+    ) -> std::result::Result<JsValue, JsValue> {
+        let _: RangeRequest = from_js(request)?;
+        self.presentation(table_handle)
+    }
+
     /// Starts a checkpoint-backed range read using the common operation ABI.
     #[wasm_bindgen(js_name = beginRead)]
     pub fn begin_read(
@@ -627,6 +650,7 @@ fn operation_action(
         JsValue::from_f64(action.length as f64),
     )?;
     let result = Object::new();
+    set(&result, "kind", JsValue::from_str("read-bytes"))?;
     set(
         &result,
         "operationHandle",
@@ -638,10 +662,9 @@ fn operation_action(
 
 /// Adds the progressive source state carried by a pending delimited-open action.
 ///
-/// This is deliberately an optional extension of adapter ABI v1 rather than a
-/// separate method: a Worker can hand the pending action to a background scan
-/// after its initial preview prefix is available, while Arrow and range reads
-/// retain the common `read-bytes` action contract unchanged.
+/// A Worker can hand the pending action to a background scan after its initial
+/// preview prefix is available, while range reads retain the common
+/// `read-bytes` action contract unchanged.
 fn open_operation_action(
     operation_handle: u32,
     action: ReadAction,
@@ -652,6 +675,7 @@ fn open_operation_action(
     bytes_scanned: u64,
 ) -> std::result::Result<JsValue, JsValue> {
     let result = Object::from(operation_action(operation_handle, action)?);
+    set(&result, "kind", JsValue::from_str("open-progress"))?;
     set(
         &result,
         "sourceHandle",
@@ -678,7 +702,7 @@ fn complete_open(
     bytes_scanned: u64,
 ) -> std::result::Result<JsValue, JsValue> {
     let result = Object::new();
-    set(&result, "status", JsValue::from_str("complete"))?;
+    set(&result, "kind", JsValue::from_str("open-complete"))?;
     set(
         &result,
         "sourceHandle",
@@ -737,7 +761,7 @@ fn complete_batch(
     warnings: &[CsvDiagnostic],
 ) -> std::result::Result<JsValue, JsValue> {
     let result = Object::new();
-    set(&result, "status", JsValue::from_str("complete"))?;
+    set(&result, "kind", JsValue::from_str("read-complete"))?;
     set(&result, "batch", batch_to_js(batch)?)?;
     if !warnings.is_empty() {
         set(&result, "warnings", to_js(warnings)?)?;

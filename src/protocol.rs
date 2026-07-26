@@ -11,14 +11,17 @@ use serde_json::Value;
 use crate::error::{ErrorCode, Result, TabularkError};
 use crate::model::{RangeRequest, TableMetadata, TypedTableBatch};
 
-/// The historical protocol version retained only for migration diagnostics.
+/// The original Worker protocol retained only for migration diagnostics.
 pub const LEGACY_PROTOCOL_VERSION: u32 = 1;
 
+/// The previous Worker protocol retained only for migration diagnostics.
+pub const PREVIOUS_PROTOCOL_VERSION: u32 = 2;
+
 /// The only Worker protocol version implemented by this crate.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The Rust adapter ABI version implemented by official adapters.
-pub const ADAPTER_API_VERSION: u32 = 1;
+pub const ADAPTER_API_VERSION: u32 = 2;
 
 /// The common typed-buffer descriptor version implemented by official adapters.
 pub use crate::model::BATCH_LAYOUT_VERSION;
@@ -28,6 +31,136 @@ pub const DELIMITED_ADAPTER_ID: &str = "tabulark:delimited";
 
 /// Stable ID of the official Apache Arrow IPC adapter.
 pub const ARROW_IPC_ADAPTER_ID: &str = "tabulark:arrow-ipc";
+
+/// Stable ID of the official Apache Parquet adapter.
+pub const PARQUET_ADAPTER_ID: &str = "tabulark:parquet";
+
+/// Stable ID of the official Excel workbook adapter.
+pub const EXCEL_ADAPTER_ID: &str = "tabulark:excel";
+
+/// One bounded source-range request issued by an official adapter.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum AdapterAction {
+    /// Read exactly `length` bytes beginning at absolute `offset`.
+    ReadBytes {
+        /// Absolute byte offset in the Worker-owned source.
+        offset: u64,
+        /// Exact number of bytes requested.
+        length: u64,
+    },
+}
+
+impl AdapterAction {
+    /// Creates a bounded byte-range action.
+    #[must_use]
+    pub const fn read_bytes(offset: u64, length: u64) -> Self {
+        Self::ReadBytes { offset, length }
+    }
+
+    /// Returns the requested absolute byte offset.
+    #[must_use]
+    pub const fn offset(self) -> u64 {
+        match self {
+            Self::ReadBytes { offset, .. } => offset,
+        }
+    }
+
+    /// Returns the exact requested byte length.
+    #[must_use]
+    pub const fn length(self) -> u64 {
+        match self {
+            Self::ReadBytes { length, .. } => length,
+        }
+    }
+}
+
+/// Stable logical-table identity published while an adapter opens a source.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdapterTableDescriptor {
+    /// Stable logical table ID within the opened source.
+    pub id: String,
+    /// User-facing table name.
+    pub name: String,
+}
+
+/// Progressive counters published by an adapter open operation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdapterProgress {
+    /// Numeric source handle owned by the adapter runtime.
+    pub source_handle: u32,
+    /// Source bytes examined so far.
+    pub bytes_scanned: u64,
+    /// Logical rows discovered so far.
+    pub rows_discovered: u64,
+    /// Whether source discovery has reached a terminal state.
+    pub done: bool,
+}
+
+/// Adapter-ABI-v2 result returned by `beginOpen`, `beginRead`, and
+/// `continueOperation`.
+///
+/// Every variant carries a top-level `kind` discriminant, so the Worker never
+/// infers lifecycle state from the presence or absence of optional fields.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum AdapterStep {
+    /// The operation needs one exact Worker-owned source range.
+    ReadBytes {
+        /// Opaque in-flight operation handle.
+        operation_handle: u32,
+        /// Bounded byte-range action.
+        action: AdapterAction,
+    },
+    /// An open operation has published a readable indexed prefix and needs
+    /// another source range to continue discovery.
+    OpenProgress {
+        /// Opaque in-flight operation handle.
+        operation_handle: u32,
+        /// Bounded byte-range action needed to continue opening.
+        action: AdapterAction,
+        /// Numeric source handle that owns the published tables.
+        source_handle: u32,
+        /// Logical tables known for the current source revision.
+        tables: Vec<AdapterTableDescriptor>,
+        /// Latest metadata snapshot for the published table.
+        metadata: TableMetadata,
+        /// Progressive source counters.
+        progress: AdapterProgress,
+        /// Adapter-specific, structured recoverable diagnostics.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<Value>,
+    },
+    /// Source discovery completed and its table descriptors are final.
+    OpenComplete {
+        /// Numeric source handle that owns the opened tables.
+        source_handle: u32,
+        /// Logical tables in deterministic source order.
+        tables: Vec<AdapterTableDescriptor>,
+        /// Final metadata snapshot for the primary or sole table.
+        metadata: TableMetadata,
+        /// Optional final progress snapshot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress: Option<AdapterProgress>,
+        /// Adapter-specific, structured recoverable diagnostics.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<Value>,
+    },
+    /// A range read completed with one logical typed batch.
+    ReadComplete {
+        /// Completed logical batch.
+        batch: TypedTableBatch,
+        /// Adapter-specific, structured recoverable diagnostics.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<Value>,
+    },
+}
 
 /// Rejects every protocol other than the current breaking version.
 pub fn ensure_protocol_version(actual: u32) -> Result<()> {
@@ -92,7 +225,7 @@ impl RequestEnvelope {
     }
 }
 
-/// Worker operations supported by protocol version two.
+/// Worker operations supported by protocol version three.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "op", content = "payload", rename_all = "camelCase")]
 #[non_exhaustive]
@@ -107,6 +240,10 @@ pub enum Request {
     OpenTable(OpenTableRequest),
     /// Get the latest progressive table metadata.
     GetMetadata(TableRequest),
+    /// Get static spreadsheet presentation metadata, when the table has it.
+    GetPresentation(TableRequest),
+    /// Read range-aligned spreadsheet styles, merges, and sparse layout data.
+    ReadPresentationRange(ReadPresentationRangeRequest),
     /// Read a bounded rectangular table range.
     ReadRange(ReadRangeRequest),
     /// Best-effort cancellation of an outstanding request.
@@ -188,6 +325,16 @@ pub struct ReadRangeRequest {
     /// Opaque table handle.
     pub table_handle: String,
     /// Requested zero-based, half-open range.
+    pub range: RangeRequest,
+}
+
+/// Payload for reading presentation data aligned with a table range.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadPresentationRangeRequest {
+    /// Opaque table handle.
+    pub table_handle: String,
+    /// Requested zero-based, half-open presentation range.
     pub range: RangeRequest,
 }
 
@@ -281,6 +428,10 @@ pub enum ResponseResult {
     Table(TableDescriptor),
     /// Latest table metadata.
     Metadata(TableMetadata),
+    /// Static table presentation, or `null` for non-spreadsheet adapters.
+    Presentation(Option<Value>),
+    /// Range-aligned presentation, or `null` for non-spreadsheet adapters.
+    PresentationRange(Option<Value>),
     /// A bounded columnar range batch.
     Batch(TypedTableBatch),
     /// An idempotent close, cancel, or shutdown acknowledgement.
@@ -372,6 +523,12 @@ pub enum RuntimeEvent {
 pub struct ProgressEvent {
     /// Opaque source handle.
     pub source_handle: String,
+    /// Logical table whose discovery advanced, when already known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_id: Option<String>,
+    /// Metadata revision associated with these counters, when already known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
     /// Bytes accepted from the source.
     pub bytes_scanned: u64,
     /// Data rows discovered so far.
@@ -414,11 +571,14 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ADAPTER_API_VERSION, ARROW_IPC_ADAPTER_ID, BATCH_LAYOUT_VERSION, DELIMITED_ADAPTER_ID,
-        EventEnvelope, HelloRequest, LEGACY_PROTOCOL_VERSION, PROTOCOL_VERSION, Request,
-        RequestEnvelope, ResponseEnvelope, ensure_protocol_version,
+        ADAPTER_API_VERSION, ARROW_IPC_ADAPTER_ID, AdapterAction, AdapterStep,
+        BATCH_LAYOUT_VERSION, DELIMITED_ADAPTER_ID, EXCEL_ADAPTER_ID, EventEnvelope, HelloRequest,
+        LEGACY_PROTOCOL_VERSION, PARQUET_ADAPTER_ID, PREVIOUS_PROTOCOL_VERSION, PROTOCOL_VERSION,
+        ReadPresentationRangeRequest, Request, RequestEnvelope, ResponseEnvelope, ResponseResult,
+        ensure_protocol_version,
     };
     use crate::error::ErrorCode;
+    use crate::model::RangeRequest;
 
     #[test]
     fn request_wire_shape_is_flat_and_versioned() {
@@ -475,15 +635,14 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v1_is_rejected_at_every_rust_envelope_boundary() {
-        let error = ensure_protocol_version(LEGACY_PROTOCOL_VERSION)
-            .expect_err("protocol v1 must be rejected");
-        assert_eq!(error.code(), ErrorCode::ProtocolIncompatible);
-        assert_eq!(error.details()["expectedProtocolVersion"], PROTOCOL_VERSION);
-        assert_eq!(
-            error.details()["actualProtocolVersion"],
-            LEGACY_PROTOCOL_VERSION
-        );
+    fn historical_protocols_are_rejected_at_every_rust_envelope_boundary() {
+        for historical in [LEGACY_PROTOCOL_VERSION, PREVIOUS_PROTOCOL_VERSION] {
+            let error = ensure_protocol_version(historical)
+                .expect_err("historical protocol must be rejected");
+            assert_eq!(error.code(), ErrorCode::ProtocolIncompatible);
+            assert_eq!(error.details()["expectedProtocolVersion"], PROTOCOL_VERSION);
+            assert_eq!(error.details()["actualProtocolVersion"], historical);
+        }
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("test/fixtures/protocol/v1");
         if !root.exists() {
@@ -498,41 +657,98 @@ mod tests {
     }
 
     #[test]
-    fn shared_v2_golden_fixtures_round_trip_through_rust_dtos() {
+    fn shared_v2_golden_fixtures_remain_historical_evidence() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("test/fixtures/protocol/v2");
         if !root.exists() {
             return;
         }
 
-        assert_fixture::<RequestEnvelope>(&root, "hello-request.json");
-        assert_fixture::<RequestEnvelope>(&root, "open-arrow-request.json");
-        assert_fixture::<ResponseEnvelope>(&root, "hello-response.json");
-        assert_fixture::<EventEnvelope>(&root, "metadata-event.json");
+        for name in [
+            "hello-request.json",
+            "open-arrow-request.json",
+            "hello-response.json",
+            "metadata-event.json",
+        ] {
+            let source = fs::read_to_string(root.join(name)).expect("read protocol fixture");
+            let fixture: serde_json::Value =
+                serde_json::from_str(&source).expect("parse fixture JSON");
+            assert_eq!(fixture["protocolVersion"], PREVIOUS_PROTOCOL_VERSION);
+        }
     }
 
     #[test]
-    fn adapter_and_layout_versions_are_independent_of_protocol_v2() {
-        assert_eq!(PROTOCOL_VERSION, 2);
-        assert_eq!(ADAPTER_API_VERSION, 1);
+    fn adapter_and_layout_versions_are_independent_of_protocol_v3() {
+        assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(ADAPTER_API_VERSION, 2);
         assert_eq!(BATCH_LAYOUT_VERSION, 1);
         assert_eq!(DELIMITED_ADAPTER_ID, "tabulark:delimited");
         assert_eq!(ARROW_IPC_ADAPTER_ID, "tabulark:arrow-ipc");
+        assert_eq!(PARQUET_ADAPTER_ID, "tabulark:parquet");
+        assert_eq!(EXCEL_ADAPTER_ID, "tabulark:excel");
     }
 
-    fn assert_fixture<T>(root: &Path, name: &str)
-    where
-        T: serde::de::DeserializeOwned + serde::Serialize,
-    {
-        let source = fs::read_to_string(root.join(name)).expect("read protocol fixture");
-        let fixture = serde_json::from_str::<serde_json::Value>(&source)
-            .unwrap_or_else(|error| panic!("parse protocol v2 JSON fixture {name}: {error}"));
-        let parsed = serde_json::from_value::<T>(fixture.clone())
-            .unwrap_or_else(|error| panic!("parse protocol v2 fixture {name}: {error}"));
+    #[test]
+    fn adapter_v2_read_steps_have_explicit_nested_discriminants() {
+        let step = AdapterStep::ReadBytes {
+            operation_handle: 7,
+            action: AdapterAction::read_bytes(1024, 4096),
+        };
+
         assert_eq!(
-            serde_json::to_value(parsed)
-                .unwrap_or_else(|error| panic!("serialize protocol v2 fixture {name}: {error}")),
-            fixture,
-            "protocol v2 fixture {name} must lock the serialized Rust wire shape"
+            serde_json::to_value(step).expect("serialize adapter step"),
+            serde_json::json!({
+                "kind": "read-bytes",
+                "operationHandle": 7,
+                "action": {
+                    "kind": "read-bytes",
+                    "offset": 1024,
+                    "length": 4096
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn protocol_v3_carries_nullable_presentation_queries() {
+        let range = RangeRequest::new(4, 2, 3, 1).expect("range");
+        let request = RequestEnvelope::new(
+            "presentation-1",
+            Request::ReadPresentationRange(ReadPresentationRangeRequest {
+                table_handle: "table-handle".into(),
+                range,
+            }),
+        );
+        assert_eq!(
+            serde_json::to_value(request).expect("serialize request"),
+            serde_json::json!({
+                "protocolVersion": 3,
+                "requestId": "presentation-1",
+                "op": "readPresentationRange",
+                "payload": {
+                    "tableHandle": "table-handle",
+                    "range": {
+                        "rowStart": 4,
+                        "rowCount": 2,
+                        "columnStart": 3,
+                        "columnCount": 1
+                    }
+                }
+            })
+        );
+
+        let response =
+            ResponseEnvelope::success("presentation-1", ResponseResult::PresentationRange(None));
+        assert_eq!(
+            serde_json::to_value(response).expect("serialize response"),
+            serde_json::json!({
+                "protocolVersion": 3,
+                "requestId": "presentation-1",
+                "status": "success",
+                "result": {
+                    "kind": "presentationRange",
+                    "data": null
+                }
+            })
         );
     }
 }

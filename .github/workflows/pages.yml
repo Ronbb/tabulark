@@ -68,6 +68,7 @@ jobs:
           test/browser/site.spec.mjs
           test/browser/example.spec.mjs
           test/browser/arrow.spec.mjs
+          test/browser/formats.spec.mjs
 
       - name: Enforce package and site size budgets
         run: npm run benchmark:size

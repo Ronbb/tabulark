@@ -1,0 +1,16 @@
+[package]
+name = "zstd-pure-compat-check"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+arrow-ipc = { version = "=59.1.0", default-features = false, features = ["zstd"] }
+parquet = { version = "=59.1.0", default-features = false, features = ["zstd"] }
+
+[patch.crates-io]
+zstd = { path = ".." }
+
+[workspace]
+resolver = "2"

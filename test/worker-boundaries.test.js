@@ -7,7 +7,6 @@ test("Worker hello validates registrations atomically and permits a corrected re
     const failed = worker.send("hello", {
       adapters: [
         { id: "tabulark:delimited", moduleUrl: "data:text/javascript,export default function(){}" },
-        { id: "unsupported", moduleUrl: "data:text/javascript,export default function(){}" },
       ],
       memoryBudgetBytes: 8 * 1024 * 1024,
     });
@@ -16,15 +15,29 @@ test("Worker hello validates registrations atomically and permits a corrected re
     assert.equal(failedResponse.error.code, "INVALID_ARGUMENT");
 
     const retried = worker.send("hello", {
-      adapters: [{
-        id: "tabulark:delimited",
-        moduleUrl: "data:text/javascript,export default function(){}",
-      }],
+      adapters: [{ id: "tabulark:delimited" }],
       memoryBudgetBytes: 8 * 1024 * 1024,
     });
     const retriedResponse = await worker.responseFor(retried);
     assert.equal(retriedResponse.status, "success");
     assert.deepEqual(retriedResponse.result.data.adapters, ["tabulark:delimited"]);
+
+    const injectedAfterInitialization = worker.send("hello", {
+      adapters: [{
+        id: "tabulark:delimited",
+        moduleUrl: "data:text/javascript,throw new Error('must not load')",
+      }],
+      memoryBudgetBytes: 8 * 1024 * 1024,
+    });
+    const injectedResponse = await worker.responseFor(injectedAfterInitialization);
+    assert.equal(injectedResponse.status, "failure");
+    assert.equal(injectedResponse.error.code, "INVALID_ARGUMENT");
+
+    const idempotent = worker.send("hello", {
+      adapters: [{ id: "tabulark:delimited" }],
+      memoryBudgetBytes: 8 * 1024 * 1024,
+    });
+    assert.equal((await worker.responseFor(idempotent)).status, "success");
   } finally {
     await worker.shutdown();
     worker.restore();
@@ -43,7 +56,7 @@ test("Worker disposes a constructed runtime when ABI validation fails", async ()
 
   try {
     const hello = worker.send("hello", {
-      adapters: [{ id: "tabulark:delimited", moduleUrl: invalidAbiModuleUrl() }],
+      adapters: [testAdapter("tabulark:delimited", invalidAbiModuleUrl())],
       memoryBudgetBytes: 8 * 1024 * 1024,
     });
     assert.equal((await worker.responseFor(hello)).status, "success");
@@ -74,7 +87,7 @@ test("Worker rejects structural delimiters and normalizes untrusted metadata", a
 
   try {
     const hello = worker.send("hello", {
-      adapters: [{ id: "tabulark:delimited", moduleUrl: boundaryModuleUrl() }],
+      adapters: [testAdapter("tabulark:delimited", boundaryModuleUrl())],
       memoryBudgetBytes: 8 * 1024 * 1024,
     });
     assert.equal((await worker.responseFor(hello)).status, "success");
@@ -122,7 +135,13 @@ test("Worker rejects structural delimiters and normalizes untrusted metadata", a
 });
 
 async function workerHarness(name, extraGlobals = []) {
-  const saved = saveGlobals(["addEventListener", "postMessage", "close", ...extraGlobals]);
+  const saved = saveGlobals([
+    "addEventListener",
+    "postMessage",
+    "close",
+    "__tabularkTestOnlyAdapterModuleUrls",
+    ...extraGlobals,
+  ]);
   const listeners = new Set();
   const messages = [];
   Object.defineProperties(globalThis, {
@@ -140,7 +159,7 @@ async function workerHarness(name, extraGlobals = []) {
   let nextRequest = 1;
   const send = (op, payload) => {
     const requestId = `r${nextRequest++}`;
-    const request = { protocolVersion: 2, requestId, op, payload };
+    const request = { protocolVersion: 3, requestId, op, payload };
     for (const listener of listeners) listener({ data: request });
     return requestId;
   };
@@ -172,13 +191,15 @@ function invalidAbiModuleUrl() {
     export default async function init() {}
     export class WasmRuntime {
       protocolVersion() { return 1; }
-      adapterApiVersion() { return 1; }
+      adapterApiVersion() { return 2; }
       batchLayoutVersion() { return 1; }
       adapterId() { return "tabulark:delimited"; }
       beginOpen() {}
       continueOperation() {}
       openTable() {}
       metadata() {}
+      presentation() { return null; }
+      readPresentationRange() { return null; }
       beginRead() {}
       cancelOperation() {}
       closeTable() {}
@@ -222,14 +243,14 @@ function boundaryModuleUrl() {
     });
     export default async function init() {}
     export class WasmRuntime {
-      protocolVersion() { return 2; }
-      adapterApiVersion() { return 1; }
+      protocolVersion() { return 3; }
+      adapterApiVersion() { return 2; }
       batchLayoutVersion() { return 1; }
       adapterId() { return "tabulark:delimited"; }
       beginOpen() {
         globalThis.__tabularkBoundaryBeginOpens += 1;
         return {
-          status: "complete",
+          kind: "open-complete",
           sourceHandle: 1,
           tables: [{ id: "table-0", name: "Boundary table" }],
           metadata: metadata(),
@@ -238,6 +259,8 @@ function boundaryModuleUrl() {
       continueOperation() {}
       openTable() { return { tableHandle: 2, metadata: metadata() }; }
       metadata() { return metadata(); }
+      presentation() { return null; }
+      readPresentationRange() { return null; }
       beginRead() {}
       cancelOperation() {}
       closeTable() {}
@@ -247,6 +270,16 @@ function boundaryModuleUrl() {
     }
   `;
   return `data:text/javascript,${encodeURIComponent(source)}`;
+}
+
+function testAdapter(id, moduleUrl) {
+  const urls = globalThis.__tabularkTestOnlyAdapterModuleUrls ?? {};
+  Object.defineProperty(globalThis, "__tabularkTestOnlyAdapterModuleUrls", {
+    configurable: true,
+    writable: true,
+    value: { ...urls, [id]: moduleUrl },
+  });
+  return { id };
 }
 
 function saveGlobals(names) {

@@ -2,12 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  axisPosition,
+  axisSize,
+  cellRect,
   createScrollAxis,
   createTableController,
   createTableLayout,
+  hitTest,
   logicalToPhysicalOffset,
   physicalToLogicalOffset,
-} from "../dist/index.js";
+} from "../dist/experimental.js";
 
 test("compresses extreme logical scroll space with reversible offsets", () => {
   const axis = createScrollAxis(2_000_000, 80, 4_960, 10_000);
@@ -34,6 +38,47 @@ test("compresses extreme logical scroll space with reversible offsets", () => {
   assert.equal(layout.spacerHeight, 10_020);
   assert.ok(layout.rows.visible.start > 99_000);
   assert.ok(layout.rows.overscan.end <= 100_000);
+});
+
+test("layout applies sparse worksheet sizes, hidden axes, and pinned geometry", () => {
+  const table = createMockTable({ rows: 1_000_000, columns: 5 });
+  const widths = [90, 80, 70, 60, 50];
+  const layout = createTableLayout(
+    table.metadata,
+    widths,
+    { width: 200, height: 140, scrollLeft: 80, scrollTop: 100 },
+    {
+      rowHeight: 20,
+      headerHeight: 20,
+      rowHeaderWidth: 40,
+      rowEntries: [
+        { index: 0, size: 32 },
+        { index: 1, hidden: true },
+        { index: 999_999, size: 40 },
+      ],
+      hiddenColumns: [false, true, false, false, false],
+      frozenRows: 1,
+      frozenColumns: 1,
+      overscanRows: 0,
+      overscanColumns: 0,
+    },
+  );
+
+  assert.equal(layout.rowGeometry.overrides.length, 3);
+  assert.equal(layout.rowGeometry.contentSize, 20_000_012);
+  assert.equal(axisPosition(layout.rowGeometry, 2), 32);
+  assert.equal(axisSize(layout.rowGeometry, 1), 0);
+  assert.deepEqual(layout.effectiveColumnWidths, [90, 0, 70, 60, 50]);
+  assert.equal(layout.visibleRows.some((row) => row.index === 1), false);
+  assert.equal(layout.visibleColumns.some((column) => column.index === 1), false);
+
+  const pinned = cellRect(layout, widths, 0, 0);
+  assert.deepEqual(pinned, { x: 40, y: 20, width: 90, height: 32 });
+  assert.deepEqual(hitTest(layout, 50, 30, widths, 0), {
+    kind: "cell",
+    rowIndex: 0,
+    columnIndex: 0,
+  });
 });
 
 test("controller requests only the viewport and overscan window", async () => {
@@ -160,6 +205,149 @@ test("keyboard navigation scrolls an offscreen active cell into view", async () 
   assert.deepEqual(snapshot.activeCell, { rowIndex: 3, columnIndex: 0 });
   assert.equal(snapshot.layout.vertical.logicalOffset, 20);
   assert.equal(snapshot.layout.vertical.physicalOffset, 20);
+  controller.dispose();
+});
+
+test("spreadsheet presentation keeps hidden navigation and merged interaction coherent", async () => {
+  const table = createMockTable({ rows: 100_000, columns: 20 });
+  const controller = createTableController(table, {
+    rowHeight: 20,
+    headerHeight: 20,
+    rowHeaderWidth: 40,
+    columnWidth: 100,
+    overscanRows: 2,
+    overscanColumns: 1,
+  });
+
+  controller.updateViewport({ width: 700, height: 300, scrollLeft: 0, scrollTop: 0 });
+  await waitFor(() => controller.getSnapshot().status === "ready");
+  const previousGeneration = controller.getSnapshot().generation;
+  controller.applySpreadsheetPresentation({
+    kind: "spreadsheet-v1",
+    tableId: table.metadata.tableId,
+    revision: table.metadata.revision,
+    visibility: "visible",
+    frozenRows: 1,
+    frozenColumns: 1,
+    rows: [{ index: 0, size: 32 }, { index: 1, hidden: true }],
+    columns: [{ index: 0, size: 120 }, { index: 1, hidden: true }],
+    styles: [],
+  });
+  assert.equal(controller.getSnapshot().generation, previousGeneration + 1);
+  await waitFor(() => controller.getSnapshot().status === "ready");
+
+  const presented = controller.getSnapshot().layout;
+  assert.equal(controller.columnWidths[0], 120);
+  assert.equal(presented.effectiveColumnWidths[1], 0);
+  assert.equal(axisSize(presented.rowGeometry, 0), 32);
+  assert.equal(axisSize(presented.rowGeometry, 1), 0);
+
+  controller.setActiveCell({ rowIndex: 0, columnIndex: 0 }, { scrollIntoView: false });
+  controller.moveActive("right", { scrollIntoView: false });
+  assert.deepEqual(controller.getSnapshot().activeCell, { rowIndex: 0, columnIndex: 2 });
+  controller.moveActive("down", { scrollIntoView: false });
+  assert.deepEqual(controller.getSnapshot().activeCell, { rowIndex: 2, columnIndex: 2 });
+
+  controller.setMergedCells([{
+    rowStart: 2,
+    rowEnd: 4,
+    columnStart: 2,
+    columnEnd: 4,
+  }]);
+  controller.setActiveCell({ rowIndex: 3, columnIndex: 3 }, { scrollIntoView: false });
+  assert.deepEqual(controller.getSnapshot().activeCell, { rowIndex: 2, columnIndex: 2 });
+  assert.deepEqual(controller.getSnapshot().selection?.range, {
+    rowStart: 2,
+    rowEnd: 4,
+    columnStart: 2,
+    columnEnd: 4,
+  });
+  const covered = controller.cellRect({ rowIndex: 3, columnIndex: 3 });
+  assert.deepEqual(
+    controller.hitTest(covered.x + covered.width / 2, covered.y + covered.height / 2, 0),
+    { kind: "cell", rowIndex: 2, columnIndex: 2 },
+  );
+  controller.moveActive("right", { scrollIntoView: false });
+  assert.deepEqual(controller.getSnapshot().activeCell, { rowIndex: 2, columnIndex: 4 });
+
+  table.calls.length = 0;
+  controller.updateViewport({ width: 420, height: 180, scrollLeft: 1_000, scrollTop: 8_000 });
+  await waitFor(() => table.calls.some((request) => request.rowStart > 200));
+  await waitFor(() => controller.getSnapshot().status === "ready");
+  assert.ok(table.calls.some((request) => request.rowStart === 0));
+  assert.ok(table.calls.length <= 8);
+  for (const request of table.calls) {
+    assert.ok(request.rowCount < 40);
+    assert.ok(request.columnCount < 8);
+  }
+  assert.deepEqual(
+    controller.cellRect({ rowIndex: 0, columnIndex: 0 }),
+    { x: 40, y: 20, width: 120, height: 32 },
+  );
+
+  controller.dispose();
+});
+
+test("intersecting merges load offscreen anchors and hit-test across frozen panes", async () => {
+  const table = createMockTable({ rows: 1_000, columns: 20 });
+  const controller = createTableController(table, {
+    rowHeight: 20,
+    headerHeight: 20,
+    rowHeaderWidth: 40,
+    columnWidth: 80,
+    overscanRows: 0,
+    overscanColumns: 0,
+  });
+  controller.applySpreadsheetPresentation({
+    kind: "spreadsheet-v1",
+    tableId: table.metadata.tableId,
+    revision: table.metadata.revision,
+    visibility: "visible",
+    frozenRows: 1,
+    frozenColumns: 1,
+    rows: [],
+    columns: [],
+    styles: [],
+  });
+  controller.updateViewport({ width: 400, height: 180, scrollLeft: 160, scrollTop: 4_000 });
+  await waitFor(() => controller.getSnapshot().status === "ready");
+
+  table.calls.length = 0;
+  controller.setMergedCells([{
+    rowStart: 10,
+    rowEnd: 500,
+    columnStart: 2,
+    columnEnd: 18,
+  }]);
+  await waitFor(() => controller.getSnapshot().status === "ready");
+  assert.ok(table.calls.some((request) => (
+    request.rowStart === 10
+    && request.rowCount === 1
+    && request.columnStart === 2
+    && request.columnCount === 1
+  )));
+  assert.deepEqual(controller.getCell(10, 2), { status: "loaded", value: "R10C2" });
+
+  controller.updateViewport({ width: 400, height: 180, scrollLeft: 80, scrollTop: 20 });
+  controller.setMergedCells([{
+    rowStart: 0,
+    rowEnd: 3,
+    columnStart: 0,
+    columnEnd: 3,
+  }]);
+  await waitFor(() => controller.getSnapshot().status === "ready");
+  for (const cell of [
+    { rowIndex: 0, columnIndex: 0 },
+    { rowIndex: 0, columnIndex: 2 },
+    { rowIndex: 2, columnIndex: 0 },
+    { rowIndex: 2, columnIndex: 2 },
+  ]) {
+    const rect = controller.cellRect(cell);
+    assert.deepEqual(
+      controller.hitTest(rect.x + rect.width / 2, rect.y + rect.height / 2, 0),
+      { kind: "cell", rowIndex: 0, columnIndex: 0 },
+    );
+  }
   controller.dispose();
 });
 

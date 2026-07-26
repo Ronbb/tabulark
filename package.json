@@ -15,11 +15,27 @@
       "types": "./dist/arrow.d.ts",
       "import": "./dist/arrow.js",
       "default": "./dist/arrow.js"
+    },
+    "./parquet": {
+      "types": "./dist/parquet.d.ts",
+      "import": "./dist/parquet.js",
+      "default": "./dist/parquet.js"
+    },
+    "./excel": {
+      "types": "./dist/excel.d.ts",
+      "import": "./dist/excel.js",
+      "default": "./dist/excel.js"
+    },
+    "./experimental": {
+      "types": "./dist/experimental.d.ts",
+      "import": "./dist/experimental.js",
+      "default": "./dist/experimental.js"
     }
   },
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE-MIT",
     "LICENSE-APACHE",
     "THIRD_PARTY_NOTICES.md"
@@ -32,10 +48,12 @@
     "build:wasm": "node scripts/build-wasm.mjs",
     "benchmark:arrow": "node test/performance/run-arrow-matrix.mjs",
     "benchmark:canonical": "node test/performance/run-browser.mjs --scenario canonical --output test/performance/baselines/windows-chromium-16mib.json",
+    "benchmark:formats": "node test/performance/run-format-smoke.mjs",
     "benchmark:size": "node test/performance/measure-sizes.mjs",
     "benchmark:smoke": "node test/performance/run-browser.mjs --scenario smoke --output target/bench/performance-smoke.json",
     "typecheck": "tsc --project tsconfig.json",
     "check": "npm run build && npm run check:versions && npm run typecheck && node --test test/*.test.js && npm run package:check && npm run pages:check",
+    "check:api": "node scripts/stable-api-snapshot.mjs",
     "check:versions": "node scripts/check-versions.mjs",
     "example": "npm run build:pages && node test/browser/server.mjs",
     "pages:check": "npm run build:pages",

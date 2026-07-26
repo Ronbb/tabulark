@@ -648,6 +648,19 @@ impl Capabilities {
         }
     }
 
+    /// Creates untyped capabilities for a workbook-style multi-table source.
+    #[must_use]
+    pub const fn spreadsheet(random_access: RandomAccess) -> Self {
+        Self {
+            random_access,
+            typed_values: false,
+            search: false,
+            sort: false,
+            filter: false,
+            multi_table: true,
+        }
+    }
+
     /// Returns the random range access level.
     #[must_use]
     pub const fn random_access(&self) -> RandomAccess {
@@ -658,6 +671,12 @@ impl Capabilities {
     #[must_use]
     pub const fn typed_values(&self) -> bool {
         self.typed_values
+    }
+
+    /// Returns whether the source can expose more than one logical table.
+    #[must_use]
+    pub const fn multi_table(&self) -> bool {
+        self.multi_table
     }
 }
 
@@ -1690,9 +1709,9 @@ mod tests {
 
     use super::{
         ArrayDescriptor, ArrayLayout, AxisExtent, BATCH_LAYOUT_VERSION, BatchBuffer, BitmapSlice,
-        BufferSlice, ColumnSchema, IntervalUnit, RangeRequest, StringColumnBatch, TableBatch,
-        TableDataType, TableExtent, TableField, TimeUnit, TypedColumnBatch, TypedTableBatch,
-        UnionField, UnionMode,
+        BufferSlice, Capabilities, ColumnSchema, IntervalUnit, RandomAccess, RangeRequest,
+        StringColumnBatch, TableBatch, TableDataType, TableExtent, TableField, TimeUnit,
+        TypedColumnBatch, TypedTableBatch, UnionField, UnionMode,
     };
     use crate::TableShape;
 
@@ -1703,6 +1722,24 @@ mod tests {
         assert_eq!(extent.exact_shape(), Some(TableShape::new(12, 4)));
         assert!(extent.rows().is_exact());
         assert_eq!(extent.columns().value(), Some(4));
+    }
+
+    #[test]
+    fn spreadsheet_capabilities_are_untyped_and_multi_table() {
+        let capabilities = Capabilities::spreadsheet(RandomAccess::Full);
+        assert!(!capabilities.typed_values());
+        assert!(capabilities.multi_table());
+        assert_eq!(
+            serde_json::to_value(capabilities).expect("serialize capabilities"),
+            serde_json::json!({
+                "randomAccess": "full",
+                "typedValues": false,
+                "search": false,
+                "sort": false,
+                "filter": false,
+                "multiTable": true,
+            })
+        );
     }
 
     #[test]

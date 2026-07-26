@@ -4,6 +4,8 @@ import {
   delimitedAdapter,
 } from "../../dist/index.js";
 import { arrowIpcAdapter } from "../../dist/arrow.js";
+import { parquetAdapter } from "../../dist/parquet.js";
+import { excelAdapter } from "../../dist/excel.js";
 
 const ARROW_SAMPLE_URL = new URL(
   "../../test/fixtures/arrow/v1/m4-sample.arrow",
@@ -165,10 +167,10 @@ window.addEventListener("pageshow", (event) => {
     return;
   }
   if (retrySource === undefined) {
-    transition("idle", "Choose CSV, TSV, or Arrow IPC explicitly, then open a local source or sample.");
+    transition("idle", "Choose CSV, TSV, Arrow IPC, Parquet, XLS, or XLSX explicitly, then open a local source or sample.");
     showEmptyState(
       "No table open",
-      "Choose a local CSV, TSV, or Arrow IPC source. Nothing is uploaded.",
+      "Choose a local CSV, TSV, Arrow IPC, Parquet, XLS, or XLSX source. Nothing is uploaded.",
     );
     return;
   }
@@ -373,7 +375,9 @@ async function ensureEngine() {
   }
 
   const generation = engineGeneration;
-  const pending = createEngine({ adapters: [delimitedAdapter, arrowIpcAdapter] }).then(async (created) => {
+  const pending = createEngine({
+    adapters: [delimitedAdapter, arrowIpcAdapter, parquetAdapter, excelAdapter],
+  }).then(async (created) => {
     if (generation !== engineGeneration) {
       await safelyClose(created);
       throw cancellationError("Engine startup was cancelled because the page was hidden");
@@ -606,7 +610,8 @@ function updateSourceSummary() {
 
 function updateSourceOptions() {
   const isArrow = formatInput.value === "arrow";
-  advanced.hidden = isArrow;
+  const isDelimited = formatInput.value === "csv" || formatInput.value === "tsv";
+  advanced.hidden = !isDelimited;
   arrowOptions.hidden = !isArrow;
   delimiterHelp.textContent = formatInput.value === "tsv"
     ? "Leave blank for a tab. Use \\t to enter a tab explicitly."
@@ -620,6 +625,15 @@ function readOpenOptions() {
       adapterOptions: {
         container: arrowContainerInput.value,
       },
+    };
+  }
+  if (formatInput.value === "parquet") {
+    return { adapter: parquetAdapter, adapterOptions: {} };
+  }
+  if (formatInput.value === "xls" || formatInput.value === "xlsx") {
+    return {
+      adapter: excelAdapter,
+      adapterOptions: { format: formatInput.value },
     };
   }
   const adapterOptions = {
@@ -680,7 +694,7 @@ function recoveryMessage(error) {
     return "Review the delimiter, header, or malformed-row setting, then retry the same local source.";
   }
   if (errorCode(error) === "UNSUPPORTED_FEATURE") {
-    return "This Arrow source uses a feature the current IPC adapter cannot decode. Choose another source or container mode.";
+    return "This source uses a format feature outside the 0.1 preview contract. Choose another local source or supported variant.";
   }
   if (isTerminalEngineError(error)) {
     return "The Worker stopped. Retry will start a fresh Worker and reopen the same local source.";

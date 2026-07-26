@@ -20,6 +20,8 @@ interface RawWasmRuntime {
   ): unknown;
   openTable(sourceHandle: string | number, tableId: string): unknown;
   metadata(handle: string | number): unknown;
+  presentation(handle: string | number): unknown;
+  readPresentationRange(handle: string | number, request: unknown): unknown;
   beginRead(tableHandle: string | number, request: unknown): unknown;
   cancelOperation(operationHandle: string | number): unknown;
   closeTable(tableHandle: string | number): unknown;
@@ -31,8 +33,47 @@ interface RawWasmRuntime {
 interface WasmBindings {
   default(input?: unknown): Promise<unknown> | unknown;
   WasmRuntime?: new (config: unknown) => RawWasmRuntime;
-  WasmArrowRuntime?: new (config: unknown) => RawWasmRuntime;
 }
+
+interface AdapterPendingRead {
+  readonly operationHandle: string | number;
+  readonly action: Readonly<{
+    readonly kind: "read-bytes";
+    readonly offset: number;
+    readonly length: number;
+  }>;
+}
+
+export interface AdapterReadBytesStep extends AdapterPendingRead {
+  readonly kind: "read-bytes";
+}
+
+export interface AdapterOpenProgressStep extends AdapterPendingRead {
+  readonly kind: "open-progress";
+  readonly sourceHandle: string | number;
+  readonly tables: unknown;
+  readonly metadata: unknown;
+  readonly progress: unknown;
+  readonly warnings?: unknown;
+}
+
+export interface AdapterOpenCompleteStep {
+  readonly kind: "open-complete";
+  readonly sourceHandle: string | number;
+  readonly tables: unknown;
+  readonly metadata: unknown;
+  readonly progress?: unknown;
+  readonly warnings?: unknown;
+}
+
+export interface AdapterReadCompleteStep {
+  readonly kind: "read-complete";
+  readonly batch: unknown;
+}
+
+export type AdapterOpenStep = AdapterReadBytesStep | AdapterOpenProgressStep | AdapterOpenCompleteStep;
+export type AdapterReadStep = AdapterReadBytesStep | AdapterReadCompleteStep;
+export type AdapterOperationStep = AdapterOpenStep | AdapterReadStep;
 
 /**
  * The sole translation layer between the Worker protocol and wasm-bindgen.
@@ -58,9 +99,7 @@ export class WasmAdapter {
         throw new TypeError("The WebAssembly module does not export a default initializer");
       }
       await bindings.default();
-      const Runtime = expectedAdapterId === "tabulark:delimited"
-        ? bindings.WasmRuntime
-        : bindings.WasmArrowRuntime;
+      const Runtime = bindings.WasmRuntime;
       if (typeof Runtime !== "function") {
         throw new ProtocolFault(
           "PROTOCOL_INCOMPATIBLE",
@@ -98,7 +137,18 @@ export class WasmAdapter {
     return this.#call("metadata", () => this.#runtime.metadata(sourceHandle));
   }
 
-  beginOpen(options: unknown, sourceLength: number): unknown {
+  presentation(tableHandle: string | number): unknown {
+    return this.#call("presentation", () => this.#runtime.presentation(tableHandle));
+  }
+
+  readPresentationRange(tableHandle: string | number, request: unknown): unknown {
+    return this.#call(
+      "readPresentationRange",
+      () => this.#runtime.readPresentationRange(tableHandle, request),
+    );
+  }
+
+  beginOpen(options: unknown, sourceLength: number): AdapterOpenStep {
     return this.#call("beginOpen", () => this.#runtime.beginOpen(options, sourceLength));
   }
 
@@ -107,7 +157,7 @@ export class WasmAdapter {
     absoluteOffset: number,
     bytes: Uint8Array,
     eof: boolean,
-  ): unknown {
+  ): AdapterOperationStep {
     return this.#call("continueOperation", () =>
       this.#runtime.continueOperation(operationHandle, absoluteOffset, bytes, eof),
     );
@@ -117,7 +167,7 @@ export class WasmAdapter {
     return this.#call("openTable", () => this.#runtime.openTable(sourceHandle, tableId));
   }
 
-  beginRead(tableHandle: string | number, request: unknown): unknown {
+  beginRead(tableHandle: string | number, request: unknown): AdapterReadStep {
     return this.#call("beginRead", () => this.#runtime.beginRead(tableHandle, request));
   }
 
@@ -153,6 +203,8 @@ export class WasmAdapter {
       "continueOperation",
       "openTable",
       "metadata",
+      "presentation",
+      "readPresentationRange",
       "beginRead",
       "cancelOperation",
       "closeTable",

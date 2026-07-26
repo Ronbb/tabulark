@@ -5,9 +5,13 @@
     "coreBrotli": 147456,
     "arrowRaw": 2555904,
     "arrowBrotli": 393216,
-    "npmPacked": 917504,
-    "npmUnpacked": 3735552,
-    "pagesRaw": 3866624,
-    "pagesBrotli": 720896
+    "parquetRaw": 4653056,
+    "parquetBrotli": 1048576,
+    "excelRaw": 1114112,
+    "excelBrotli": 393216,
+    "npmPacked": 2883584,
+    "npmUnpacked": 9961472,
+    "pagesRaw": 10092544,
+    "pagesBrotli": 2228224
   }
 }

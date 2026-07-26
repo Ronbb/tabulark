@@ -1,91 +1,83 @@
 # Delivery and release policy
 
-> **M4 does not publish a crate or npm package.** It is a pre-alpha validation
-> milestone. Do not create a tag, change registry ownership, publish to
-> crates.io/npm, or call the milestone complete merely because a local build
-> succeeds.
+M4 completed as a source and Pages milestone. It did **not** publish 0.1.0.
+The 0.1.0 tag remains the only formal release entry point, and it must not be
+created until this checklist is complete.
 
-## Candidate delivery gates
+## Pre-tag checklist
 
-For a commit to be considered an M4 delivery candidate, all of the following
-must be green for that same commit:
-
-1. Rust formatting, Clippy, workspace tests, adapter lifecycle checks, fuzz
-   seed replay, and `wasm32-unknown-unknown` checks for both wrapper crates.
-2. JavaScript type checks, protocol/fixture/lifecycle tests, package-consumer
-   smoke, and a clean `npm run build`.
-3. Chromium Worker, Arrow, Canvas, ARIA, axe, visual, forced-colors, CJK,
-   keyboard/copy, mobile, and lazy-artifact tests.
-4. CSV and Arrow performance/size measurement gates. The M3 CSV canonical
-   baseline remains intact; Arrow has its own measurements and budget.
-5. A Pages assembly from the built package with relative URLs, both WASM
-   artifacts, fixture/provenance/license/notice assets, and local artifact
-   browser tests before upload.
-6. GitHub Pages deployment followed by a smoke test against the actual URL
-   returned by the deployment action. That smoke opens CSV, TSV, and Arrow,
-   switches sources, copies from the semantic grid, checks console/page errors,
-   and verifies lazy artifact network behavior.
-
-The first five gates can establish a local or pull-request candidate. The sixth
-is mandatory production evidence and cannot be inferred from a test server.
-
-## Local verification sequence
+From a clean checkout at `origin/main`, run the full format, type, Rust,
+package-consumer, Chromium, fuzz-seed, and size matrix documented in
+[`testing.md`](testing.md). Then run:
 
 ```sh
-npm ci
-npm run build
-npm run check
-npm run test:browser
-npm run benchmark:smoke
-npm run benchmark:arrow
-npm run benchmark:size
-npm run build:pages
+node scripts/release-preflight.mjs v0.1.0 \
+  --confirm-npm-trusted-publisher \
+  --confirm-crates-trusted-publisher
 ```
 
-The exact complete test matrix and any platform caveats are documented in
-[Testing and performance validation](testing.md). `benchmark:canonical` is
-intentionally a fuller CSV reference benchmark; it is not substituted by the
-small smoke scenario.
+The preflight blocks tagging unless all of these conditions hold:
 
-## Package contents
+- `package.json`, `Cargo.toml`, and `CHANGELOG.md` agree on the version.
+- The release heading no longer says `unreleased`, and the changelog no longer
+  claims that the version has not been published.
+- The worktree is clean, `HEAD` equals `origin/main`, and the tag is unused
+  both locally and remotely.
+- npm and crates.io do not already contain that version; expected registry
+  owners are still present.
+- The operator explicitly confirms the npm and crates.io OIDC trusted-publisher
+  configuration. This cannot be inferred safely through a public registry API.
+- CI and GitHub Pages are both successful for the exact commit, and the
+  deployed Pages URL is reachable.
 
-The packed archive must contain:
+The tag-triggered workflow independently repeats the `origin/main` and exact
+CI/Pages-run checks. A tag cannot bypass a skipped local preflight.
 
-- The `tabulark` root entry point and `tabulark/arrow` subpath export.
-- JavaScript, declarations, and source maps for the root, Arrow entry, and
-  generic Worker.
-- Delimited and Arrow WASM glue, declaration files, and `.wasm` payloads.
-- MIT/Apache licenses and `THIRD_PARTY_NOTICES.md`.
+The confirmation flags are deliberate: before tagging, independently verify
+that npm's trusted publisher is restricted to this repository/workflow and that
+crates.io is configured for the same release identity. In the release workflow,
+the protected GitHub Environments repeat that check through reviewer approval
+and environment-scoped confirmation variables.
 
-`scripts/package-smoke.mjs` packs the built tree, installs it into a temporary
-consumer, checks the export map and exact files, verifies there are no
-production dependencies, imports both public entry points, and typechecks a
-consumer snippet.
+## Tag-triggered release order
 
-## Static Pages delivery
+Pushing `vX.Y.Z` starts the release workflow. It first reruns verification,
+creates and checks the npm tarball, records its SHA-256, and validates package
+contents. Publishing is then serialized:
 
-`npm run build:pages` creates `target/pages` with no CDN runtime dependency and
-only relative internal URLs. It contains the built package runtime, Arrow
-fixtures and provenance, licenses, notice, and the static Playground. The Pages
-workflow tests this assembled directory before `upload-pages-artifact`.
+1. `publish-crate` waits for the protected `cratesio-release` Environment.
+   It checks registry availability again and uses the crates.io OIDC trusted
+   publisher.
+2. `publish-npm` waits for the protected `npm-release` Environment and for the
+   crate job. It publishes the verified tarball with npm provenance rather than
+   rebuilding a different archive.
+3. `github-release` waits for npm. It attaches the recorded tarball checksum
+   and SPDX SBOM to the GitHub Release.
+4. `registry-smoke` installs the published npm package into a clean consumer,
+   imports all stable entry points, typechecks a consumer, and verifies the
+   exact registry version.
+5. `registry-crate-smoke` resolves the exact crates.io version in a clean Cargo
+   project, enables the published experimental feature set, then compiles and
+   runs that consumer.
 
-The deployment job receives the URL output from `actions/deploy-pages` and runs
-the dedicated deployed Pages test with `TABULARK_DEPLOYED_BASE_URL`. If the
-deployment cannot be reached, the job fails; a skipped or missing deployed URL
-does not count as M4 evidence.
+Repository administrators must configure both named Environments with required
+reviewers before enabling release tags. The workflow intentionally fails if the
+environment has not supplied `TABULARK_NPM_TRUSTED_PUBLISHER_CONFIRMED=1` or
+`TABULARK_CRATES_TRUSTED_PUBLISHER_CONFIRMED=1`.
 
-## Future formal releases
+## Immutable release semantics
 
-The repository may retain a tag-triggered formal release workflow for a later
-milestone, but that workflow is not authorization to publish M4. Before a
-future release is proposed, explicitly decide and record:
+Registry publication is not atomically reversible. A tag may be rerun without
+code changes when a workflow delivery step fails. Before a rerun accepts an
+existing version, it downloads the registry `.crate` or npm tarball and compares
+it byte-for-byte with the checksum-verified release bundle; a mismatch fails
+the workflow instead of silently skipping publication. If code needs to change
+after either registry publishes, create a new patch release such as `0.1.1`;
+deprecate and/or yank `0.1.0` according to severity rather than moving or
+reusing its tag.
 
-- The public API and adapter-ABI stability policy.
-- Semver versioning and changelog policy.
-- Registry ownership and trusted publishing configuration.
-- Supported browsers, source formats, compression/type guarantees, and
-  compatibility horizon.
-- Reproducible artifact provenance, notices, and security-review process.
+## M4 evidence
 
-Until then, source builds and GitHub Pages candidates are the only intended M4
-delivery channels.
+The previous milestone's CI, Pages deployment, and deployed-URL smoke evidence
+is recorded in [`m4-completion.md`](m4-completion.md). That record does not
+substitute for the 0.1.0 format-specific release gates.

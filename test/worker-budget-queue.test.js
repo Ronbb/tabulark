@@ -29,7 +29,7 @@ test("Worker derives Wasm limits and bounds/cancels queued range reads", async (
     let nextRequest = 1;
     const send = (op, payload) => {
       const requestId = `r${nextRequest++}`;
-      const request = { protocolVersion: 2, requestId, op, payload };
+      const request = { protocolVersion: 3, requestId, op, payload };
       for (const listener of listeners) listener({ data: request });
       return requestId;
     };
@@ -43,7 +43,7 @@ test("Worker derives Wasm limits and bounds/cancels queued range reads", async (
     };
 
     const hello = send("hello", {
-      adapters: [{ id: "tabulark:delimited", moduleUrl: wasmModuleUrl }],
+      adapters: [testAdapter("tabulark:delimited", wasmModuleUrl)],
       memoryBudgetBytes: 8 * 1024 * 1024,
     });
     assert.equal((await responseFor(hello)).status, "success");
@@ -57,7 +57,7 @@ test("Worker derives Wasm limits and bounds/cancels queued range reads", async (
     });
     const datasetHandle = (await responseFor(opened)).result.data.datasetHandle;
     assert.deepEqual(globalThis.__tabularkWasmConfigs[0], {
-      memoryBudgetBytes: 2 * 1024 * 1024,
+      memoryBudgetBytes: 4 * 1024 * 1024,
       indexBudgetBytes: 1024 * 1024,
       tileCacheBudgetBytes: 1024 * 1024,
       chunkBytes: 1024 * 1024,
@@ -82,6 +82,7 @@ test("Worker derives Wasm limits and bounds/cancels queued range reads", async (
     const overLimit = await responseFor(reads[10]);
     assert.equal(overLimit.status, "failure");
     assert.equal(overLimit.error.code, "RESOURCE_LIMIT");
+    assertResourceLimitDetails(overLimit.error.details);
 
     const cancelled = send("cancel", { targetRequestId: reads[2] });
     assert.equal((await responseFor(cancelled)).status, "success");
@@ -133,7 +134,7 @@ test("Worker cancels an in-flight open and releases its source immediately", asy
     let nextRequest = 1;
     const send = (op, payload) => {
       const requestId = `r${nextRequest++}`;
-      const request = { protocolVersion: 2, requestId, op, payload };
+      const request = { protocolVersion: 3, requestId, op, payload };
       for (const listener of listeners) listener({ data: request });
       return requestId;
     };
@@ -147,7 +148,7 @@ test("Worker cancels an in-flight open and releases its source immediately", asy
     };
 
     const hello = send("hello", {
-      adapters: [{ id: "tabulark:delimited", moduleUrl: wasmModuleUrl }],
+      adapters: [testAdapter("tabulark:delimited", wasmModuleUrl)],
       memoryBudgetBytes: 8 * 1024 * 1024,
     });
     assert.equal((await responseFor(hello)).status, "success");
@@ -175,6 +176,12 @@ test("Worker cancels an in-flight open and releases its source immediately", asy
     source.resumeSlices();
   } finally {
     restoreGlobals(globals);
+  }
+});
+
+test("cancelled Blob reads retain reservations until normal and progressive reads settle", async () => {
+  for (const progressive of [false, true]) {
+    await assertCancelledBlobReservationsHeld(progressive);
   }
 });
 
@@ -208,7 +215,7 @@ test("Worker counts datasets and cross-adapter in-flight opens against one sourc
     const send = (op, payload) => {
       const requestId = `r${nextRequest++}`;
       for (const listener of listeners) {
-        listener({ data: { protocolVersion: 2, requestId, op, payload } });
+        listener({ data: { protocolVersion: 3, requestId, op, payload } });
       }
       return requestId;
     };
@@ -224,8 +231,8 @@ test("Worker counts datasets and cross-adapter in-flight opens against one sourc
 
     const hello = send("hello", {
       adapters: [
-        { id: "tabulark:delimited", moduleUrl: mockWasmModuleUrl() },
-        { id: "tabulark:arrow-ipc", moduleUrl: mockArrowWasmModuleUrl() },
+        testAdapter("tabulark:delimited", mockWasmModuleUrl()),
+        testAdapter("tabulark:arrow-ipc", mockArrowWasmModuleUrl()),
       ],
       memoryBudgetBytes: 8 * 1024 * 1024,
     });
@@ -256,6 +263,7 @@ test("Worker counts datasets and cross-adapter in-flight opens against one sourc
     assert.equal(overLimitResponse.status, "failure");
     assert.equal(overLimitResponse.error.code, "RESOURCE_LIMIT");
     assert.equal(overLimitResponse.error.details.maxSources, 2);
+    assertResourceLimitDetails(overLimitResponse.error.details);
     assert.equal(globalThis.__tabularkWasmConfigs[0].memoryBudgetBytes, 2 * 1024 * 1024);
     assert.equal(globalThis.__tabularkArrowConfigs[0].memoryBudgetBytes, 2 * 1024 * 1024);
 
@@ -287,7 +295,7 @@ test("Worker counts datasets and cross-adapter in-flight opens against one sourc
   }
 });
 
-test("Delimited open returns an indexed preview while its ABI-v1 operation scans in background", async () => {
+test("Delimited open returns an indexed preview while its ABI-v2 operation scans in background", async () => {
   const globals = saveGlobals([
     "addEventListener",
     "postMessage",
@@ -311,7 +319,7 @@ test("Delimited open returns an indexed preview while its ABI-v1 operation scans
     const send = (op, payload) => {
       const requestId = `r${nextRequest++}`;
       for (const listener of listeners) {
-        listener({ data: { protocolVersion: 2, requestId, op, payload } });
+        listener({ data: { protocolVersion: 3, requestId, op, payload } });
       }
       return requestId;
     };
@@ -325,7 +333,7 @@ test("Delimited open returns an indexed preview while its ABI-v1 operation scans
     };
 
     const hello = send("hello", {
-      adapters: [{ id: "tabulark:delimited", moduleUrl: progressiveDelimitedWasmModuleUrl() }],
+      adapters: [testAdapter("tabulark:delimited", progressiveDelimitedWasmModuleUrl())],
       memoryBudgetBytes: 8 * 1024 * 1024,
     });
     assert.equal((await responseFor(hello)).status, "success");
@@ -367,6 +375,7 @@ test("Delimited open returns an indexed preview while its ABI-v1 operation scans
     const overLimit = await responseFor(additionalFutureReads.at(-1));
     assert.equal(overLimit.status, "failure");
     assert.equal(overLimit.error.code, "RESOURCE_LIMIT");
+    assertResourceLimitDetails(overLimit.error.details);
     const cancelWaiting = send("cancel", { targetRequestId: additionalFutureReads[0] });
     assert.equal((await responseFor(cancelWaiting)).status, "success");
     assert.equal((await responseFor(additionalFutureReads[0])).error.code, "CANCELLED");
@@ -394,6 +403,8 @@ test("Delimited open returns an indexed preview while its ABI-v1 operation scans
     ));
     assert.deepEqual(completed.payload, {
       sourceHandle: datasetHandle,
+      tableId: "table-0",
+      revision: 0,
       bytesScanned: 2 * 1024 * 1024,
       rowsDiscovered: 600,
       done: true,
@@ -431,7 +442,7 @@ test("Delimited EOF progress is retained until open finishes the listTables hand
     const send = (op, payload) => {
       const requestId = `r${nextRequest++}`;
       for (const listener of listeners) {
-        listener({ data: { protocolVersion: 2, requestId, op, payload } });
+        listener({ data: { protocolVersion: 3, requestId, op, payload } });
       }
       return requestId;
     };
@@ -445,7 +456,7 @@ test("Delimited EOF progress is retained until open finishes the listTables hand
     };
 
     const hello = send("hello", {
-      adapters: [{ id: "tabulark:delimited", moduleUrl: progressiveDelimitedWasmModuleUrl() }],
+      adapters: [testAdapter("tabulark:delimited", progressiveDelimitedWasmModuleUrl())],
       memoryBudgetBytes: 8 * 1024 * 1024,
     });
     assert.equal((await responseFor(hello)).status, "success");
@@ -478,12 +489,15 @@ test("Delimited EOF progress is retained until open finishes the listTables hand
 
     const completed = messages.filter((message) => message.event === "progress");
     assert.deepEqual(completed, [{
-      protocolVersion: 2,
+      protocolVersion: 3,
       event: "progress",
       datasetHandle,
       tableId: "table-0",
+      revision: 0,
       payload: {
         sourceHandle: datasetHandle,
+        tableId: "table-0",
+        revision: 0,
         bytesScanned: sourceSize,
         rowsDiscovered: 600,
         done: true,
@@ -520,6 +534,8 @@ test("Delimited EOF progress is retained until open finishes the listTables hand
     const emptyCompleted = messages.filter((message) => message.event === "progress").at(-1);
     assert.deepEqual(emptyCompleted?.payload, {
       sourceHandle: emptyDatasetHandle,
+      tableId: "table-0",
+      revision: 0,
       bytesScanned: 0,
       rowsDiscovered: 0,
       done: true,
@@ -562,7 +578,7 @@ test("Arrow Stream open publishes an indexed prefix and completes under the same
     const send = (op, payload) => {
       const requestId = `r${nextRequest++}`;
       for (const listener of listeners) {
-        listener({ data: { protocolVersion: 2, requestId, op, payload } });
+        listener({ data: { protocolVersion: 3, requestId, op, payload } });
       }
       return requestId;
     };
@@ -576,7 +592,7 @@ test("Arrow Stream open publishes an indexed prefix and completes under the same
     };
 
     const hello = send("hello", {
-      adapters: [{ id: "tabulark:arrow-ipc", moduleUrl: progressiveArrowWasmModuleUrl() }],
+      adapters: [testAdapter("tabulark:arrow-ipc", progressiveArrowWasmModuleUrl())],
       memoryBudgetBytes: 8 * 1024 * 1024,
     });
     assert.equal((await responseFor(hello)).status, "success");
@@ -588,7 +604,11 @@ test("Arrow Stream open publishes an indexed prefix and completes under the same
       options: { container: "stream" },
     });
     const openResponse = await responseFor(opened);
-    assert.equal(openResponse.status, "success", "the first decoded record prefix is enough to open");
+    assert.equal(
+      openResponse.status,
+      "success",
+      `the first decoded record prefix is enough to open: ${JSON.stringify(openResponse)}`,
+    );
     await eventually(() => source.waitingForSecondSlice);
     const datasetHandle = openResponse.result.data.datasetHandle;
     const listed = send("listTables", { datasetHandle });
@@ -650,6 +670,8 @@ test("Arrow Stream open publishes an indexed prefix and completes under the same
     ));
     assert.deepEqual(completed.payload, {
       sourceHandle: datasetHandle,
+      tableId: "table-0",
+      revision: 0,
       bytesScanned: 2 * 1024 * 1024,
       rowsDiscovered: 600,
       done: true,
@@ -686,7 +708,7 @@ test("an adapter open failure cancels its operation and does not poison later op
     let nextRequest = 1;
     const send = (op, payload) => {
       const requestId = `r${nextRequest++}`;
-      const request = { protocolVersion: 2, requestId, op, payload };
+      const request = { protocolVersion: 3, requestId, op, payload };
       for (const listener of listeners) listener({ data: request });
       return requestId;
     };
@@ -700,7 +722,7 @@ test("an adapter open failure cancels its operation and does not poison later op
     };
 
     const hello = send("hello", {
-      adapters: [{ id: "tabulark:delimited", moduleUrl: backgroundFailureWasmModuleUrl() }],
+      adapters: [testAdapter("tabulark:delimited", backgroundFailureWasmModuleUrl())],
       memoryBudgetBytes: 8 * 1024 * 1024,
     });
     assert.equal((await responseFor(hello)).status, "success");
@@ -768,7 +790,7 @@ test("a failed Arrow artifact initialization is retryable and does not poison de
     const send = (op, payload) => {
       const requestId = `r${nextRequest++}`;
       for (const listener of listeners) {
-        listener({ data: { protocolVersion: 2, requestId, op, payload } });
+        listener({ data: { protocolVersion: 3, requestId, op, payload } });
       }
       return requestId;
     };
@@ -783,8 +805,8 @@ test("a failed Arrow artifact initialization is retryable and does not poison de
 
     const hello = send("hello", {
       adapters: [
-        { id: "tabulark:delimited", moduleUrl: mockWasmModuleUrl() },
-        { id: "tabulark:arrow-ipc", moduleUrl: flakyArrowWasmModuleUrl() },
+        testAdapter("tabulark:delimited", mockWasmModuleUrl()),
+        testAdapter("tabulark:arrow-ipc", flakyArrowWasmModuleUrl()),
       ],
       memoryBudgetBytes: 8 * 1024 * 1024,
     });
@@ -862,7 +884,7 @@ test("Worker canonicalizes snake_case fields from Rust enum variant descriptors"
     const send = (op, payload) => {
       const requestId = `r${nextRequest++}`;
       for (const listener of listeners) {
-        listener({ data: { protocolVersion: 2, requestId, op, payload } });
+        listener({ data: { protocolVersion: 3, requestId, op, payload } });
       }
       return requestId;
     };
@@ -876,7 +898,7 @@ test("Worker canonicalizes snake_case fields from Rust enum variant descriptors"
     };
 
     const hello = send("hello", {
-      adapters: [{ id: "tabulark:delimited", moduleUrl: snakeCaseDescriptorWasmModuleUrl() }],
+      adapters: [testAdapter("tabulark:delimited", snakeCaseDescriptorWasmModuleUrl())],
       memoryBudgetBytes: 8 * 1024 * 1024,
     });
     assert.equal((await responseFor(hello)).status, "success");
@@ -917,6 +939,10 @@ class SlowBlob extends Blob {
     this.#paused = true;
   }
 
+  get pendingSlices() {
+    return this.#resolvers.length;
+  }
+
   resumeSlices() {
     this.#paused = false;
     for (const resolve of this.#resolvers.splice(0)) {
@@ -929,6 +955,104 @@ class SlowBlob extends Blob {
     return {
       arrayBuffer: () => new Promise((resolve) => this.#resolvers.push(resolve)),
     };
+  }
+}
+
+async function assertCancelledBlobReservationsHeld(progressive) {
+  const globals = saveGlobals([
+    "addEventListener",
+    "postMessage",
+    "close",
+    "__tabularkWasmConfigs",
+    "__tabularkBeginCount",
+    "__tabularkClosedSources",
+  ]);
+  const listeners = new Set();
+  const messages = [];
+  Object.defineProperties(globalThis, {
+    addEventListener: { configurable: true, value: (type, listener) => {
+      if (type === "message") listeners.add(listener);
+    } },
+    postMessage: { configurable: true, value: (message) => messages.push(message) },
+    close: { configurable: true, value: () => {} },
+    __tabularkWasmConfigs: { configurable: true, writable: true, value: [] },
+    __tabularkBeginCount: { configurable: true, writable: true, value: 0 },
+    __tabularkClosedSources: { configurable: true, writable: true, value: 0 },
+  });
+
+  try {
+    await import(`../dist/worker.js?reservation-after-cancel=${progressive}-${Date.now()}`);
+    let nextRequest = 1;
+    const send = (op, payload) => {
+      const requestId = `lease-${progressive}-${nextRequest++}`;
+      for (const listener of listeners) {
+        listener({ data: { protocolVersion: 3, requestId, op, payload } });
+      }
+      return requestId;
+    };
+    const responseFor = async (requestId) => {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        const response = messages.find((message) => message.requestId === requestId);
+        if (response) return response;
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      throw new Error(`No response for ${requestId}`);
+    };
+    const moduleUrl = progressive
+      ? progressiveDelimitedWasmModuleUrl()
+      : mockWasmModuleUrl();
+    const hello = send("hello", {
+      adapters: [testAdapter("tabulark:delimited", moduleUrl)],
+      memoryBudgetBytes: 2 * 1024 * 1024,
+    });
+    assert.equal((await responseFor(hello)).status, "success");
+
+    const sourceBytes = 256 * 1024;
+    const blockedSources = [];
+    for (let index = 0; index < 4; index += 1) {
+      const source = new SlowBlob([new Uint8Array(sourceBytes)]);
+      source.pauseSlices();
+      blockedSources.push(source);
+      const opening = send("openSource", {
+        source,
+        adapterId: "tabulark:delimited",
+        options: { delimiter: ",", header: "first-row", mode: "strict" },
+      });
+      await eventually(() => source.pendingSlices === 1);
+      const cancel = send("cancel", { targetRequestId: opening });
+      assert.equal((await responseFor(cancel)).status, "success");
+      assert.equal((await responseFor(opening)).error.code, "CANCELLED");
+    }
+
+    const whileReadsPending = send("openSource", {
+      source: new Blob([new Uint8Array(sourceBytes)]),
+      adapterId: "tabulark:delimited",
+      options: { delimiter: ",", header: "first-row", mode: "strict" },
+    });
+    const blocked = await responseFor(whileReadsPending);
+    assert.equal(blocked.status, "failure");
+    assert.equal(blocked.error.code, "RESOURCE_LIMIT");
+    assert.deepEqual(blocked.error.details, {
+      resource: "source-staging",
+      requiredBytes: sourceBytes,
+      availableBytes: 0,
+    });
+
+    blockedSources[0].resumeSlices();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const afterSettlement = send("openSource", {
+      source: new Blob([new Uint8Array(sourceBytes)]),
+      adapterId: "tabulark:delimited",
+      options: { delimiter: ",", header: "first-row", mode: "strict" },
+    });
+    assert.equal((await responseFor(afterSettlement)).status, "success");
+
+    for (const source of blockedSources.slice(1)) source.resumeSlices();
+    const shutdown = send("shutdown", {});
+    assert.equal((await responseFor(shutdown)).status, "success");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  } finally {
+    restoreGlobals(globals);
   }
 }
 
@@ -966,26 +1090,26 @@ function mockWasmModuleUrl() {
     export default async function init() {}
     export class WasmRuntime {
       constructor(config) { globalThis.__tabularkWasmConfigs.push(config); }
-      protocolVersion() { return 2; }
-      adapterApiVersion() { return 1; }
+      protocolVersion() { return 3; }
+      adapterApiVersion() { return 2; }
       batchLayoutVersion() { return 1; }
       adapterId() { return "tabulark:delimited"; }
       beginOpen(_options, sourceLength) {
         const handle = nextOperation++;
         operations.set(handle, { kind: "open" });
-        return { operationHandle: handle, action: { kind: "read-bytes", offset: 0, length: sourceLength } };
+        return { kind: "read-bytes", operationHandle: handle, action: { kind: "read-bytes", offset: 0, length: sourceLength } };
       }
       continueOperation(handle) {
         const operation = operations.get(handle);
         operations.delete(handle);
         if (operation.kind === "open") {
-          return { status: "complete", sourceHandle: 1, tables: [{ id: "table-0", name: "Table 1" }], metadata: metadata() };
+          return { kind: "open-complete", sourceHandle: 1, tables: [{ id: "table-0", name: "Table 1" }], metadata: metadata() };
         }
         const range = operation.range;
         const values = new Uint8Array();
         const offsets = new Uint32Array(range.rowCount + 1);
         const validity = new Uint8Array([1]);
-        return { status: "complete", batch: {
+        return { kind: "read-complete", batch: {
           layoutVersion: 1,
           tableId: "table-0", revision: 0, schemaVersion: 0, range, complete: true,
           buffers: [values, offsets, validity],
@@ -998,11 +1122,13 @@ function mockWasmModuleUrl() {
       }
       openTable() { return { tableHandle: 1, metadata: metadata() }; }
       metadata() { return metadata(); }
+      presentation() { return null; }
+      readPresentationRange() { return null; }
       beginRead(_table, request) {
         const handle = nextOperation++;
         globalThis.__tabularkBeginCount += 1;
         operations.set(handle, { kind: "read", range: request });
-        return { operationHandle: handle, action: { kind: "read-bytes", offset: 0, length: 1 } };
+        return { kind: "read-bytes", operationHandle: handle, action: { kind: "read-bytes", offset: 0, length: 1 } };
       }
       cancelOperation(handle) {
         const operation = operations.get(handle);
@@ -1028,23 +1154,25 @@ function mockArrowWasmModuleUrl() {
     const operations = new Set();
     let nextOperation = 1;
     export default async function init() {}
-    export class WasmArrowRuntime {
+    export class WasmRuntime {
       constructor(config) { globalThis.__tabularkArrowConfigs.push(config); }
-      protocolVersion() { return 2; }
-      adapterApiVersion() { return 1; }
+      protocolVersion() { return 3; }
+      adapterApiVersion() { return 2; }
       batchLayoutVersion() { return 1; }
       adapterId() { return "tabulark:arrow-ipc"; }
       beginOpen(_options, sourceLength) {
         const handle = nextOperation++;
         operations.add(handle);
-        return { operationHandle: handle, action: { kind: "read-bytes", offset: 0, length: sourceLength } };
+        return { kind: "read-bytes", operationHandle: handle, action: { kind: "read-bytes", offset: 0, length: sourceLength } };
       }
       continueOperation(handle) {
         operations.delete(handle);
-        return { status: "complete", sourceHandle: 1, tables: [{ id: "table-0", name: "Arrow IPC" }], metadata: metadata() };
+        return { kind: "open-complete", sourceHandle: 1, tables: [{ id: "table-0", name: "Arrow IPC" }], metadata: metadata() };
       }
       openTable() { return { tableHandle: 1, metadata: metadata() }; }
       metadata() { return metadata(); }
+      presentation() { return null; }
+      readPresentationRange() { return null; }
       beginRead() { throw new Error("not used"); }
       cancelOperation(handle) { operations.delete(handle); }
       closeTable() {}
@@ -1070,8 +1198,8 @@ function backgroundFailureWasmModuleUrl() {
     export default async function init() {}
     export class WasmRuntime {
       constructor(config) { chunkBytes = config.chunkBytes; }
-      protocolVersion() { return 2; }
-      adapterApiVersion() { return 1; }
+      protocolVersion() { return 3; }
+      adapterApiVersion() { return 2; }
       batchLayoutVersion() { return 1; }
       adapterId() { return "tabulark:delimited"; }
       beginOpen(_options, sourceLength) {
@@ -1079,13 +1207,14 @@ function backgroundFailureWasmModuleUrl() {
         const fail = failNextOpen;
         failNextOpen = false;
         operations.set(handle, { fail, sourceLength, step: 0 });
-        return { operationHandle: handle, action: { kind: "read-bytes", offset: 0, length: Math.min(chunkBytes, sourceLength) } };
+        return { kind: "read-bytes", operationHandle: handle, action: { kind: "read-bytes", offset: 0, length: Math.min(chunkBytes, sourceLength) } };
       }
       continueOperation(handle) {
         const operation = operations.get(handle);
         if (operation.fail && operation.step === 0) {
           operation.step = 1;
           return {
+            kind: "read-bytes",
             operationHandle: handle,
             action: {
               kind: "read-bytes",
@@ -1096,10 +1225,12 @@ function backgroundFailureWasmModuleUrl() {
         }
         if (operation.fail) throw new Error("synthetic adapter open failure");
         operations.delete(handle);
-        return { status: "complete", sourceHandle: 1, tables: [{ id: "table-0", name: "Table 1" }], metadata: metadata() };
+        return { kind: "open-complete", sourceHandle: 1, tables: [{ id: "table-0", name: "Table 1" }], metadata: metadata() };
       }
       openTable() { return { tableHandle: 1, metadata: metadata() }; }
       metadata() { return metadata(); }
+      presentation() { return null; }
+      readPresentationRange() { return null; }
       beginRead() { throw new Error("not used"); }
       cancelOperation(handle) {
         if (operations.delete(handle)) globalThis.__tabularkClosedSources += 1;
@@ -1129,6 +1260,7 @@ function progressiveDelimitedWasmModuleUrl() {
     });
     const tables = [{ id: "table-0", name: "Table 1" }];
     const pending = (operationHandle, offset, length) => ({
+      kind: "open-progress",
       operationHandle,
       action: { kind: "read-bytes", offset, length },
       sourceHandle: 1,
@@ -1154,8 +1286,8 @@ function progressiveDelimitedWasmModuleUrl() {
     export default async function init() {}
     export class WasmRuntime {
       constructor(config) { chunkBytes = config.chunkBytes; }
-      protocolVersion() { return 2; }
-      adapterApiVersion() { return 1; }
+      protocolVersion() { return 3; }
+      adapterApiVersion() { return 2; }
       batchLayoutVersion() { return 1; }
       adapterId() { return "tabulark:delimited"; }
       beginOpen(_options, sourceLength) {
@@ -1182,15 +1314,17 @@ function progressiveDelimitedWasmModuleUrl() {
         operations.delete(handle);
         scanDone = true;
         return {
-          status: "complete", sourceHandle: 1, metadata: metadata(), tables,
+          kind: "open-complete", sourceHandle: 1, metadata: metadata(), tables,
           progress: { sourceHandle: 1, bytesScanned: operation.sourceLength, rowsDiscovered: scannedRows, done: true },
         };
       }
       openTable() { return { tableHandle: 1, metadata: metadata() }; }
       metadata() { return metadata(); }
+      presentation() { return null; }
+      readPresentationRange() { return null; }
       beginRead(_table, request) {
         globalThis.__tabularkReadStarts.push(request.rowStart);
-        return { status: "complete", batch: batch(request) };
+        return { kind: "read-complete", batch: batch(request) };
       }
       cancelOperation(handle) { operations.delete(handle); }
       closeTable() {}
@@ -1219,6 +1353,7 @@ function progressiveArrowWasmModuleUrl() {
     });
     const tables = [{ id: "table-0", name: "Arrow IPC" }];
     const pending = (operationHandle, offset, length) => ({
+      kind: "open-progress",
       operationHandle,
       action: { kind: "read-bytes", offset, length },
       sourceHandle,
@@ -1255,15 +1390,16 @@ function progressiveArrowWasmModuleUrl() {
       };
     };
     export default async function init() {}
-    export class WasmArrowRuntime {
+    export class WasmRuntime {
       constructor(config) { chunkBytes = config.chunkBytes; }
-      protocolVersion() { return 2; }
-      adapterApiVersion() { return 1; }
+      protocolVersion() { return 3; }
+      adapterApiVersion() { return 2; }
       batchLayoutVersion() { return 1; }
       adapterId() { return "tabulark:arrow-ipc"; }
       beginOpen(_options, sourceLength) {
         operations.set(1, { sourceLength, offset: 0 });
         return {
+          kind: "read-bytes",
           operationHandle: 1,
           action: { kind: "read-bytes", offset: 0, length: Math.min(chunkBytes, sourceLength) },
         };
@@ -1282,15 +1418,17 @@ function progressiveArrowWasmModuleUrl() {
         operations.delete(handle);
         scanDone = true;
         return {
-          status: "complete", sourceHandle, metadata: metadata(), tables,
+          kind: "open-complete", sourceHandle, metadata: metadata(), tables,
           progress: { sourceHandle, bytesScanned: operation.sourceLength, rowsDiscovered: scannedRows, done: true },
         };
       }
       openTable() { return { tableHandle: 9, metadata: metadata() }; }
       metadata() { return metadata(); }
+      presentation() { return null; }
+      readPresentationRange() { return null; }
       beginRead(_table, request) {
         globalThis.__tabularkReadStarts.push(request.rowStart);
-        return { status: "complete", batch: batch(request) };
+        return { kind: "read-complete", batch: batch(request) };
       }
       cancelOperation(handle) { operations.delete(handle); }
       closeTable() {}
@@ -1315,23 +1453,25 @@ function flakyArrowWasmModuleUrl() {
       globalThis.__tabularkArrowInitAttempts += 1;
       if (globalThis.__tabularkArrowInitAttempts === 1) throw new Error("synthetic Arrow initializer failure");
     }
-    export class WasmArrowRuntime {
-      protocolVersion() { return 2; }
-      adapterApiVersion() { return 1; }
+    export class WasmRuntime {
+      protocolVersion() { return 3; }
+      adapterApiVersion() { return 2; }
       batchLayoutVersion() { return 1; }
       adapterId() { return "tabulark:arrow-ipc"; }
       beginOpen(options, sourceLength) {
         globalThis.__tabularkArrowOpenOptions = options;
         const handle = nextOperation++;
         operations.add(handle);
-        return { operationHandle: handle, action: { kind: "read-bytes", offset: 0, length: sourceLength } };
+        return { kind: "read-bytes", operationHandle: handle, action: { kind: "read-bytes", offset: 0, length: sourceLength } };
       }
       continueOperation(handle) {
         operations.delete(handle);
-        return { status: "complete", sourceHandle: 2, tables: [{ id: "table-0", name: "Arrow IPC" }], metadata: metadata() };
+        return { kind: "open-complete", sourceHandle: 2, tables: [{ id: "table-0", name: "Arrow IPC" }], metadata: metadata() };
       }
       openTable() { return { tableHandle: 2, metadata: metadata() }; }
       metadata() { return metadata(); }
+      presentation() { return null; }
+      readPresentationRange() { return null; }
       beginRead() { throw new Error("not used"); }
       cancelOperation(handle) { operations.delete(handle); }
       closeTable() {}
@@ -1372,18 +1512,20 @@ function snakeCaseDescriptorWasmModuleUrl() {
     });
     export default async function init() {}
     export class WasmRuntime {
-      protocolVersion() { return 2; }
-      adapterApiVersion() { return 1; }
+      protocolVersion() { return 3; }
+      adapterApiVersion() { return 2; }
       batchLayoutVersion() { return 1; }
       adapterId() { return "tabulark:delimited"; }
       beginOpen(_options, sourceLength) {
-        return { operationHandle: 1, action: { kind: "read-bytes", offset: 0, length: sourceLength } };
+        return { kind: "read-bytes", operationHandle: 1, action: { kind: "read-bytes", offset: 0, length: sourceLength } };
       }
       continueOperation() {
-        return { status: "complete", sourceHandle: 1, tables: [{ id: "table-0", name: "Table 1" }], metadata: metadata() };
+        return { kind: "open-complete", sourceHandle: 1, tables: [{ id: "table-0", name: "Table 1" }], metadata: metadata() };
       }
       openTable() { return { tableHandle: 1, metadata: metadata() }; }
       metadata() { return metadata(); }
+      presentation() { return null; }
+      readPresentationRange() { return null; }
       beginRead() {
         const typeIds = new Int8Array([5, 7]);
         const left = new Int32Array([11, 0]);
@@ -1392,7 +1534,7 @@ function snakeCaseDescriptorWasmModuleUrl() {
         const runValues = new Int32Array([7]);
         const displayOffsets = new Uint32Array([0, 0, 0]);
         const displayValues = new Uint8Array();
-        return { status: "complete", batch: {
+        return { kind: "read-complete", batch: {
           layoutVersion: 1, tableId: "table-0", revision: 0, schemaVersion: 0,
           range: { rowStart: 0, rowCount: 2, columnStart: 0, columnCount: 2 }, complete: true,
           buffers: [typeIds, left, right, runEnds, runValues, displayOffsets, displayValues],
@@ -1438,8 +1580,29 @@ async function eventually(predicate) {
   throw new Error("Timed out waiting for condition");
 }
 
+function testAdapter(id, moduleUrl) {
+  const urls = globalThis.__tabularkTestOnlyAdapterModuleUrls ?? {};
+  Object.defineProperty(globalThis, "__tabularkTestOnlyAdapterModuleUrls", {
+    configurable: true,
+    writable: true,
+    value: { ...urls, [id]: moduleUrl },
+  });
+  return { id };
+}
+
+function assertResourceLimitDetails(details) {
+  assert.equal(typeof details?.resource, "string");
+  assert.ok(details.resource.length > 0);
+  const hasBytes = Number.isFinite(details.requiredBytes)
+    && Number.isFinite(details.availableBytes);
+  const hasCount = Number.isFinite(details.required)
+    && Number.isFinite(details.available);
+  assert.equal(hasBytes || hasCount, true, "resource errors report required and available capacity");
+}
+
 function saveGlobals(names) {
-  return names.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]);
+  const savedNames = [...new Set(["__tabularkTestOnlyAdapterModuleUrls", ...names])];
+  return savedNames.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]);
 }
 
 function restoreGlobals(descriptors) {

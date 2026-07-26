@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "adapters": {
+    "parquet": {
+      "maxEngineStartupMs": 1000,
+      "maxAdapterColdOpenMs": 2000,
+      "maxRangeReadMs": 1000,
+      "maxMemoryPeakDeltaBytes": 67108864
+    },
+    "excel": {
+      "maxEngineStartupMs": 1000,
+      "maxAdapterColdOpenMs": 2000,
+      "maxRangeReadMs": 1000,
+      "maxMemoryPeakDeltaBytes": 67108864
+    }
+  }
+}

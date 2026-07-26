@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createEngine, createTableController, delimitedAdapter } from "../dist/index.js";
+import { createEngine, delimitedAdapter } from "../dist/index.js";
+import { createTableController } from "../dist/experimental.js";
 
 const createTestEngine = () => createEngine({
   adapters: [delimitedAdapter],
@@ -497,7 +498,7 @@ class LifecycleWorker {
     if (request.op === this.malformedResponseOp) {
       queueMicrotask(() => this.#emit("message", {
         data: {
-          protocolVersion: 2,
+          protocolVersion: 3,
           requestId: request.requestId,
           status: "success",
         },
@@ -513,7 +514,7 @@ class LifecycleWorker {
     if (request.op === "listTables" && this.malformedEventBeforeListTables) {
       queueMicrotask(() => this.#emit("message", {
         data: {
-          protocolVersion: 2,
+          protocolVersion: 3,
           event: "warning",
           payload: {
             handle: request.payload.datasetHandle,
@@ -528,7 +529,7 @@ class LifecycleWorker {
       queueMicrotask(() => {
         this.#emit("message", {
           data: {
-            protocolVersion: 2,
+            protocolVersion: 3,
             event: "runtimeError",
             datasetHandle: request.payload.datasetHandle,
             payload: {
@@ -540,7 +541,7 @@ class LifecycleWorker {
         });
         this.#emit("message", {
           data: {
-            protocolVersion: 2,
+            protocolVersion: 3,
             event: "closed",
             datasetHandle: request.payload.datasetHandle,
             payload: { handle: request.payload.datasetHandle, kind: "source" },
@@ -548,7 +549,7 @@ class LifecycleWorker {
         });
         this.#emit("message", {
           data: {
-            protocolVersion: 2,
+            protocolVersion: 3,
             requestId: request.requestId,
             status: "failure",
             error: {
@@ -568,7 +569,7 @@ class LifecycleWorker {
     if (request.op === "closeSource") {
       queueMicrotask(() => this.#emit("message", {
         data: {
-          protocolVersion: 2,
+          protocolVersion: 3,
           event: "closed",
           datasetHandle: request.payload.datasetHandle,
           payload: { handle: request.payload.datasetHandle, kind: "dataset" },
@@ -598,7 +599,7 @@ class LifecycleWorker {
     this.closedSources.push(datasetHandle);
     this.#emit("message", {
       data: {
-        protocolVersion: 2,
+        protocolVersion: 3,
         event: "runtimeError",
         datasetHandle,
         payload: {
@@ -610,7 +611,7 @@ class LifecycleWorker {
     });
     this.#emit("message", {
       data: {
-        protocolVersion: 2,
+        protocolVersion: 3,
         event: "closed",
         datasetHandle,
         tableHandle,
@@ -620,7 +621,7 @@ class LifecycleWorker {
     });
     this.#emit("message", {
       data: {
-        protocolVersion: 2,
+        protocolVersion: 3,
         event: "closed",
         datasetHandle,
         tableId: "table-0",
@@ -646,8 +647,8 @@ function responseFor(request, worker) {
     case "hello":
       kind = "hello";
       data = {
-        protocolVersion: 2,
-        adapterApiVersion: 1,
+        protocolVersion: 3,
+        adapterApiVersion: 2,
         batchLayoutVersion: 1,
         adapters: request.payload.adapters.map((adapter) => adapter.id),
         transferableBatches: true,
@@ -682,7 +683,7 @@ function responseFor(request, worker) {
       return undefined;
   }
   return {
-    protocolVersion: 2,
+    protocolVersion: 3,
     requestId: request.requestId,
     status: "success",
     result: data === undefined ? { kind } : { kind, data },

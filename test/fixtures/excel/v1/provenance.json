@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "producer": "tabulark generator and an upstream Microsoft Excel workbook",
+  "generator": "crates/tabulark-excel-wasm/examples/generate_fixtures.rs",
+  "files": [
+    {
+      "path": "tabulark-biff8.xls",
+      "format": "BIFF8",
+      "bytes": 2560,
+      "sha256": "bf0db35f53130cdcab585d3e0615b880a965c0f0953575acf5b0bdb32cc6abad",
+      "producer": "tabulark deterministic fixture generator"
+    },
+    {
+      "path": "tabulark-ooxml.xlsx",
+      "format": "OOXML",
+      "bytes": 3206,
+      "sha256": "80821f9cc9d262b48e480f509d53ada2f74bd85ed5bc9c5a990da75c7988a554",
+      "producer": "tabulark deterministic fixture generator"
+    },
+    {
+      "path": "xlsxwriter-merge-range01.xlsx",
+      "format": "OOXML",
+      "bytes": 7394,
+      "sha256": "6b52019ce3bc3f9803104b58c621684110d895549047c66132743ec45425bdc0",
+      "producer": "Microsoft Excel 12.0 (upstream XlsxWriter comparison corpus)",
+      "upstream": {
+        "repository": "https://github.com/jmcnamara/XlsxWriter",
+        "revision": "9fd7f1c4a000c9db79102bb65f7810bba410681f",
+        "path": "xlsxwriter/test/comparison/xlsx_files/merge_range01.xlsx",
+        "blob": "bb4b1ca79fd6c66f857a8b102ecdbf52c3d8dbf6",
+        "license": "BSD-2-Clause",
+        "licenseFile": "XLSXWRITER-LICENSE.txt"
+      }
+    }
+  ]
+}

@@ -85,13 +85,24 @@ export class AsyncPermitQueue {
 export class ByteLruCache<T> {
   readonly #maxBytes: number;
   readonly #entries = new Map<string, CacheEntry<T>>();
+  readonly #onRemove: ((key: string, value: T, byteLength: number) => void) | undefined;
   #byteLength = 0;
 
-  constructor(maxBytes: number) {
+  constructor(
+    maxBytes: number,
+    options: Readonly<{
+      onRemove?: (key: string, value: T, byteLength: number) => void;
+    }> = {},
+  ) {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
       throw new RangeError("maxBytes must be a non-negative safe integer");
     }
     this.#maxBytes = maxBytes;
+    this.#onRemove = options.onRemove;
+  }
+
+  get maxBytes(): number {
+    return this.#maxBytes;
   }
 
   get(key: string): T | undefined {
@@ -114,8 +125,7 @@ export class ByteLruCache<T> {
 
     const existing = this.#entries.get(key);
     if (existing) {
-      this.#entries.delete(key);
-      this.#byteLength -= existing.byteLength;
+      this.#remove(key, existing);
     }
 
     while (this.#byteLength + byteLength > this.#maxBytes) {
@@ -124,8 +134,7 @@ export class ByteLruCache<T> {
         break;
       }
       const oldest = this.#entries.get(oldestKey)!;
-      this.#entries.delete(oldestKey);
-      this.#byteLength -= oldest.byteLength;
+      this.#remove(oldestKey, oldest);
     }
 
     this.#entries.set(key, { value, byteLength });
@@ -137,14 +146,22 @@ export class ByteLruCache<T> {
       if (!predicate(key, entry.value)) {
         continue;
       }
-      this.#entries.delete(key);
-      this.#byteLength -= entry.byteLength;
+      this.#remove(key, entry);
     }
   }
 
   clear(): void {
+    for (const [key, entry] of this.#entries) {
+      this.#onRemove?.(key, entry.value, entry.byteLength);
+    }
     this.#entries.clear();
     this.#byteLength = 0;
+  }
+
+  #remove(key: string, entry: CacheEntry<T>): void {
+    this.#entries.delete(key);
+    this.#byteLength -= entry.byteLength;
+    this.#onRemove?.(key, entry.value, entry.byteLength);
   }
 }
 

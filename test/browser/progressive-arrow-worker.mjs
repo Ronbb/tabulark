@@ -32,7 +32,10 @@ Blob.prototype.arrayBuffer = function (...args) {
     completedSourceBytes += bytes.byteLength;
     return bytes;
   });
-  if (sourceReadCount !== 2) {
+  // Four 8 KiB reads publish the fixture's 256-row indexed prefix. Hold the
+  // next background scan action so the test can exercise an in-flight read
+  // while the stable handles still expose that prefix.
+  if (sourceReadCount !== 5) {
     return readActualBytes();
   }
 

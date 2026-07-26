@@ -4,11 +4,11 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import {
-  ADAPTER_API_VERSION,
-  BATCH_LAYOUT_VERSION,
-  PROTOCOL_VERSION,
-} from "../dist/index.js";
+// Worker protocol and adapter ABI are intentionally private; the golden tests
+// pin them without creating a package export for their implementation module.
+const PROTOCOL_VERSION = 3;
+const ADAPTER_API_VERSION = 2;
+const BATCH_LAYOUT_VERSION = 1;
 
 const protocolRoot = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -17,12 +17,15 @@ const protocolRoot = join(
 );
 const v1Directory = join(protocolRoot, "v1");
 const v2Directory = join(protocolRoot, "v2");
+const v3Directory = join(protocolRoot, "v3");
 const operations = new Set([
   "hello",
   "openSource",
   "listTables",
   "openTable",
   "getMetadata",
+  "getPresentation",
+  "readPresentationRange",
   "readRange",
   "cancel",
   "closeTable",
@@ -46,11 +49,11 @@ test("protocol v1 fixtures remain immutable historical evidence", async () => {
   for (const file of files) {
     const payload = await fixture(v1Directory, file);
     assert.equal(payload.protocolVersion, 1, `${file} remains v1`);
-    assert.notEqual(payload.protocolVersion, PROTOCOL_VERSION, `${file} must be rejected by v2`);
+    assert.notEqual(payload.protocolVersion, PROTOCOL_VERSION, `${file} must be rejected by v3`);
   }
 });
 
-test("protocol v2 golden fixtures lock adapter registration and recursive schema envelopes", async () => {
+test("protocol v2 fixtures remain immutable M4 evidence", async () => {
   const files = (await readdir(v2Directory)).sort();
   assert.deepEqual(files, [
     "hello-request.json",
@@ -61,7 +64,8 @@ test("protocol v2 golden fixtures lock adapter registration and recursive schema
 
   for (const file of files) {
     const payload = await fixture(v2Directory, file);
-    assert.equal(payload.protocolVersion, PROTOCOL_VERSION, `${file} protocolVersion`);
+    assert.equal(payload.protocolVersion, 2, `${file} protocolVersion`);
+    assert.notEqual(payload.protocolVersion, PROTOCOL_VERSION, `${file} must be rejected by v3`);
     validateEnvelope(payload, file);
   }
 
@@ -73,7 +77,7 @@ test("protocol v2 golden fixtures lock adapter registration and recursive schema
   assert.equal(helloRequest.payload.memoryBudgetBytes, 256 * 1024 * 1024);
 
   const helloResponse = await fixture(v2Directory, "hello-response.json");
-  assert.equal(helloResponse.result.data.adapterApiVersion, ADAPTER_API_VERSION);
+  assert.equal(helloResponse.result.data.adapterApiVersion, 1);
   assert.equal(helloResponse.result.data.batchLayoutVersion, BATCH_LAYOUT_VERSION);
 
   const openArrow = await fixture(v2Directory, "open-arrow-request.json");
@@ -92,6 +96,77 @@ test("protocol v2 golden fixtures lock adapter registration and recursive schema
       nullable: true,
     },
   });
+});
+
+test("protocol v3 golden fixtures lock four adapters and presentation envelopes", async () => {
+  const files = (await readdir(v3Directory)).sort();
+  assert.deepEqual(files, [
+    "hello-request.json",
+    "hello-response.json",
+    "metadata-event.json",
+    "presentation-range-request.json",
+    "presentation-range-response.json",
+    "presentation-response.json",
+    "progress-event.json",
+  ]);
+
+  for (const file of files) {
+    const payload = await fixture(v3Directory, file);
+    assert.equal(payload.protocolVersion, PROTOCOL_VERSION, `${file} protocolVersion`);
+    validateEnvelope(payload, file);
+  }
+
+  const helloRequest = await fixture(v3Directory, "hello-request.json");
+  assert.deepEqual(helloRequest.payload.adapters.map(({ id }) => id), [
+    "tabulark:delimited",
+    "tabulark:arrow-ipc",
+    "tabulark:parquet",
+    "tabulark:excel",
+  ]);
+  assert.equal(
+    helloRequest.payload.adapters.some((adapter) => "moduleUrl" in adapter),
+    false,
+    "v3 hello carries only manifest IDs",
+  );
+
+  const helloResponse = await fixture(v3Directory, "hello-response.json");
+  assert.equal(helloResponse.result.data.adapterApiVersion, ADAPTER_API_VERSION);
+  assert.equal(helloResponse.result.data.batchLayoutVersion, BATCH_LAYOUT_VERSION);
+
+  const rangeRequest = await fixture(v3Directory, "presentation-range-request.json");
+  assert.equal(rangeRequest.op, "readPresentationRange");
+  assert.deepEqual(rangeRequest.payload.range, {
+    rowStart: 4,
+    rowCount: 2,
+    columnStart: 1,
+    columnCount: 3,
+  });
+
+  const presentation = await fixture(v3Directory, "presentation-response.json");
+  assert.equal(presentation.result.kind, "presentation");
+  assert.equal(presentation.result.data.kind, "spreadsheet-v1");
+  assert.equal(presentation.result.data.visibility, "hidden");
+
+  const metadata = await fixture(v3Directory, "metadata-event.json");
+  assert.equal(metadata.revision, 7);
+  assert.equal(metadata.payload.revision, metadata.revision);
+  assert.equal(metadata.tableId, metadata.payload.tableId);
+
+  const progress = await fixture(v3Directory, "progress-event.json");
+  assert.equal(progress.revision, 3);
+  assert.equal(progress.payload.revision, progress.revision);
+  assert.equal(progress.tableId, progress.payload.tableId);
+  assert.equal(progress.payload.done, false);
+
+  const presentationRange = await fixture(v3Directory, "presentation-range-response.json");
+  assert.equal(presentationRange.result.kind, "presentationRange");
+  assert.equal(presentationRange.result.data.revision, 7);
+  assert.deepEqual(presentationRange.result.data.range, rangeRequest.payload.range);
+  assert.equal(presentationRange.result.data.styleIds.length, rangeRequest.payload.range.rowCount);
+  assert.equal(presentationRange.result.data.styleIds[0].length, rangeRequest.payload.range.columnCount);
+  assert.deepEqual(presentationRange.result.data.mergedCells, [
+    { rowStart: 4, rowCount: 2, columnStart: 1, columnCount: 2 },
+  ]);
 });
 
 function validateEnvelope(payload, file) {

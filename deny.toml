@@ -1,0 +1,27 @@
+[graph]
+all-features = true
+
+[advisories]
+ignore = [
+  # Parquet 59.1.0 is an explicit 0.1 compatibility pin and transitively uses
+  # paste 1.0.15. RUSTSEC-2024-0436 is maintenance-only (not a vulnerability
+  # or unsoundness report). Remove this narrow exception when the Parquet pin
+  # can move to a release that no longer depends on paste.
+  { id = "RUSTSEC-2024-0436", reason = "maintenance-only transitive dependency of the required Parquet 59.1.0 pin" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "MIT",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]

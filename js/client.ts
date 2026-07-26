@@ -5,7 +5,9 @@ import {
   type AdapterRegistration,
   type ArrowIpcAdapterOptions,
   type DelimitedAdapterOptions,
+  type ExcelAdapterOptions,
   type OfficialAdapterId,
+  type ParquetAdapterOptions,
 } from "./adapters.js";
 import {
   DEFAULT_MEMORY_BUDGET_BYTES,
@@ -15,6 +17,12 @@ import {
   normalizeMetadata,
   validateRange,
   type RangeRequest,
+  type MergedCellRegion,
+  type PresentationAxisEntry,
+  type PresentationRange,
+  type PresentationStyle,
+  type SpreadsheetPresentation,
+  type TablePresentation,
   type TableBatch,
   type TableDescriptor,
   type TableMetadata,
@@ -28,6 +36,7 @@ import {
   isRecord,
   type ProtocolEvent,
 } from "./protocol.js";
+import { officialAdapterManifestEntry } from "./official-adapter-manifest.js";
 import {
   ByteLruCache,
   cloneWireTableBatch,
@@ -66,6 +75,8 @@ export interface ReadRangeOptions {
 
 export interface RuntimeProgress {
   readonly sourceHandle: string;
+  readonly tableId?: string;
+  readonly revision?: number;
   readonly bytesScanned: number;
   readonly rowsDiscovered: number;
   readonly done: boolean;
@@ -99,6 +110,11 @@ export interface DatasetSession {
 
 export interface TableHandle {
   readonly metadata: Readonly<TableMetadata>;
+  getPresentation(): Promise<TablePresentation | null>;
+  readPresentationRange(
+    request: RangeRequest,
+    options?: ReadRangeOptions,
+  ): Promise<PresentationRange | null>;
   readRange(request: RangeRequest, options?: ReadRangeOptions): Promise<TableBatch>;
   subscribe(listener: (event: TableEvent) => void): Unsubscribe;
   close(): Promise<void>;
@@ -177,7 +193,7 @@ class Engine implements TabularkEngine {
         "hello",
         {
           clientName: "tabulark-js",
-          adapters: normalized.adapters,
+          adapters: normalized.adapters.map(({ id }) => Object.freeze({ id })),
           memoryBudgetBytes: normalized.memoryBudgetBytes,
         },
         "hello",
@@ -218,7 +234,13 @@ class Engine implements TabularkEngine {
         throw new TabularkError(
           "RESOURCE_LIMIT",
           `ArrayBuffer sources larger than ${this.#maxArrayBufferBytes} bytes must be supplied as a Blob`,
-          { details: { limit: this.#maxArrayBufferBytes, byteLength: source.byteLength } },
+          {
+            details: {
+              resource: "source-staging",
+              requiredBytes: source.byteLength,
+              availableBytes: this.#maxArrayBufferBytes,
+            },
+          },
         );
       }
       if (options.transferInput === true) {
@@ -383,6 +405,41 @@ class Engine implements TabularkEngine {
       );
     }
     return new ColumnarTableBatch(batch);
+  }
+
+  async getPresentation(table: TableHandleImpl): Promise<TablePresentation | null> {
+    this.#assertOpen();
+    table.assertOpen();
+    const value = await this.#rpc.request<unknown>(
+      "getPresentation",
+      { tableHandle: table.handle },
+      "presentation",
+    );
+    this.#assertOpen();
+    table.assertOpen();
+    return normalizePresentationWire(value, table.metadata);
+  }
+
+  async readPresentationRange(
+    table: TableHandleImpl,
+    request: RangeRequest,
+    options: ReadRangeOptions,
+  ): Promise<PresentationRange | null> {
+    this.#assertOpen();
+    table.assertOpen();
+    const normalized = validateRange(request);
+    if (options.signal?.aborted) {
+      throw cancelledError();
+    }
+    const value = await this.#rpc.request<unknown>(
+      "readPresentationRange",
+      { tableHandle: table.handle, range: normalized },
+      "presentationRange",
+      options.signal ? { signal: options.signal } : {},
+    );
+    this.#assertOpen();
+    table.assertOpen();
+    return normalizePresentationRangeWire(value, table.metadata, normalized);
   }
 
   async closeTable(table: TableHandleImpl): Promise<void> {
@@ -679,7 +736,10 @@ class DatasetSessionImpl implements DatasetSession {
     }
     switch (event.event) {
       case "progress":
-        this.#emit({ type: "progress", progress: normalizeProgress(event.payload) });
+        this.#emit({
+          type: "progress",
+          progress: normalizeProgress(event.payload, event.tableId, event.revision),
+        });
         break;
       case "metadata": {
         const metadata = normalizeMetadataWire(event.payload);
@@ -760,6 +820,17 @@ class TableHandleImpl implements TableHandle {
 
   readRange(request: RangeRequest, options: ReadRangeOptions = {}): Promise<TableBatch> {
     return this.#engine.readRange(this, request, options);
+  }
+
+  getPresentation(): Promise<TablePresentation | null> {
+    return this.#engine.getPresentation(this);
+  }
+
+  readPresentationRange(
+    request: RangeRequest,
+    options: ReadRangeOptions = {},
+  ): Promise<PresentationRange | null> {
+    return this.#engine.readPresentationRange(this, request, options);
   }
 
   subscribe(listener: (event: TableEvent) => void): Unsubscribe {
@@ -904,16 +975,40 @@ function normalizeOpenOptions<Options>(
     throw invalidArgument("adapter must be an official frozen adapter descriptor");
   }
   const registered = adapters.get(selected.id);
-  if (!registered || registered.moduleUrl !== selected.moduleUrl) {
+  if (!registered) {
     throw invalidArgument(`Adapter ${selected.id} was not registered with this engine`);
   }
   const rawOptions = options.adapterOptions;
   if (rawOptions !== undefined && (!isRecord(rawOptions) || Array.isArray(rawOptions))) {
     throw invalidArgument("adapterOptions must be an object");
   }
-  const normalized = selected.id === "tabulark:delimited"
-    ? normalizeDelimitedOptions(rawOptions as DelimitedAdapterOptions | undefined, inferredSourceName)
-    : normalizeArrowOptions(rawOptions as ArrowIpcAdapterOptions | undefined, inferredSourceName);
+  let normalized: Readonly<Record<string, unknown>>;
+  switch (selected.id) {
+    case "tabulark:delimited":
+      normalized = normalizeDelimitedOptions(
+        rawOptions as DelimitedAdapterOptions | undefined,
+        inferredSourceName,
+      );
+      break;
+    case "tabulark:arrow-ipc":
+      normalized = normalizeArrowOptions(
+        rawOptions as ArrowIpcAdapterOptions | undefined,
+        inferredSourceName,
+      );
+      break;
+    case "tabulark:parquet":
+      normalized = normalizeParquetOptions(
+        rawOptions as ParquetAdapterOptions | undefined,
+        inferredSourceName,
+      );
+      break;
+    case "tabulark:excel":
+      normalized = normalizeExcelOptions(
+        rawOptions as ExcelAdapterOptions | undefined,
+        inferredSourceName,
+      );
+      break;
+  }
   return {
     adapter: registered,
     options: normalized,
@@ -925,7 +1020,7 @@ function normalizeDelimitedOptions(
   inferredSourceName?: string,
 ): Readonly<Record<string, unknown>> {
   const raw = options ?? {};
-  assertOnlyKeys(raw, ["dialect", "header", "mode", "delimiter", "sourceName"]);
+  assertManifestKeys("tabulark:delimited", raw);
   const dialect = raw.dialect ?? "csv";
   const header = raw.header ?? "first-row";
   const mode = raw.mode ?? "lenient";
@@ -957,7 +1052,7 @@ function normalizeArrowOptions(
   inferredSourceName?: string,
 ): Readonly<Record<string, unknown>> {
   const raw = options ?? {};
-  assertOnlyKeys(raw, ["container", "sourceName"]);
+  assertManifestKeys("tabulark:arrow-ipc", raw);
   const container = raw.container ?? "auto";
   if (container !== "auto" && container !== "file" && container !== "stream") {
     throw invalidArgument("container must be auto, file, or stream");
@@ -965,6 +1060,33 @@ function normalizeArrowOptions(
   const sourceName = normalizeSourceName(raw.sourceName ?? inferredSourceName);
   return Object.freeze({
     container,
+    ...(sourceName === undefined ? {} : { sourceName }),
+  });
+}
+
+function normalizeParquetOptions(
+  options: ParquetAdapterOptions | undefined,
+  inferredSourceName?: string,
+): Readonly<Record<string, unknown>> {
+  const raw = options ?? {};
+  assertManifestKeys("tabulark:parquet", raw);
+  const sourceName = normalizeSourceName(raw.sourceName ?? inferredSourceName);
+  return Object.freeze(sourceName === undefined ? {} : { sourceName });
+}
+
+function normalizeExcelOptions(
+  options: ExcelAdapterOptions | undefined,
+  inferredSourceName?: string,
+): Readonly<Record<string, unknown>> {
+  const raw = options ?? {};
+  assertManifestKeys("tabulark:excel", raw);
+  const format = raw.format ?? "auto";
+  if (format !== "auto" && format !== "xls" && format !== "xlsx") {
+    throw invalidArgument("format must be auto, xls, or xlsx");
+  }
+  const sourceName = normalizeSourceName(raw.sourceName ?? inferredSourceName);
+  return Object.freeze({
+    format,
     ...(sourceName === undefined ? {} : { sourceName }),
   });
 }
@@ -977,8 +1099,8 @@ function normalizeSourceName(value: unknown): string | undefined {
   return value;
 }
 
-function assertOnlyKeys(value: object, allowed: readonly string[]): void {
-  const allowedSet = new Set(allowed);
+function assertManifestKeys(id: OfficialAdapterId, value: object): void {
+  const allowedSet = new Set(officialAdapterManifestEntry(id).options.allowedKeys);
   for (const key of Object.keys(value)) {
     if (!allowedSet.has(key)) {
       throw invalidArgument(`Unknown adapter option: ${key}`);
@@ -1032,6 +1154,226 @@ function normalizeMetadataWire(value: unknown): Readonly<TableMetadata> {
   });
 }
 
+function normalizePresentationWire(
+  value: unknown,
+  metadata: Readonly<TableMetadata>,
+): TablePresentation | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (!isRecord(value) || value.kind !== "spreadsheet-v1") {
+    throw new TabularkError("PROTOCOL_INCOMPATIBLE", "Worker returned an invalid table presentation");
+  }
+  if (value.tableId !== metadata.tableId) {
+    throw new TabularkError("PROTOCOL_INCOMPATIBLE", "Presentation tableId does not match its table");
+  }
+  const visibility = value.visibility === "hidden" || value.visibility === "very-hidden"
+    ? value.visibility
+    : "visible";
+  return Object.freeze({
+    kind: "spreadsheet-v1" as const,
+    tableId: metadata.tableId,
+    revision: numeric(value.revision, metadata.revision),
+    visibility,
+    frozenRows: numeric(value.frozenRows, 0),
+    frozenColumns: numeric(value.frozenColumns, 0),
+    rows: normalizePresentationAxis(value.rows, "rows"),
+    columns: normalizePresentationAxis(value.columns, "columns"),
+    styles: normalizePresentationStyles(value.styles),
+  } satisfies SpreadsheetPresentation);
+}
+
+function normalizePresentationRangeWire(
+  value: unknown,
+  metadata: Readonly<TableMetadata>,
+  requested: RangeRequest,
+): PresentationRange | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (!isRecord(value) || value.kind !== "spreadsheet-v1" || value.tableId !== metadata.tableId) {
+    throw new TabularkError("PROTOCOL_INCOMPATIBLE", "Worker returned an invalid presentation range");
+  }
+  const range = isRecord(value.range) ? value.range : {};
+  for (const key of ["rowStart", "rowCount", "columnStart", "columnCount"] as const) {
+    if (range[key] !== requested[key]) {
+      throw new TabularkError(
+        "PROTOCOL_INCOMPATIBLE",
+        "Presentation range must be aligned with its requested range",
+      );
+    }
+  }
+  if (!Array.isArray(value.styleIds) || value.styleIds.length !== requested.rowCount) {
+    throw new TabularkError("PROTOCOL_INCOMPATIBLE", "Presentation style rows do not match the range");
+  }
+  const styleIds = Object.freeze(value.styleIds.map((row, rowIndex) => {
+    if (!Array.isArray(row) || row.length !== requested.columnCount) {
+      throw new TabularkError(
+        "PROTOCOL_INCOMPATIBLE",
+        `Presentation style row ${rowIndex} does not match the range`,
+      );
+    }
+    return Object.freeze(row.map((styleId) => (
+      styleId === null || (Number.isSafeInteger(styleId) && (styleId as number) >= 0)
+        ? styleId as number | null
+        : invalidPresentationStyleId()
+    )));
+  }));
+  const mergedCells = Array.isArray(value.mergedCells)
+    ? Object.freeze(value.mergedCells.map((region, index) => normalizeMergedCell(region, index)))
+    : Object.freeze([]);
+  return Object.freeze({
+    kind: "spreadsheet-v1" as const,
+    tableId: metadata.tableId,
+    revision: numeric(value.revision, metadata.revision),
+    range: Object.freeze({ ...requested }),
+    styleIds,
+    mergedCells,
+    rows: normalizePresentationAxis(value.rows, "rows"),
+    columns: normalizePresentationAxis(value.columns, "columns"),
+  });
+}
+
+function invalidPresentationStyleId(): never {
+  throw new TabularkError("PROTOCOL_INCOMPATIBLE", "Presentation style IDs must be non-negative integers or null");
+}
+
+function normalizePresentationAxis(value: unknown, name: string): readonly PresentationAxisEntry[] {
+  if (value === undefined) return Object.freeze([]);
+  if (!Array.isArray(value)) {
+    throw new TabularkError("PROTOCOL_INCOMPATIBLE", `Presentation ${name} must be an array`);
+  }
+  const seen = new Set<number>();
+  return Object.freeze(value.map((entry, index) => {
+    if (!isRecord(entry) || !Number.isSafeInteger(entry.index) || (entry.index as number) < 0) {
+      throw new TabularkError("PROTOCOL_INCOMPATIBLE", `Presentation ${name}[${index}] has an invalid index`);
+    }
+    const axisIndex = entry.index as number;
+    if (seen.has(axisIndex)) {
+      throw new TabularkError("PROTOCOL_INCOMPATIBLE", `Presentation ${name} contains duplicate index ${axisIndex}`);
+    }
+    seen.add(axisIndex);
+    if (entry.size !== undefined && (typeof entry.size !== "number" || !Number.isFinite(entry.size) || entry.size < 0)) {
+      throw new TabularkError("PROTOCOL_INCOMPATIBLE", `Presentation ${name}[${index}] has an invalid size`);
+    }
+    if (entry.hidden !== undefined && typeof entry.hidden !== "boolean") {
+      throw new TabularkError("PROTOCOL_INCOMPATIBLE", `Presentation ${name}[${index}] has an invalid hidden flag`);
+    }
+    return Object.freeze({
+      index: axisIndex,
+      ...(entry.size === undefined ? {} : { size: entry.size as number }),
+      ...(entry.hidden === undefined ? {} : { hidden: entry.hidden as boolean }),
+    });
+  }));
+}
+
+function normalizePresentationStyles(value: unknown): readonly PresentationStyle[] {
+  if (value === undefined) return Object.freeze([]);
+  if (!Array.isArray(value)) {
+    throw new TabularkError("PROTOCOL_INCOMPATIBLE", "Presentation styles must be an array");
+  }
+  return Object.freeze(value.map((style, index) => {
+    if (!isRecord(style)) {
+      throw new TabularkError("PROTOCOL_INCOMPATIBLE", `Presentation style ${index} must be an object`);
+    }
+    // Copy only the stable static style vocabulary. Unknown producer fields are
+    // intentionally ignored so future adapters can enrich their private wire DTO.
+    return Object.freeze({
+      ...(typeof style.numberFormat === "string" ? { numberFormat: style.numberFormat } : {}),
+      ...(normalizePresentationFont(style.font) ? { font: normalizePresentationFont(style.font)! } : {}),
+      ...(normalizePresentationColor(style.foregroundColor) ? { foregroundColor: normalizePresentationColor(style.foregroundColor)! } : {}),
+      ...(normalizePresentationColor(style.backgroundColor) ? { backgroundColor: normalizePresentationColor(style.backgroundColor)! } : {}),
+      ...(normalizePresentationColor(style.fillColor) ? { fillColor: normalizePresentationColor(style.fillColor)! } : {}),
+      ...(normalizePresentationBorders(style.borders) ? { borders: normalizePresentationBorders(style.borders)! } : {}),
+      ...(isHorizontalAlignment(style.horizontalAlignment)
+        ? { horizontalAlignment: style.horizontalAlignment }
+        : {}),
+      ...(isVerticalAlignment(style.verticalAlignment)
+        ? { verticalAlignment: style.verticalAlignment }
+        : {}),
+      ...(typeof style.wrapText === "boolean" ? { wrapText: style.wrapText } : {}),
+    });
+  }));
+}
+
+function normalizePresentationColor(value: unknown): Readonly<{ css?: string }> | undefined {
+  if (!isRecord(value) || typeof value.css !== "string" || value.css.length === 0 || value.css.length > 128) {
+    return undefined;
+  }
+  return Object.freeze({ css: value.css });
+}
+
+function normalizePresentationFont(value: unknown): PresentationStyle["font"] | undefined {
+  if (!isRecord(value)) return undefined;
+  const color = normalizePresentationColor(value.color);
+  const size = typeof value.size === "number" && Number.isFinite(value.size) && value.size > 0
+    ? value.size
+    : undefined;
+  const font = {
+    ...(typeof value.family === "string" && value.family.length > 0 ? { family: value.family } : {}),
+    ...(size === undefined ? {} : { size }),
+    ...(typeof value.bold === "boolean" ? { bold: value.bold } : {}),
+    ...(typeof value.italic === "boolean" ? { italic: value.italic } : {}),
+    ...(typeof value.underline === "boolean" ? { underline: value.underline } : {}),
+    ...(color === undefined ? {} : { color }),
+  };
+  return Object.keys(font).length === 0 ? undefined : Object.freeze(font);
+}
+
+function normalizePresentationBorders(value: unknown): PresentationStyle["borders"] | undefined {
+  if (!isRecord(value)) return undefined;
+  const sides = ["top", "right", "bottom", "left"] as const;
+  const result: Record<string, unknown> = {};
+  for (const side of sides) {
+    const raw = value[side];
+    if (!isRecord(raw)) continue;
+    const style = isBorderStyle(raw.style) ? raw.style : undefined;
+    const color = normalizePresentationColor(raw.color);
+    if (style !== undefined || color !== undefined) {
+      result[side] = Object.freeze({
+        ...(style === undefined ? {} : { style }),
+        ...(color === undefined ? {} : { color }),
+      });
+    }
+  }
+  return Object.keys(result).length === 0 ? undefined : Object.freeze(result);
+}
+
+function normalizeMergedCell(value: unknown, index: number): MergedCellRegion {
+  if (!isRecord(value)) {
+    throw new TabularkError("PROTOCOL_INCOMPATIBLE", `Merged cell ${index} must be an object`);
+  }
+  const fields = ["rowStart", "rowEnd", "columnStart", "columnEnd"] as const;
+  for (const field of fields) {
+    if (!Number.isSafeInteger(value[field]) || (value[field] as number) < 0) {
+      throw new TabularkError("PROTOCOL_INCOMPATIBLE", `Merged cell ${index} has an invalid ${field}`);
+    }
+  }
+  const region = {
+    rowStart: value.rowStart as number,
+    rowEnd: value.rowEnd as number,
+    columnStart: value.columnStart as number,
+    columnEnd: value.columnEnd as number,
+  };
+  if (region.rowEnd <= region.rowStart || region.columnEnd <= region.columnStart) {
+    throw new TabularkError("PROTOCOL_INCOMPATIBLE", `Merged cell ${index} must be non-empty`);
+  }
+  return Object.freeze(region);
+}
+
+function isBorderStyle(value: unknown): value is "none" | "thin" | "medium" | "thick" | "dashed" | "dotted" | "double" {
+  return value === "none" || value === "thin" || value === "medium" || value === "thick"
+    || value === "dashed" || value === "dotted" || value === "double";
+}
+
+function isHorizontalAlignment(value: unknown): value is "general" | "left" | "center" | "right" | "justify" {
+  return value === "general" || value === "left" || value === "center" || value === "right" || value === "justify";
+}
+
+function isVerticalAlignment(value: unknown): value is "top" | "center" | "bottom" | "justify" {
+  return value === "top" || value === "center" || value === "bottom" || value === "justify";
+}
+
 function normalizeColumn(value: unknown, index: number): TableMetadata["schema"]["columns"][number] {
   const raw = isRecord(value) ? value : {};
   return {
@@ -1076,10 +1418,22 @@ function isValidDelimiter(value: unknown): value is string {
   return byte <= 0x7f && byte !== 0 && byte !== 0x0d && byte !== 0x0a && byte !== 0x22;
 }
 
-function normalizeProgress(value: unknown): RuntimeProgress {
+function normalizeProgress(
+  value: unknown,
+  tableId?: string,
+  revision?: number,
+): RuntimeProgress {
   const raw = isRecord(value) ? value : {};
   return {
     sourceHandle: typeof raw.sourceHandle === "string" ? raw.sourceHandle : "",
+    ...(typeof raw.tableId === "string" && raw.tableId.length > 0
+      ? { tableId: raw.tableId }
+      : typeof tableId === "string" && tableId.length > 0 ? { tableId } : {}),
+    ...(Number.isSafeInteger(raw.revision) && (raw.revision as number) >= 0
+      ? { revision: raw.revision as number }
+      : Number.isSafeInteger(revision) && (revision as number) >= 0
+        ? { revision: revision as number }
+      : {}),
     bytesScanned: numeric(raw.bytesScanned, 0),
     rowsDiscovered: numeric(raw.rowsDiscovered, 0),
     done: raw.done === true,

@@ -129,15 +129,16 @@ async function runScenario({ expectedRows, requireMemory = true, scrollFrames = 
     const rangeReadMs = [];
     const rangeBatchBytes = [];
     for (const rowStart of starts) {
+      const transferredBefore = workerMetrics.batchPayloadBytes;
       const started = performance.now();
-      const batch = await table.readRange({
+      await table.readRange({
         rowStart,
         rowCount: Math.min(128, Math.max(0, rowCount - rowStart)),
         columnStart: 0,
         columnCount,
       });
       rangeReadMs.push(performance.now() - started);
-      rangeBatchBytes.push(batch.byteLength);
+      rangeBatchBytes.push(workerMetrics.batchPayloadBytes - transferredBefore);
     }
 
     const scroller = view.element.querySelector("[data-tabulark-scroll]");
@@ -318,15 +319,16 @@ async function runArrowScenario({
     const rangeReadMs = [];
     const rangeBatchBytes = [];
     for (const rowStart of starts) {
+      const transferredBefore = workerMetrics.batchPayloadBytes;
       const started = performance.now();
-      const batch = await table.readRange({
+      await table.readRange({
         rowStart,
         rowCount: Math.min(128, Math.max(0, rowCount - rowStart)),
         columnStart: 0,
         columnCount,
       });
       rangeReadMs.push(performance.now() - started);
-      rangeBatchBytes.push(batch.byteLength);
+      rangeBatchBytes.push(workerMetrics.batchPayloadBytes - transferredBefore);
     }
     await measureMemory("range-read");
 

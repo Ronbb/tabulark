@@ -9,6 +9,8 @@ export interface AccessibleGridCell {
   readonly value: string | null | undefined;
   readonly selected: boolean;
   readonly active: boolean;
+  readonly rowSpan?: number;
+  readonly columnSpan?: number;
 }
 
 export interface AccessibleGridRow {
@@ -87,6 +89,16 @@ export class AccessibleViewportGrid {
         cellElement.setAttribute("role", "gridcell");
         cellElement.setAttribute("aria-colindex", String(cell.columnIndex + 1));
         cellElement.setAttribute("aria-selected", String(cell.selected));
+        setOptionalAttribute(
+          cellElement,
+          "aria-rowspan",
+          cell.rowSpan === undefined || cell.rowSpan <= 1 ? undefined : String(cell.rowSpan),
+        );
+        setOptionalAttribute(
+          cellElement,
+          "aria-colspan",
+          cell.columnSpan === undefined || cell.columnSpan <= 1 ? undefined : String(cell.columnSpan),
+        );
         cellElement.textContent = cell.value === undefined
           ? "Loading"
           : cell.value === null

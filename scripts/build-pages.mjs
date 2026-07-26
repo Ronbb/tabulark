@@ -17,6 +17,10 @@ import { fileURLToPath } from "node:url";
 const repositoryRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const targetRoot = resolve(repositoryRoot, "target");
 const pagesRoot = resolve(targetRoot, "pages");
+const officialManifest = JSON.parse(await readFile(
+  resolve(repositoryRoot, "js", "official-adapters.json"),
+  "utf8",
+));
 
 assertInsideTarget(pagesRoot);
 await rm(pagesRoot, { force: true, recursive: true });
@@ -41,9 +45,23 @@ await Promise.all([
     resolve(pagesRoot, "test", "fixtures", "arrow"),
     { recursive: true },
   ),
+  cp(
+    resolve(repositoryRoot, "test", "fixtures", "parquet"),
+    resolve(pagesRoot, "test", "fixtures", "parquet"),
+    { recursive: true },
+  ),
+  cp(
+    resolve(repositoryRoot, "test", "fixtures", "excel"),
+    resolve(pagesRoot, "test", "fixtures", "excel"),
+    { recursive: true },
+  ),
 ]);
 await writeFile(resolve(pagesRoot, ".nojekyll"), "", "utf8");
 
+const stableBundles = officialManifest.adapters.map(({ entrypoint }) => (
+  entrypoint === "." ? "index" : entrypoint.replace(/^\.\//u, "")
+));
+const publicBundles = [...stableBundles, "experimental", "worker"];
 const requiredFiles = [
   ".nojekyll",
   "index.html",
@@ -52,27 +70,30 @@ const requiredFiles = [
   "THIRD_PARTY_NOTICES.md",
   "examples/csv-preview/index.html",
   "examples/csv-preview/main.js",
-  "dist/index.js",
-  "dist/index.js.map",
-  "dist/index.d.ts",
-  "dist/arrow.js",
-  "dist/arrow.js.map",
-  "dist/arrow.d.ts",
-  "dist/worker.js",
-  "dist/worker.js.map",
-  "dist/worker.d.ts",
-  "dist/wasm/delimited/tabulark_delimited.js",
-  "dist/wasm/delimited/tabulark_delimited.d.ts",
-  "dist/wasm/delimited/tabulark_delimited_bg.wasm",
-  "dist/wasm/delimited/tabulark_delimited_bg.wasm.d.ts",
-  "dist/wasm/arrow/tabulark_arrow.js",
-  "dist/wasm/arrow/tabulark_arrow.d.ts",
-  "dist/wasm/arrow/tabulark_arrow_bg.wasm",
-  "dist/wasm/arrow/tabulark_arrow_bg.wasm.d.ts",
+  ...publicBundles.flatMap((name) => [
+    `dist/${name}.js`,
+    `dist/${name}.js.map`,
+    `dist/${name}.d.ts`,
+  ]),
+  ...officialManifest.adapters.flatMap(({ wasm }) => [
+    `${wasm.outputDirectory}/${wasm.outputName}.js`,
+    `${wasm.outputDirectory}/${wasm.outputName}.d.ts`,
+    `${wasm.outputDirectory}/${wasm.outputName}_bg.wasm`,
+    `${wasm.outputDirectory}/${wasm.outputName}_bg.wasm.d.ts`,
+  ]),
   "test/fixtures/arrow/v1/APACHE-ARROW-TESTING-LICENSE.txt",
   "test/fixtures/arrow/v1/apache-arrow-1.0.0-generated-nested.arrow",
   "test/fixtures/arrow/v1/m4-sample.arrow",
   "test/fixtures/arrow/v1/provenance.json",
+  "test/fixtures/parquet/v1/provenance.json",
+  "test/fixtures/parquet/v1/APACHE-PARQUET-TESTING-LICENSE.txt",
+  "test/fixtures/parquet/v1/apache-parquet-testing-alltypes-plain.parquet",
+  "test/fixtures/parquet/v1/tabulark-rust.parquet",
+  "test/fixtures/excel/v1/provenance.json",
+  "test/fixtures/excel/v1/tabulark-biff8.xls",
+  "test/fixtures/excel/v1/tabulark-ooxml.xlsx",
+  "test/fixtures/excel/v1/XLSXWRITER-LICENSE.txt",
+  "test/fixtures/excel/v1/xlsxwriter-merge-range01.xlsx",
 ];
 for (const path of requiredFiles) {
   const metadata = await lstat(resolve(pagesRoot, path)).catch(() => undefined);
@@ -93,11 +114,10 @@ const playground = await readFile(
   resolve(pagesRoot, "examples", "csv-preview", "main.js"),
   "utf8",
 );
-if (!playground.includes('from "../../dist/index.js"')) {
-  throw new Error("Playground module no longer resolves the packaged runtime relatively");
-}
-if (!playground.includes('from "../../dist/arrow.js"')) {
-  throw new Error("Playground module no longer resolves the Arrow descriptor relatively");
+for (const bundle of stableBundles) {
+  if (!playground.includes(`from "../../dist/${bundle}.js"`)) {
+    throw new Error(`Playground no longer resolves the manifest bundle ${bundle} relatively`);
+  }
 }
 if (/\b(?:import|from)\s*(?:\(|)["']https?:\/\//u.test(playground)) {
   throw new Error("Playground cannot import runtime code from a CDN or remote origin");
@@ -124,6 +144,18 @@ for (const fixture of arrowProvenance.external?.files ?? []) {
   const digest = createHash("sha256").update(bytes).digest("hex");
   if (fixture.bytes !== bytes.byteLength || fixture.sha256 !== digest) {
     throw new Error(`Pages external Arrow fixture ${fixture.path} does not match provenance`);
+  }
+}
+
+for (const format of ["parquet", "excel"]) {
+  const formatRoot = resolve(pagesRoot, "test", "fixtures", format, "v1");
+  const provenance = JSON.parse(await readFile(resolve(formatRoot, "provenance.json"), "utf8"));
+  for (const fixture of provenance.files ?? []) {
+    const bytes = await readFile(resolve(formatRoot, fixture.path));
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    if (fixture.bytes !== bytes.byteLength || fixture.sha256 !== digest) {
+      throw new Error(`Pages ${format} fixture ${fixture.path} does not match provenance`);
+    }
   }
 }
 

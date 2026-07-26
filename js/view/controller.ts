@@ -1,13 +1,23 @@
 import type { TableHandle, TableEvent, Unsubscribe } from "../client.js";
 import { TabularkError, closedError, invalidArgument } from "../errors.js";
-import { MAX_RANGE_CELLS, type RangeRequest, type TableBatch } from "../model.js";
 import {
+  MAX_RANGE_CELLS,
+  type MergedCellRegion,
+  type PresentationAxisEntry,
+  type RangeRequest,
+  type SpreadsheetPresentation,
+  type TableBatch,
+} from "../model.js";
+import {
+  axisPosition,
+  axisSize,
   cellRect,
   columnOffsets,
   createTableLayout,
   extentValue,
   hitTest,
   logicalToPhysicalOffset,
+  nextVisibleAxisIndex,
   selectionRect,
   type LayoutOptions,
 } from "./layout.js";
@@ -62,6 +72,10 @@ export interface TableViewController {
   ensureColumnVisible(columnIndex: number): void;
   resizeColumn(columnIndex: number, width: number): void;
   autosizeColumn(columnIndex: number, measuredWidth: number): void;
+  /** Applies validated static worksheet geometry in one controller generation. */
+  applySpreadsheetPresentation(presentation: SpreadsheetPresentation): void;
+  /** Updates merge interaction geometry for the currently loaded presentation window. */
+  setMergedCells(regions: readonly MergedCellRegion[]): void;
   hitTest(x: number, y: number, resizeHandleWidth?: number): HitTestResult;
   cellRect(cell: CellPosition): Readonly<PixelRect>;
   selectionRect(selection?: TableSelection | null): Readonly<PixelRect> | null;
@@ -83,6 +97,11 @@ class Controller implements TableViewController {
     devicePixelRatio: 1,
   };
   #columnWidths: number[];
+  #hiddenColumns: boolean[];
+  #presentationRows: readonly PresentationAxisEntry[] = [];
+  #frozenRows = 0;
+  #frozenColumns = 0;
+  #mergedCells: readonly MergedCellRegion[] = [];
   #snapshot: Readonly<TableViewSnapshot>;
   #activeCell: Readonly<CellPosition> | null = null;
   #selection: Readonly<TableSelection> | null = null;
@@ -98,11 +117,12 @@ class Controller implements TableViewController {
     this.#table = table;
     this.#options = normalizeOptions(options);
     this.#columnWidths = initialColumnWidths(table.metadata, this.#options);
+    this.#hiddenColumns = Array.from({ length: this.#columnWidths.length }, () => false);
     const layout = createTableLayout(
       table.metadata,
       this.#columnWidths,
       this.#viewport,
-      this.#options,
+      this.#layoutOptions(),
     );
     this.#snapshot = Object.freeze({
       generation: this.#generation,
@@ -154,19 +174,21 @@ class Controller implements TableViewController {
   setActiveCell(cell: CellPosition, options: SetActiveCellOptions = {}): void {
     this.#assertOpen();
     assertCellPosition(cell, "cell");
-    const next = clampCell(
+    const clamped = clampCell(
       cell,
       this.#snapshot.layout.rowCount,
       this.#snapshot.layout.columnCount,
     );
-    if (next === null) {
+    if (clamped === null) {
       return;
     }
+    const next = this.#visibleCell(this.#mergeAnchor(clamped), 1, 1);
+    if (next === null) return;
     const anchor = options.extendSelection && this.#selection !== null
       ? this.#selection.anchor
       : next;
     this.#activeCell = next;
-    this.#selection = createSelection(anchor, next);
+    this.#selection = createMergedSelection(anchor, next, this.#mergedCells);
     if (options.scrollIntoView !== false && this.#scrollCellIntoView(next)) {
       this.#advanceGeneration();
       return;
@@ -185,22 +207,28 @@ class Controller implements TableViewController {
     this.#assertOpen();
     assertCellPosition(anchor, "anchor");
     assertCellPosition(focus, "focus");
-    const clampedAnchor = clampCell(
+    const rawAnchor = clampCell(
       anchor,
       this.#snapshot.layout.rowCount,
       this.#snapshot.layout.columnCount,
     );
-    const clampedFocus = clampCell(
+    const rawFocus = clampCell(
       focus,
       this.#snapshot.layout.rowCount,
       this.#snapshot.layout.columnCount,
     );
+    if (rawAnchor === null || rawFocus === null) {
+      this.clearSelection();
+      return;
+    }
+    const clampedAnchor = this.#visibleCell(this.#mergeAnchor(rawAnchor), 1, 1);
+    const clampedFocus = this.#visibleCell(this.#mergeAnchor(rawFocus), 1, 1);
     if (clampedAnchor === null || clampedFocus === null) {
       this.clearSelection();
       return;
     }
     this.#activeCell = clampedFocus;
-    this.#selection = createSelection(clampedAnchor, clampedFocus);
+    this.#selection = createMergedSelection(clampedAnchor, clampedFocus, this.#mergedCells);
     this.#publish();
   }
 
@@ -216,13 +244,18 @@ class Controller implements TableViewController {
   moveActive(command: NavigationCommand, options: MoveActiveCellOptions = {}): void {
     this.#assertOpen();
     const current = this.#activeCell ?? { rowIndex: 0, columnIndex: 0 };
-    const next = moveCell(
-      current,
+    const origin = navigationOrigin(current, command, this.#mergedCells);
+    const moved = moveCell(
+      origin,
       command,
       this.#snapshot.layout.rowCount,
       this.#snapshot.layout.columnCount,
-      Math.max(1, Math.floor(this.#snapshot.layout.bodyHeight / this.#snapshot.layout.rowHeight)),
+      Math.max(1, this.#snapshot.layout.visibleRows.filter((row) => !row.frozen).length),
     );
+    const [rowDirection, columnDirection] = navigationDirections(command);
+    const next = moved === null
+      ? null
+      : this.#visibleCell(this.#mergeAnchor(moved), rowDirection, columnDirection);
     if (next !== null) {
       this.setActiveCell(next, options);
     }
@@ -264,14 +297,64 @@ class Controller implements TableViewController {
     this.resizeColumn(columnIndex, measuredWidth);
   }
 
+  applySpreadsheetPresentation(presentation: SpreadsheetPresentation): void {
+    this.#assertOpen();
+    if (presentation.kind !== "spreadsheet-v1" || presentation.tableId !== this.metadata.tableId) {
+      throw invalidArgument("presentation must belong to the controller table");
+    }
+    const nextWidths = [...this.#columnWidths];
+    const hiddenColumns = Array.from({ length: nextWidths.length }, () => false);
+    for (const entry of presentation.columns) {
+      if (!Number.isSafeInteger(entry.index) || entry.index < 0 || entry.index >= nextWidths.length) {
+        continue;
+      }
+      hiddenColumns[entry.index] = entry.hidden === true;
+      if (entry.size !== undefined && Number.isFinite(entry.size) && entry.size > 0) {
+        nextWidths[entry.index] = clampWidth(entry.size, this.#options);
+      }
+    }
+    this.#columnWidths = nextWidths;
+    this.#hiddenColumns = hiddenColumns;
+    this.#presentationRows = Object.freeze(presentation.rows.map((entry) => Object.freeze({ ...entry })));
+    this.#frozenRows = presentation.frozenRows;
+    this.#frozenColumns = presentation.frozenColumns;
+    this.#mergedCells = [];
+    this.#advanceGeneration();
+    this.#normalizeInteractionForPresentation();
+    this.#publish();
+  }
+
+  setMergedCells(regions: readonly MergedCellRegion[]): void {
+    this.#assertOpen();
+    const normalized = normalizeMergedCells(
+      regions,
+      this.#snapshot.layout.rowCount,
+      this.#snapshot.layout.columnCount,
+    );
+    if (sameMergedCells(normalized, this.#mergedCells)) {
+      return;
+    }
+    this.#mergedCells = normalized;
+    this.#normalizeInteractionForPresentation();
+    // A merge may intersect the viewport while its value anchor is far
+    // outside the ordinary visible/overscan windows. Start a new generation
+    // so those anchors are requested along with the visible cells.
+    this.#advanceGeneration();
+  }
+
   hitTest(x: number, y: number, resizeHandleWidth?: number): HitTestResult {
-    return hitTest(
+    const result = hitTest(
       this.#snapshot.layout,
       x,
       y,
       this.#columnWidths,
       resizeHandleWidth,
     );
+    if (result.kind !== "cell") {
+      return result;
+    }
+    const anchor = this.#mergeAnchor(result);
+    return Object.freeze({ kind: "cell", ...anchor });
   }
 
   cellRect(cell: CellPosition): Readonly<PixelRect> {
@@ -371,12 +454,13 @@ class Controller implements TableViewController {
   }
 
   async #loadGeneration(generation: number): Promise<void> {
-    let visible: Readonly<GridRange> | null;
-    let overscan: Readonly<GridRange> | null;
+    let visible: readonly Readonly<GridRange>[];
+    let overscan: readonly Readonly<GridRange>[];
     try {
       ({ visible, overscan } = layoutRanges(
         this.#snapshot.layout,
         this.#options.maxWindowCells,
+        this.#mergedCells,
       ));
     } catch (error) {
       if (!this.#disposed && generation === this.#generation) {
@@ -385,7 +469,7 @@ class Controller implements TableViewController {
       }
       return;
     }
-    if (visible === null) {
+    if (visible.length === 0) {
       this.#windows = [];
       this.#loadingRanges = [];
       this.#rebuildSnapshot("ready");
@@ -393,9 +477,12 @@ class Controller implements TableViewController {
     }
     const abort = new AbortController();
     this.#requestAbort = abort;
-    const ranges = sameGridRange(visible, overscan) || overscan === null
-      ? [visible]
-      : [visible, overscan];
+    const ranges = Object.freeze([
+      ...visible,
+      ...overscan.filter((candidate) => !visible.some(
+        (required) => rangeContainsRange(candidate, required) && sameGridRange(candidate, required),
+      )),
+    ]);
     this.#loadingRanges = Object.freeze(ranges);
     this.#publish();
     let loaded: LoadedWindow[] = [];
@@ -437,25 +524,29 @@ class Controller implements TableViewController {
 
   #scrollCellIntoView(cell: CellPosition): boolean {
     const layout = this.#snapshot.layout;
-    const offsets = columnOffsets(this.#columnWidths);
+    const offsets = columnOffsets(layout.effectiveColumnWidths);
     const cellLeft = offsets[cell.columnIndex]!;
     const cellRight = offsets[cell.columnIndex + 1]!;
-    const cellTop = cell.rowIndex * layout.rowHeight;
-    const cellBottom = cellTop + layout.rowHeight;
-    const logicalLeft = revealOffset(
-      layout.horizontal.logicalOffset,
-      layout.bodyWidth,
-      cellLeft,
-      cellRight,
-      layout.horizontal.logicalMaxOffset,
-    );
-    const logicalTop = revealOffset(
-      layout.vertical.logicalOffset,
-      layout.bodyHeight,
-      cellTop,
-      cellBottom,
-      layout.vertical.logicalMaxOffset,
-    );
+    const cellTop = axisPosition(layout.rowGeometry, cell.rowIndex);
+    const cellBottom = cellTop + axisSize(layout.rowGeometry, cell.rowIndex);
+    const logicalLeft = cell.columnIndex < layout.frozenColumnCount
+      ? layout.horizontal.logicalOffset
+      : revealOffset(
+        layout.horizontal.logicalOffset,
+        layout.bodyWidth,
+        cellLeft,
+        cellRight,
+        layout.horizontal.logicalMaxOffset,
+      );
+    const logicalTop = cell.rowIndex < layout.frozenRowCount
+      ? layout.vertical.logicalOffset
+      : revealOffset(
+        layout.vertical.logicalOffset,
+        layout.bodyHeight,
+        cellTop,
+        cellBottom,
+        layout.vertical.logicalMaxOffset,
+      );
     const scrollLeft = logicalToPhysicalOffset(layout.horizontal, logicalLeft);
     const scrollTop = logicalToPhysicalOffset(layout.vertical, logicalTop);
     if (scrollLeft === this.#viewport.scrollLeft && scrollTop === this.#viewport.scrollTop) {
@@ -467,14 +558,16 @@ class Controller implements TableViewController {
 
   #scrollColumnIntoView(columnIndex: number): boolean {
     const layout = this.#snapshot.layout;
-    const offsets = columnOffsets(this.#columnWidths);
-    const logicalLeft = revealOffset(
-      layout.horizontal.logicalOffset,
-      layout.bodyWidth,
-      offsets[columnIndex]!,
-      offsets[columnIndex + 1]!,
-      layout.horizontal.logicalMaxOffset,
-    );
+    const offsets = columnOffsets(layout.effectiveColumnWidths);
+    const logicalLeft = columnIndex < layout.frozenColumnCount
+      ? layout.horizontal.logicalOffset
+      : revealOffset(
+        layout.horizontal.logicalOffset,
+        layout.bodyWidth,
+        offsets[columnIndex]!,
+        offsets[columnIndex + 1]!,
+        layout.horizontal.logicalMaxOffset,
+      );
     const scrollLeft = logicalToPhysicalOffset(layout.horizontal, logicalLeft);
     if (scrollLeft === this.#viewport.scrollLeft) {
       return false;
@@ -489,14 +582,22 @@ class Controller implements TableViewController {
     }
     switch (event.type) {
       case "metadata": {
+        const previousMetadata = this.#snapshot.metadata;
         this.#columnWidths = reconcileColumnWidths(
-          this.#snapshot.metadata,
+          previousMetadata,
           event.metadata,
           this.#columnWidths,
           this.#options,
         );
-        this.#clampInteraction();
+        const hiddenById = new Map(previousMetadata.schema.columns.map(
+          (column, index) => [column.id, this.#hiddenColumns[index] === true] as const,
+        ));
+        this.#hiddenColumns = event.metadata.schema.columns.map(
+          (column) => hiddenById.get(column.id) === true,
+        );
         this.#advanceGeneration();
+        this.#clampInteraction();
+        this.#publish();
         break;
       }
       case "runtimeError":
@@ -525,7 +626,10 @@ class Controller implements TableViewController {
     }
     const rowCount = extentValue(this.#table.metadata.extent.rows);
     const columnCount = this.#table.metadata.schema.columns.length;
-    const nextActive = clampCell(this.#activeCell, rowCount, columnCount);
+    const rawActive = clampCell(this.#activeCell, rowCount, columnCount);
+    const nextActive = rawActive === null
+      ? null
+      : this.#visibleCell(this.#mergeAnchor(rawActive), 1, 1);
     if (nextActive === null) {
       this.#activeCell = null;
       this.#selection = null;
@@ -533,10 +637,56 @@ class Controller implements TableViewController {
     }
     this.#activeCell = nextActive;
     if (this.#selection !== null) {
-      const anchor = clampCell(this.#selection.anchor, rowCount, columnCount)!;
-      const focus = clampCell(this.#selection.focus, rowCount, columnCount)!;
-      this.#selection = createSelection(anchor, focus);
+      const rawAnchor = clampCell(this.#selection.anchor, rowCount, columnCount)!;
+      const rawFocus = clampCell(this.#selection.focus, rowCount, columnCount)!;
+      const anchor = this.#visibleCell(this.#mergeAnchor(rawAnchor), 1, 1);
+      const focus = this.#visibleCell(this.#mergeAnchor(rawFocus), 1, 1);
+      this.#selection = anchor === null || focus === null
+        ? null
+        : createMergedSelection(anchor, focus, this.#mergedCells);
     }
+  }
+
+  #layoutOptions(): LayoutOptions {
+    return Object.freeze({
+      ...this.#options,
+      rowEntries: this.#presentationRows,
+      hiddenColumns: this.#hiddenColumns,
+      frozenRows: this.#frozenRows,
+      frozenColumns: this.#frozenColumns,
+    });
+  }
+
+  #mergeAnchor(cell: CellPosition): Readonly<CellPosition> {
+    const region = mergeContaining(this.#mergedCells, cell);
+    return region === undefined
+      ? Object.freeze({ rowIndex: cell.rowIndex, columnIndex: cell.columnIndex })
+      : Object.freeze({ rowIndex: region.rowStart, columnIndex: region.columnStart });
+  }
+
+  #visibleCell(
+    cell: CellPosition,
+    rowDirection: -1 | 1,
+    columnDirection: -1 | 1,
+  ): Readonly<CellPosition> | null {
+    const layout = this.#snapshot.layout;
+    const row = nextVisibleAxisIndex(layout.rowGeometry, cell.rowIndex, rowDirection)
+      ?? nextVisibleAxisIndex(layout.rowGeometry, cell.rowIndex, rowDirection === 1 ? -1 : 1);
+    if (row === null) return null;
+    const column = nextVisibleColumn(
+      layout.effectiveColumnWidths,
+      cell.columnIndex,
+      columnDirection,
+    ) ?? nextVisibleColumn(
+      layout.effectiveColumnWidths,
+      cell.columnIndex,
+      columnDirection === 1 ? -1 : 1,
+    );
+    return column === null ? null : Object.freeze({ rowIndex: row, columnIndex: column });
+  }
+
+  #normalizeInteractionForPresentation(): void {
+    this.#clampInteraction();
   }
 
   #rebuildSnapshot(status: TableViewSnapshot["status"], error?: unknown): void {
@@ -544,7 +694,7 @@ class Controller implements TableViewController {
       this.#table.metadata,
       this.#columnWidths,
       this.#viewport,
-      this.#options,
+      this.#layoutOptions(),
     );
     this.#viewport = Object.freeze({
       ...this.#viewport,
@@ -599,6 +749,140 @@ export function createTableController(
     throw invalidArgument("table must be a TableHandle");
   }
   return new Controller(table, options);
+}
+
+function normalizeMergedCells(
+  regions: readonly MergedCellRegion[],
+  rowCount: number,
+  columnCount: number,
+): readonly MergedCellRegion[] {
+  const unique = new Map<string, MergedCellRegion>();
+  for (const region of regions) {
+    if (
+      !region
+      || !Number.isSafeInteger(region.rowStart)
+      || !Number.isSafeInteger(region.rowEnd)
+      || !Number.isSafeInteger(region.columnStart)
+      || !Number.isSafeInteger(region.columnEnd)
+      || region.rowStart < 0
+      || region.columnStart < 0
+      || region.rowEnd <= region.rowStart
+      || region.columnEnd <= region.columnStart
+      || region.rowEnd > rowCount
+      || region.columnEnd > columnCount
+    ) {
+      continue;
+    }
+    const frozen = Object.freeze({ ...region });
+    unique.set(mergeKey(frozen), frozen);
+  }
+  return Object.freeze([...unique.values()].sort(
+    (left, right) => left.rowStart - right.rowStart
+      || left.columnStart - right.columnStart
+      || left.rowEnd - right.rowEnd
+      || left.columnEnd - right.columnEnd,
+  ));
+}
+
+function sameMergedCells(
+  left: readonly MergedCellRegion[],
+  right: readonly MergedCellRegion[],
+): boolean {
+  return left.length === right.length
+    && left.every((region, index) => mergeKey(region) === mergeKey(right[index]!));
+}
+
+function mergeKey(region: MergedCellRegion): string {
+  return `${region.rowStart}:${region.rowEnd}:${region.columnStart}:${region.columnEnd}`;
+}
+
+function mergeContaining(
+  regions: readonly MergedCellRegion[],
+  cell: CellPosition,
+): MergedCellRegion | undefined {
+  return regions.find((region) => (
+    cell.rowIndex >= region.rowStart
+    && cell.rowIndex < region.rowEnd
+    && cell.columnIndex >= region.columnStart
+    && cell.columnIndex < region.columnEnd
+  ));
+}
+
+function createMergedSelection(
+  anchor: CellPosition,
+  focus: CellPosition,
+  regions: readonly MergedCellRegion[],
+): Readonly<TableSelection> {
+  const selection = createSelection(anchor, focus);
+  let range = selection.range;
+  for (;;) {
+    let expanded = range;
+    for (const region of regions) {
+      if (!rangesIntersect(expanded, region)) continue;
+      expanded = Object.freeze({
+        rowStart: Math.min(expanded.rowStart, region.rowStart),
+        rowEnd: Math.max(expanded.rowEnd, region.rowEnd),
+        columnStart: Math.min(expanded.columnStart, region.columnStart),
+        columnEnd: Math.max(expanded.columnEnd, region.columnEnd),
+      });
+    }
+    if (sameGridRange(range, expanded)) break;
+    range = expanded;
+  }
+  return Object.freeze({ ...selection, range });
+}
+
+function rangesIntersect(left: GridRange, right: MergedCellRegion): boolean {
+  return left.rowStart < right.rowEnd
+    && left.rowEnd > right.rowStart
+    && left.columnStart < right.columnEnd
+    && left.columnEnd > right.columnStart;
+}
+
+function navigationOrigin(
+  current: CellPosition,
+  command: NavigationCommand,
+  regions: readonly MergedCellRegion[],
+): Readonly<CellPosition> {
+  const merge = mergeContaining(regions, current);
+  if (merge === undefined) return current;
+  if (command === "right") {
+    return Object.freeze({ rowIndex: current.rowIndex, columnIndex: merge.columnEnd - 1 });
+  }
+  if (command === "down" || command === "page-down") {
+    return Object.freeze({ rowIndex: merge.rowEnd - 1, columnIndex: current.columnIndex });
+  }
+  return current;
+}
+
+function navigationDirections(command: NavigationCommand): readonly [-1 | 1, -1 | 1] {
+  switch (command) {
+    case "left":
+    case "row-start":
+      return [1, -1];
+    case "up":
+    case "page-up":
+      return [-1, 1];
+    case "table-start":
+      return [-1, -1];
+    default:
+      return [1, 1];
+  }
+}
+
+function nextVisibleColumn(
+  widths: readonly number[],
+  from: number,
+  direction: -1 | 1,
+): number | null {
+  for (
+    let index = Math.min(widths.length - 1, Math.max(0, from));
+    index >= 0 && index < widths.length;
+    index += direction
+  ) {
+    if ((widths[index] ?? 0) > 0) return index;
+  }
+  return null;
 }
 
 function normalizeOptions(options: TableControllerOptions): NormalizedOptions {
@@ -673,59 +957,117 @@ function normalizeViewport(viewport: ViewportUpdate): Required<ViewportUpdate> {
 function layoutRanges(
   layout: TableViewSnapshot["layout"],
   maxCells: number,
+  mergedCells: readonly MergedCellRegion[] = [],
 ): Readonly<{
-  visible: Readonly<GridRange> | null;
-  overscan: Readonly<GridRange> | null;
+  visible: readonly Readonly<GridRange>[];
+  overscan: readonly Readonly<GridRange>[];
 }> {
-  const visibleRows = layout.rows.visible;
-  const visibleColumns = layout.columns.visible;
-  if (visibleRows.start === visibleRows.end || visibleColumns.start === visibleColumns.end) {
-    return Object.freeze({ visible: null, overscan: null });
-  }
-  const visible = Object.freeze({
-    rowStart: visibleRows.start,
-    rowEnd: visibleRows.end,
-    columnStart: visibleColumns.start,
-    columnEnd: visibleColumns.end,
-  });
-  const visibleCellCount = rangeCellCount(visible);
+  const visible = windowRectangles(
+    layout.rows.visible,
+    layout.columns.visible,
+    layout.frozenRowRange,
+    layout.frozenColumnRange,
+  );
+  const anchors = mergeAnchorRanges(mergedCells, visible);
+  const visibleWithAnchors = Object.freeze([
+    ...visible,
+    ...anchors.filter((anchor) => !visible.some((range) => rangeContainsRange(range, anchor))),
+  ]);
+  const visibleCellCount = visibleWithAnchors.reduce(
+    (total, range) => total + rangeCellCount(range),
+    0,
+  );
   if (visibleCellCount > maxCells) {
     throw new TabularkError(
       "RESOURCE_LIMIT",
       `The viewport contains ${visibleCellCount} cells; the window limit is ${maxCells}`,
-      { details: { visibleCellCount, maxCells } },
+      {
+        details: {
+          resource: "viewport-cells",
+          required: visibleCellCount,
+          available: maxCells,
+          visibleCellCount,
+          maxCells,
+        },
+      },
     );
   }
-  const overscanRows = layout.rows.overscan;
-  const overscanColumns = layout.columns.overscan;
-  const fullOverscan = Object.freeze({
-    rowStart: overscanRows.start,
-    rowEnd: overscanRows.end,
-    columnStart: overscanColumns.start,
-    columnEnd: overscanColumns.end,
-  });
-  if (rangeCellCount(fullOverscan) <= maxCells) {
-    return Object.freeze({ visible, overscan: fullOverscan });
-  }
-
-  let columnStart = fullOverscan.columnStart;
-  let columnEnd = fullOverscan.columnEnd;
-  const visibleRowCount = visible.rowEnd - visible.rowStart;
-  if ((columnEnd - columnStart) * visibleRowCount > maxCells) {
-    columnStart = visible.columnStart;
-    columnEnd = visible.columnEnd;
-  }
-  const columnCount = columnEnd - columnStart;
-  const maximumRows = Math.max(visibleRowCount, Math.floor(maxCells / columnCount));
-  const extraRows = maximumRows - visibleRowCount;
-  let rowStart = Math.max(fullOverscan.rowStart, visible.rowStart - Math.floor(extraRows / 2));
-  let rowEnd = Math.min(fullOverscan.rowEnd, rowStart + maximumRows);
-  rowStart = Math.max(fullOverscan.rowStart, rowEnd - maximumRows);
-  rowEnd = Math.max(rowEnd, visible.rowEnd);
+  const fullOverscan = windowRectangles(
+    layout.rows.overscan,
+    layout.columns.overscan,
+    layout.frozenRowRange,
+    layout.frozenColumnRange,
+  );
+  const overscanCellCount = fullOverscan.reduce(
+    (total, range) => total + rangeCellCount(range),
+    0,
+  );
+  const overscanWithAnchors = Object.freeze([
+    ...fullOverscan,
+    ...anchors.filter((anchor) => !fullOverscan.some(
+      (range) => rangeContainsRange(range, anchor),
+    )),
+  ]);
   return Object.freeze({
-    visible,
-    overscan: Object.freeze({ rowStart, rowEnd, columnStart, columnEnd }),
+    visible: visibleWithAnchors,
+    overscan: overscanCellCount + anchors.length <= maxCells
+      ? overscanWithAnchors
+      : visibleWithAnchors,
   });
+}
+
+function mergeAnchorRanges(
+  mergedCells: readonly MergedCellRegion[],
+  visible: readonly Readonly<GridRange>[],
+): readonly Readonly<GridRange>[] {
+  const anchors = new Map<string, Readonly<GridRange>>();
+  for (const region of mergedCells) {
+    if (!visible.some((range) => rangesIntersect(range, region))) continue;
+    const range = Object.freeze({
+      rowStart: region.rowStart,
+      rowEnd: region.rowStart + 1,
+      columnStart: region.columnStart,
+      columnEnd: region.columnStart + 1,
+    });
+    anchors.set(`${range.rowStart}:${range.columnStart}`, range);
+  }
+  return Object.freeze([...anchors.values()]);
+}
+
+function windowRectangles(
+  rows: Readonly<{ start: number; end: number }>,
+  columns: Readonly<{ start: number; end: number }>,
+  frozenRows: Readonly<{ start: number; end: number }>,
+  frozenColumns: Readonly<{ start: number; end: number }>,
+): readonly Readonly<GridRange>[] {
+  const rowBands = mergeIndexBands(rows, frozenRows);
+  const columnBands = mergeIndexBands(columns, frozenColumns);
+  const rectangles: GridRange[] = [];
+  for (const row of rowBands) {
+    for (const column of columnBands) {
+      rectangles.push(Object.freeze({
+        rowStart: row.start,
+        rowEnd: row.end,
+        columnStart: column.start,
+        columnEnd: column.end,
+      }));
+    }
+  }
+  return Object.freeze(rectangles);
+}
+
+function mergeIndexBands(
+  primary: Readonly<{ start: number; end: number }>,
+  frozen: Readonly<{ start: number; end: number }>,
+): readonly Readonly<{ start: number; end: number }>[] {
+  const bands = [primary, frozen]
+    .filter((range) => range.start < range.end)
+    .sort((left, right) => left.start - right.start);
+  if (bands.length <= 1) return Object.freeze(bands.map((range) => Object.freeze({ ...range })));
+  const [first, second] = bands as [typeof primary, typeof primary];
+  return first.end >= second.start
+    ? Object.freeze([Object.freeze({ start: first.start, end: Math.max(first.end, second.end) })])
+    : Object.freeze(bands.map((range) => Object.freeze({ ...range })));
 }
 
 function gridRangeToRequest(range: GridRange): Readonly<RangeRequest> {
@@ -833,7 +1175,15 @@ function assertWindowCellLimit(request: RangeRequest, limit: number, label: stri
     throw new TabularkError(
       "RESOURCE_LIMIT",
       `The ${label} contains ${cells} cells; the limit is ${limit}`,
-      { details: { cells, limit } },
+      {
+        details: {
+          resource: "view-window-cells",
+          required: cells,
+          available: limit,
+          cells,
+          limit,
+        },
+      },
     );
   }
 }

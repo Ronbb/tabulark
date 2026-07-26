@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use serde::Serialize;
 use tabulark::arrow::{
-    ArrowFileReadOperation, ArrowIpcOpenOperation, ArrowIpcOptions, ArrowIpcRuntime,
-    ArrowReadStart, ArrowRuntimeConfig, ArrowSourceHandle, ArrowTableHandle, ReadBytesAction,
+    ArrowFileReadOperation, ArrowIpcLimits, ArrowIpcOpenOperation, ArrowIpcOptions,
+    ArrowIpcRuntime, ArrowReadStart, ArrowRuntimeConfig, ArrowSourceHandle, ArrowTableHandle,
+    ReadBytesAction,
 };
 use tabulark::model::{RangeRequest, TableMetadata, TypedTableBatch};
 use tabulark::protocol::{
@@ -69,17 +70,17 @@ impl State {
     }
 }
 
-/// Dedicated Arrow IPC runtime artifact implementing adapter ABI v1.
+/// Dedicated Arrow IPC runtime artifact implementing adapter ABI v2.
 #[wasm_bindgen]
-pub struct WasmArrowRuntime {
+pub struct WasmRuntime {
     state: RefCell<State>,
 }
 
 #[wasm_bindgen]
-impl WasmArrowRuntime {
+impl WasmRuntime {
     /// Creates an empty Arrow adapter runtime.
     #[wasm_bindgen(constructor)]
-    pub fn new(config: JsValue) -> std::result::Result<WasmArrowRuntime, JsValue> {
+    pub fn new(config: JsValue) -> std::result::Result<WasmRuntime, JsValue> {
         let config = if config.is_null() || config.is_undefined() {
             ArrowRuntimeConfig::default()
         } else {
@@ -132,7 +133,7 @@ impl WasmArrowRuntime {
         source_length: f64,
     ) -> std::result::Result<JsValue, JsValue> {
         let source_length = safe_usize(source_length, "sourceLength")?;
-        let options = if options.is_null() || options.is_undefined() {
+        let mut options = if options.is_null() || options.is_undefined() {
             ArrowIpcOptions::default()
         } else {
             from_js(options)?
@@ -142,6 +143,11 @@ impl WasmArrowRuntime {
         // this check a Stream could spend its full sequential scan only to
         // fail while registering the completed source.
         let memory_budget_bytes = self.state.borrow().memory_budget_bytes;
+        // Resource limits are host policy. Derive them from the allocation
+        // made by the Worker ledger rather than retaining the native default
+        // ceiling when stable JS options omit private limit fields.
+        options.limits =
+            ArrowIpcLimits::from_memory_budget(memory_budget_bytes).map_err(error_to_js)?;
         options
             .limits
             .validate_for_memory_budget(memory_budget_bytes)
@@ -291,6 +297,27 @@ impl WasmArrowRuntime {
             .metadata(ArrowTableHandle::from_raw(table_handle))
             .map_err(error_to_js)?;
         to_js(metadata)
+    }
+
+    /// Returns no static presentation for Arrow IPC tables.
+    pub fn presentation(&self, table_handle: u32) -> std::result::Result<JsValue, JsValue> {
+        let state = self.state.borrow();
+        state
+            .runtime
+            .metadata(ArrowTableHandle::from_raw(table_handle))
+            .map_err(error_to_js)?;
+        Ok(JsValue::NULL)
+    }
+
+    /// Returns no range presentation for Arrow IPC tables.
+    #[wasm_bindgen(js_name = readPresentationRange)]
+    pub fn read_presentation_range(
+        &self,
+        table_handle: u32,
+        request: JsValue,
+    ) -> std::result::Result<JsValue, JsValue> {
+        let _: RangeRequest = from_js(request)?;
+        self.presentation(table_handle)
     }
 
     /// Starts a range read. Streams complete from retained decoded batches;
@@ -502,6 +529,7 @@ fn operation_action(
     action: ReadBytesAction,
 ) -> std::result::Result<JsValue, JsValue> {
     let result = Object::new();
+    set(&result, "kind", JsValue::from_str("read-bytes"))?;
     set(
         &result,
         "operationHandle",
@@ -519,6 +547,7 @@ fn progressive_open_action(
     metadata: &TableMetadata,
 ) -> std::result::Result<JsValue, JsValue> {
     let result = Object::new();
+    set(&result, "kind", JsValue::from_str("open-progress"))?;
     set(
         &result,
         "operationHandle",
@@ -537,7 +566,7 @@ fn complete_open(
     bytes_scanned: Option<u64>,
 ) -> std::result::Result<JsValue, JsValue> {
     let result = Object::new();
-    set(&result, "status", JsValue::from_str("complete"))?;
+    set(&result, "kind", JsValue::from_str("open-complete"))?;
     set_open_identity(&result, source, table_name, metadata)?;
     if let Some(bytes_scanned) = bytes_scanned {
         set_open_progress(&result, source, bytes_scanned, metadata, true)?;
@@ -611,7 +640,7 @@ fn set_open_progress(
 
 fn complete_batch(batch: &TypedTableBatch) -> std::result::Result<JsValue, JsValue> {
     let result = Object::new();
-    set(&result, "status", JsValue::from_str("complete"))?;
+    set(&result, "kind", JsValue::from_str("read-complete"))?;
     set(&result, "batch", batch_to_js(batch)?)?;
     Ok(result.into())
 }

@@ -6,14 +6,14 @@
     <meta name="color-scheme" content="light dark" />
     <meta
       name="description"
-      content="Tabulark is a WebAssembly-first engine for fast, local CSV, TSV, and Apache Arrow IPC preview in the browser. Try the interactive Canvas playground."
+      content="Tabulark is a WebAssembly-first engine for fast, local CSV, TSV, Arrow IPC, Parquet, XLS, and XLSX preview in the browser. Try the interactive Canvas playground."
     />
     <meta name="theme-color" content="#f4f6fb" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#111827" media="(prefers-color-scheme: dark)" />
     <meta property="og:title" content="Tabulark · Local table preview infrastructure" />
     <meta
       property="og:description"
-      content="Open CSV, TSV, and Apache Arrow IPC files locally with a Worker, WebAssembly, Canvas rendering, and an accessible semantic viewport."
+      content="Open local CSV, TSV, Arrow IPC, Parquet, XLS, and XLSX files with a Worker, WebAssembly, Canvas rendering, and an accessible semantic viewport."
     />
     <meta property="og:type" content="website" />
     <title>Tabulark · Local table preview infrastructure</title>
@@ -939,7 +939,7 @@
       <section id="playground" class="section" aria-labelledby="playground-title" tabindex="-1">
         <div class="section-heading">
           <span class="playground-label">Runs entirely in this browser</span>
-          <h2 id="playground-title">Try the CSV / TSV / Arrow IPC playground.</h2>
+          <h2 id="playground-title">Try the local table-format playground.</h2>
           <p>
             Choose a local file or open a committed sample. Nothing is uploaded, and the
             preview remains usable with keyboard navigation and a bounded semantic grid.
@@ -959,7 +959,7 @@
                   id="source"
                   data-testid="source-input"
                   type="file"
-                  accept=".csv,.tsv,.arrow,.arrows,.feather,text/csv,text/tab-separated-values,application/vnd.apache.arrow.file,application/vnd.apache.arrow.stream"
+                  accept=".csv,.tsv,.arrow,.arrows,.feather,.parquet,.xls,.xlsx,text/csv,text/tab-separated-values,application/vnd.apache.arrow.file,application/vnd.apache.arrow.stream,application/vnd.apache.parquet,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 />
               </label>
               <label class="field">
@@ -968,6 +968,9 @@
                   <option value="csv">CSV</option>
                   <option value="tsv">TSV</option>
                   <option value="arrow">Arrow IPC</option>
+                  <option value="parquet">Parquet</option>
+                  <option value="xls">Excel XLS</option>
+                  <option value="xlsx">Excel XLSX</option>
                 </select>
               </label>
               <button id="open" data-testid="open-button" class="primary" type="submit">Open preview</button>
@@ -1044,7 +1047,7 @@
               <div class="state-line">
                 <span class="state-badge" data-testid="state-label">Idle</span>
                 <p id="status" data-testid="status" role="status" aria-live="polite" aria-atomic="true" tabindex="-1">
-                  Choose CSV, TSV, or Arrow IPC explicitly, then open a local source or sample.
+                  Choose CSV, TSV, Arrow IPC, Parquet, XLS, or XLSX explicitly, then open a local source or sample.
                 </p>
               </div>
               <div class="source-meta">
@@ -1066,7 +1069,7 @@
                 </svg>
                 <strong id="empty-title" data-testid="empty-title">No table open</strong>
                 <p id="empty-message" data-testid="empty-message">
-                  Choose a local CSV, TSV, or Arrow IPC source. Nothing is uploaded.
+                  Choose a local CSV, TSV, Arrow IPC, Parquet, XLS, or XLSX source. Nothing is uploaded.
                 </p>
               </div>
             </section>
@@ -1083,8 +1086,8 @@
           <p class="eyebrow">Prototype boundary</p>
           <h2 id="architecture-title">What is working today.</h2>
           <p>
-            The current release is intentionally pre-alpha. CSV/TSV and Apache Arrow IPC now
-            exercise the same explicit adapter, Worker, typed-batch, and lifecycle boundaries.
+            The 0.1.0 release train uses one closed official-adapter boundary;
+            CSV/TSV, Arrow IPC, Parquet, XLS, and XLSX choice is explicit and local-only.
           </p>
         </div>
         <ul class="capability-list">
@@ -1095,6 +1098,14 @@
           <li>
             <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 5.5h16v13H4zM4 10h16M9 5.5v13M15 5.5v13" fill="none" stroke="currentColor" stroke-width="1.7" /></svg>
             <span><strong>Apache Arrow IPC adapter</strong><br />File and Stream containers, typed values, nested schema descriptors, dictionary preservation, and deterministic display text.</span>
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 5.5h16v13H4zM4 10h16M9 5.5v13M15 5.5v13" fill="none" stroke="currentColor" stroke-width="1.7" /></svg>
+            <span><strong>Apache Parquet adapter</strong><br />Footer-first range reads, row-group projection, and typed Arrow-compatible batches.</span>
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 5.5h16v13H4zM4 10h16M9 5.5v13M15 5.5v13" fill="none" stroke="currentColor" stroke-width="1.7" /></svg>
+            <span><strong>Excel XLS / XLSX adapter</strong><br />Worksheet tables, cached formula values, and static spreadsheet presentation metadata.</span>
           </li>
           <li>
             <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m5 12 4 4 10-10" fill="none" stroke="currentColor" stroke-width="2" /></svg>

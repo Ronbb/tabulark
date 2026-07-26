@@ -1,4 +1,4 @@
-import { mkdir, readdir, rm } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,6 +8,10 @@ import { build } from "esbuild";
 const rootUrl = new URL("../", import.meta.url);
 const root = fileURLToPath(rootUrl);
 const dist = fileURLToPath(new URL("dist/", rootUrl));
+const officialManifest = JSON.parse(await readFile(
+  fileURLToPath(new URL("js/official-adapters.json", rootUrl)),
+  "utf8",
+));
 
 await cleanJavaScriptArtifacts(dist);
 
@@ -22,21 +26,30 @@ const shared = {
   format: "esm",
   platform: "browser",
   target: "es2022",
+  // Keep identifiers and syntax stable for readable stacks while removing
+  // formatting-only bytes from every shipped runtime bundle.
+  minifyWhitespace: true,
   sourcemap: true,
   sourcesContent: true,
   legalComments: "none",
 };
 
+const adapterEntrypoints = new Map();
+for (const adapter of officialManifest.adapters) {
+  const outputName = adapter.entrypoint === "." ? "index" : adapter.entrypoint.replace(/^\.\//u, "");
+  adapterEntrypoints.set(outputName, outputName);
+}
+
 await Promise.all([
+  ...[...adapterEntrypoints].map(([sourceName, outputName]) => build({
+    ...shared,
+    entryPoints: [fileURLToPath(new URL(`js/${sourceName}.ts`, rootUrl))],
+    outfile: fileURLToPath(new URL(`dist/${outputName}.js`, rootUrl)),
+  })),
   build({
     ...shared,
-    entryPoints: [fileURLToPath(new URL("js/index.ts", rootUrl))],
-    outfile: fileURLToPath(new URL("dist/index.js", rootUrl)),
-  }),
-  build({
-    ...shared,
-    entryPoints: [fileURLToPath(new URL("js/arrow.ts", rootUrl))],
-    outfile: fileURLToPath(new URL("dist/arrow.js", rootUrl)),
+    entryPoints: [fileURLToPath(new URL("js/experimental.ts", rootUrl))],
+    outfile: fileURLToPath(new URL("dist/experimental.js", rootUrl)),
   }),
   build({
     ...shared,

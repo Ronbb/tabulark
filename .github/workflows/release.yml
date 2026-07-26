@@ -6,6 +6,7 @@ on:
       - "v*.*.*"
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -14,15 +15,52 @@ concurrency:
 
 jobs:
   verify:
-    name: Verify release
-    # The release gate includes the same Chromium visual suite as CI.
+    name: Verify and assemble release
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
+      tarball: ${{ steps.bundle.outputs.tarball }}
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
+      - name: Verify tag provenance and prerequisite workflows
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          candidate="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          remote_main="$(git ls-remote origin refs/heads/main | awk '{ print $1 }')"
+          test -n "$remote_main"
+          if [ "$candidate" != "$remote_main" ]; then
+            echo "Release tag commit $candidate is not origin/main $remote_main" >&2
+            exit 1
+          fi
+
+          runs="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "/repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${candidate}&per_page=100")"
+          for workflow in "CI" "GitHub Pages"; do
+            if ! jq -e --arg workflow "$workflow" --arg sha "$candidate" \
+              '[.workflow_runs[] | select(
+                .name == $workflow
+                and .head_sha == $sha
+                and .status == "completed"
+                and .conclusion == "success"
+              )] | length > 0' <<<"$runs" >/dev/null; then
+              echo "$workflow has no successful completed run for $candidate" >&2
+              exit 1
+            fi
+          done
+
+      - name: Install Rust 1.85 MSRV
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.85.0
+
+      # Install stable last so every unqualified cargo invocation below,
+      # including the ones spawned by npm scripts, uses the release toolchain.
+      - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -32,21 +70,19 @@ jobs:
         shell: bash
         run: |
           version="$(cargo metadata --format-version 1 --locked --no-default-features --features wasm | jq -er '[.packages[] | select(.name == "wasm-bindgen") | .version][0]')"
-          if ! command -v wasm-bindgen > /dev/null || ! wasm-bindgen --version | grep -Fx "wasm-bindgen $version" > /dev/null; then
-            target="x86_64-unknown-linux-musl"
-            archive="wasm-bindgen-${version}-${target}.tar.gz"
-            checksum="${archive}.sha256sum"
-            curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
-              --output "$RUNNER_TEMP/$archive" \
-              "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/${archive}"
-            curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
-              --output "$RUNNER_TEMP/$checksum" \
-              "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/${checksum}"
-            expected="$(awk '{ print $1 }' "$RUNNER_TEMP/$checksum")"
-            printf '%s  %s\n' "$expected" "$RUNNER_TEMP/$archive" | sha256sum --check
-            tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
-            echo "$RUNNER_TEMP/wasm-bindgen-${version}-${target}" >> "$GITHUB_PATH"
-          fi
+          target="x86_64-unknown-linux-musl"
+          archive="wasm-bindgen-${version}-${target}.tar.gz"
+          checksum="${archive}.sha256sum"
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
+            --output "$RUNNER_TEMP/$archive" \
+            "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/${archive}"
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
+            --output "$RUNNER_TEMP/$checksum" \
+            "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/${checksum}"
+          expected="$(awk '{ print $1 }' "$RUNNER_TEMP/$checksum")"
+          printf '%s  %s\n' "$expected" "$RUNNER_TEMP/$archive" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/wasm-bindgen-${version}-${target}" >> "$GITHUB_PATH"
 
       - name: Install Node.js
         uses: actions/setup-node@v6
@@ -57,52 +93,169 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Validate release version
+      - name: Validate release version and changelog
         id: version
         shell: bash
         run: |
           version="$(node scripts/check-versions.mjs "$GITHUB_REF_NAME")"
+          grep -Fx "## ${version}" CHANGELOG.md
+          if grep -Fq 'has **not** been published' CHANGELOG.md; then
+            echo "CHANGELOG.md still describes the release as unpublished" >&2
+            exit 1
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Check formatting
-        run: cargo fmt --all --check
+      - name: Check registry version availability
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          npm_status="$(curl --silent --output /dev/null --write-out '%{http_code}' "https://registry.npmjs.org/tabulark/${VERSION}")"
+          crate_status="$(curl --silent --output /dev/null --write-out '%{http_code}' "https://crates.io/api/v1/crates/tabulark/${VERSION}")"
+          case "$npm_status" in 200|404) ;; *) echo "Unexpected npm response: HTTP $npm_status" >&2; exit 1;; esac
+          case "$crate_status" in 200|404) ;; *) echo "Unexpected crates.io response: HTTP $crate_status" >&2; exit 1;; esac
 
-      - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Check formatting
+        run: |
+          cargo fmt --all --check
+          cargo fmt --manifest-path crates/zstd-pure-compat/Cargo.toml --check
+          cargo fmt --manifest-path crates/zstd-pure-compat/compat-check/Cargo.toml --check
+
+      - name: Check Rust 1.85 compatibility
+        run: |
+          cargo +1.85.0 check --workspace --all-features --locked
+          cargo +1.85.0 test --manifest-path crates/zstd-pure-compat/Cargo.toml --locked
+          cargo +1.85.0 check --manifest-path crates/zstd-pure-compat/compat-check/Cargo.toml --locked
+          cargo +1.85.0 check --package tabulark-delimited-wasm --target wasm32-unknown-unknown --locked
+          cargo +1.85.0 check --package tabulark-arrow-wasm --target wasm32-unknown-unknown --locked
+          cargo +1.85.0 check --package tabulark-parquet-wasm --target wasm32-unknown-unknown --locked
+          cargo +1.85.0 check --package tabulark-excel-wasm --target wasm32-unknown-unknown --locked
+
+      - name: Run Clippy on stable
+        run: |
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo clippy --manifest-path crates/zstd-pure-compat/Cargo.toml --all-targets --locked -- -D warnings
+          cargo clippy --manifest-path crates/zstd-pure-compat/compat-check/Cargo.toml --all-targets --locked -- -D warnings
 
       - name: Run Rust tests
         run: cargo test --workspace --all-features --locked
 
-      - name: Check WebAssembly target
+      - name: Check dependency advisories and licenses
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses
+
+      - name: Enforce pure-Rust official codec graphs
+        shell: bash
+        run: |
+          for package in tabulark-arrow-wasm tabulark-parquet-wasm; do
+            tree="$(cargo tree --package "$package" --edges normal --locked)"
+            grep -F 'ruzstd v0.8.1' <<<"$tree"
+            if grep -Eq 'zstd-(sys|safe)' <<<"$tree"; then
+              echo "$package contains a forbidden C-backed Zstd dependency" >&2
+              exit 1
+            fi
+          done
+          fuzz_tree="$(cargo tree --manifest-path fuzz/Cargo.toml --edges normal --locked)"
+          grep -F 'ruzstd v0.8.1' <<<"$fuzz_tree"
+          ! grep -Eq 'zstd-(sys|safe)' <<<"$fuzz_tree"
+
+      - name: Replay fuzz seeds
+        run: |
+          cargo run --manifest-path fuzz/Cargo.toml --bin csv_lifecycle --locked
+          cargo run --manifest-path fuzz/Cargo.toml --bin arrow_lifecycle --locked
+          cargo run --manifest-path fuzz/Cargo.toml --bin parquet_lifecycle --locked
+          cargo run --manifest-path fuzz/Cargo.toml --bin excel_lifecycle --locked
+
+      - name: Check all WebAssembly wrappers
         run: |
           cargo check --package tabulark-delimited-wasm --target wasm32-unknown-unknown --locked
           cargo check --package tabulark-arrow-wasm --target wasm32-unknown-unknown --locked
+          cargo check --package tabulark-parquet-wasm --target wasm32-unknown-unknown --locked
+          cargo check --package tabulark-excel-wasm --target wasm32-unknown-unknown --locked
 
       - name: Build JavaScript and WebAssembly
         run: npm run build
 
-      - name: Check TypeScript
-        run: npm run typecheck
+      - name: Check TypeScript and JavaScript tests
+        run: |
+          npm run typecheck
+          npm test
 
-      - name: Run JavaScript tests
-        run: npm test
+      - name: Check packed consumer and Pages assembly
+        run: |
+          npm run package:check
+          npm run pages:check
 
       - name: Install Chromium
         run: npx --no-install playwright install --with-deps chromium
 
-      - name: Run browser integration tests
+      - name: Record exact Chromium version
+        shell: bash
+        run: |
+          mkdir -p target/release
+          node --input-type=module <<'NODE' > target/release/chromium-version.txt
+          import { chromium } from "@playwright/test";
+          const browser = await chromium.launch({ headless: true });
+          console.log(`Playwright 1.61.1 / Chromium ${await browser.version()}`);
+          await browser.close();
+          NODE
+          cat target/release/chromium-version.txt
+
+      - name: Run Chromium release gate
         run: npm run test:browser
 
-      - name: Run performance invariant smoke
-        run: npm run benchmark:smoke
+      - name: Run performance and size gates
+        run: |
+          npm run benchmark:smoke
+          npm run benchmark:arrow
+          npm run benchmark:formats
+          npm run benchmark:size
 
-      - name: Run Arrow delivery performance smoke
-        run: npm run benchmark:arrow
+      - name: Package crate and npm tarball
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cargo package --locked
+          package_manifest="$(find target/package -mindepth 2 -maxdepth 2 -path '*/tabulark-*/Cargo.toml' -print -quit)"
+          test -n "$package_manifest"
+          published_tree="$(cargo tree --manifest-path "$package_manifest" --all-features --edges normal)"
+          if grep -Eq '(^|[[:space:]])(zstd|ruzstd|zstd-safe|zstd-sys) v' <<<"$published_tree"; then
+            echo "Published experimental Rust graph unexpectedly enables Zstd after patch stripping" >&2
+            exit 1
+          fi
+          mkdir -p target/release
+          cp "target/package/tabulark-${VERSION}.crate" target/release/
+          npm pack --ignore-scripts --pack-destination target/release
 
-      - name: Enforce package and site size budgets
-        run: npm run benchmark:size
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: target/release/tabulark-${{ steps.version.outputs.version }}.spdx.json
+          upload-artifact: false
 
-      - name: Upload browser traces and screenshot diffs
+      - name: Record checksums
+        id: bundle
+        shell: bash
+        run: |
+          tarball="$(find target/release -maxdepth 1 -name '*.tgz' -printf '%f\n')"
+          test -n "$tarball"
+          (cd target/release && sha256sum "$tarball" *.crate *.spdx.json > SHA256SUMS)
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          cat target/release/SHA256SUMS
+
+      - name: Upload immutable release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle-${{ github.ref_name }}
+          path: target/release/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload browser diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -113,20 +266,31 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Check registry packages
-        run: |
-          cargo package --locked
-          npm run package:check
-
   publish-crate:
     name: Publish crate
     needs: verify
+    runs-on: ubuntu-latest
+    environment:
+      name: cratesio-release
     permissions:
       contents: read
       id-token: write
-    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
+      - name: Download verified release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: release-bundle-${{ github.ref_name }}
+          path: target/release
+
+      - name: Verify release checksums
+        run: cd target/release && sha256sum --check SHA256SUMS
+
+      - name: Require protected-environment confirmation
+        env:
+          CONFIRMED: ${{ vars.TABULARK_CRATES_TRUSTED_PUBLISHER_CONFIRMED }}
+        run: test "$CONFIRMED" = "1"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -137,15 +301,12 @@ jobs:
         env:
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          if curl --fail --silent --show-error \
-            --retry 5 --retry-all-errors --retry-delay 2 \
-            "https://index.crates.io/ta/bu/tabulark" \
-            | grep "\"vers\":\"${VERSION}\"" > /dev/null; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "tabulark ${VERSION} already exists on crates.io; skipping."
-          else
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-          fi
+          status="$(curl --silent --output /dev/null --write-out '%{http_code}' "https://crates.io/api/v1/crates/tabulark/${VERSION}")"
+          case "$status" in
+            200) echo "publish=false" >> "$GITHUB_OUTPUT" ;;
+            404) echo "publish=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "Unexpected crates.io response: HTTP $status" >&2; exit 1 ;;
+          esac
 
       - name: Authenticate to crates.io
         if: steps.availability.outputs.publish == 'true'
@@ -158,15 +319,45 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
+      - name: Verify crates.io artifact matches the release bundle
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          expected="target/release/tabulark-${VERSION}.crate"
+          test -f "$expected"
+          curl --fail --location --retry 12 --retry-all-errors --retry-delay 5 \
+            --output "$RUNNER_TEMP/tabulark-${VERSION}.crate" \
+            "https://crates.io/api/v1/crates/tabulark/${VERSION}/download"
+          cmp --silent "$expected" "$RUNNER_TEMP/tabulark-${VERSION}.crate" || {
+            echo "crates.io artifact does not match the verified release bundle" >&2
+            sha256sum "$expected" "$RUNNER_TEMP/tabulark-${VERSION}.crate" >&2
+            exit 1
+          }
+
   publish-npm:
-    name: Publish npm package
-    needs: verify
+    name: Publish verified npm tarball
+    needs: [verify, publish-crate]
+    runs-on: ubuntu-latest
+    environment:
+      name: npm-release
     permissions:
       contents: read
       id-token: write
-    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - name: Require protected-environment confirmation
+        env:
+          CONFIRMED: ${{ vars.TABULARK_NPM_TRUSTED_PUBLISHER_CONFIRMED }}
+        run: test "$CONFIRMED" = "1"
+
+      - name: Download verified release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: release-bundle-${{ github.ref_name }}
+          path: target/release
+
+      - name: Verify release checksums
+        run: cd target/release && sha256sum --check SHA256SUMS
 
       - name: Check npm version
         id: availability
@@ -176,66 +367,135 @@ jobs:
         run: |
           status="$(curl --silent --output /dev/null --write-out '%{http_code}' "https://registry.npmjs.org/tabulark/${VERSION}")"
           case "$status" in
-            200)
-              echo "publish=false" >> "$GITHUB_OUTPUT"
-              echo "tabulark ${VERSION} already exists on npm; skipping."
-              ;;
-            404)
-              echo "publish=true" >> "$GITHUB_OUTPUT"
-              ;;
-            *)
-              echo "Unexpected npm response: HTTP ${status}" >&2
-              exit 1
-              ;;
+            200) echo "publish=false" >> "$GITHUB_OUTPUT" ;;
+            404) echo "publish=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "Unexpected npm response: HTTP $status" >&2; exit 1 ;;
           esac
 
       - name: Install Node.js
-        if: steps.availability.outputs.publish == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
 
-      - name: Install Rust for WebAssembly build
-        if: steps.availability.outputs.publish == 'true'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Install matching wasm-bindgen CLI
-        if: steps.availability.outputs.publish == 'true'
-        shell: bash
-        run: |
-          version="$(cargo metadata --format-version 1 --locked --no-default-features --features wasm | jq -er '[.packages[] | select(.name == "wasm-bindgen") | .version][0]')"
-          if ! command -v wasm-bindgen > /dev/null || ! wasm-bindgen --version | grep -Fx "wasm-bindgen $version" > /dev/null; then
-            target="x86_64-unknown-linux-musl"
-            archive="wasm-bindgen-${version}-${target}.tar.gz"
-            checksum="${archive}.sha256sum"
-            curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
-              --output "$RUNNER_TEMP/$archive" \
-              "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/${archive}"
-            curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
-              --output "$RUNNER_TEMP/$checksum" \
-              "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/${checksum}"
-            expected="$(awk '{ print $1 }' "$RUNNER_TEMP/$checksum")"
-            printf '%s  %s\n' "$expected" "$RUNNER_TEMP/$archive" | sha256sum --check
-            tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
-            echo "$RUNNER_TEMP/wasm-bindgen-${version}-${target}" >> "$GITHUB_PATH"
-          fi
-
-      - name: Install an OIDC-capable npm CLI
+      - name: Install provenance-capable npm
         if: steps.availability.outputs.publish == 'true'
         run: npm install --global npm@11
 
-      - name: Install dependencies
+      - name: Publish the verified tarball with provenance
         if: steps.availability.outputs.publish == 'true'
-        run: npm ci
+        env:
+          TARBALL: ${{ needs.verify.outputs.tarball }}
+        run: npm publish "target/release/$TARBALL" --access public --provenance
 
-      - name: Build JavaScript and WebAssembly
-        if: steps.availability.outputs.publish == 'true'
-        run: npm run build
+      - name: Verify npm artifact matches the release bundle
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          TARBALL: ${{ needs.verify.outputs.tarball }}
+        run: |
+          metadata="$RUNNER_TEMP/tabulark-${VERSION}.json"
+          for attempt in $(seq 1 12); do
+            status="$(curl --silent --show-error --output "$metadata" --write-out '%{http_code}' \
+              "https://registry.npmjs.org/tabulark/${VERSION}")"
+            if [ "$status" = "200" ]; then break; fi
+            if [ "$attempt" = "12" ]; then
+              echo "npm metadata remained unavailable: HTTP $status" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          registry_tarball="$(node --input-type=module - "$metadata" <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const metadata = JSON.parse(await readFile(process.argv[2], "utf8"));
+          if (typeof metadata?.dist?.tarball !== "string") throw new Error("npm metadata has no tarball URL");
+          console.log(metadata.dist.tarball);
+          NODE
+          )"
+          curl --fail --location --retry 12 --retry-all-errors --retry-delay 5 \
+            --output "$RUNNER_TEMP/$TARBALL" "$registry_tarball"
+          cmp --silent "target/release/$TARBALL" "$RUNNER_TEMP/$TARBALL" || {
+            echo "npm artifact does not match the verified release bundle" >&2
+            sha256sum "target/release/$TARBALL" "$RUNNER_TEMP/$TARBALL" >&2
+            exit 1
+          }
 
-      - name: Publish to npm
-        if: steps.availability.outputs.publish == 'true'
-        run: npm publish
+  github-release:
+    name: Create GitHub Release and attach SBOM
+    needs: [verify, publish-npm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: release-bundle-${{ github.ref_name }}
+          path: target/release
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" target/release/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" target/release/* \
+              --verify-tag \
+              --title "Tabulark ${{ needs.verify.outputs.version }}" \
+              --generate-notes
+          fi
+
+  registry-smoke:
+    name: Registry consumer smoke (Node ${{ matrix.node }})
+    needs: [verify, github-release]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: Smoke-test the published registry package
+        env:
+          TABULARK_REGISTRY_VERSION: ${{ needs.verify.outputs.version }}
+        run: node scripts/registry-smoke.mjs
+
+  registry-crate-smoke:
+    name: Registry Cargo consumer smoke
+    needs: [verify, github-release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Compile and run a clean crates.io consumer
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          consumer="$(mktemp -d)"
+          cargo new --bin --vcs none "$consumer"
+          cd "$consumer"
+          cargo add "tabulark@=${VERSION}" --features parquet,wasm
+          cat > src/main.rs <<'RS'
+          use tabulark::TableShape;
+
+          fn main() {
+              let shape = TableShape::new(3, 4);
+              assert_eq!(shape.checked_cell_count(), Some(12));
+          }
+          RS
+          cargo check --locked
+          cargo run --locked --quiet

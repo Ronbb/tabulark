@@ -22,10 +22,12 @@ import type {
 import {
   ColumnarTableBatch,
   deriveMemoryBudgetLimits,
+  MemoryReservationLedger,
   normalizeDataType,
   MAX_ACTIVE_RANGES,
   MAX_RANGE_WAITERS,
   type MemoryBudgetLimits,
+  type MemoryReservation,
 } from "./model.js";
 import {
   AsyncPermitQueue,
@@ -37,6 +39,12 @@ import {
 } from "./range-cache.js";
 import { WasmAdapter } from "./worker/wasm-adapter.js";
 import { ProtocolFault, serializeFault } from "./worker/worker-errors.js";
+import {
+  isOfficialAdapterId,
+  officialAdapterModuleUrl,
+  officialAdapterManifestEntry,
+  type OfficialAdapterId,
+} from "./official-adapter-manifest.js";
 
 const CHUNK_BYTES = 1024 * 1024;
 // wasm32 address arithmetic and Rust `usize` cap one Blob source below 4 GiB.
@@ -53,7 +61,7 @@ interface DatasetState {
   readonly handle: string;
   readonly openRequestId: string;
   readonly source: Blob;
-  readonly adapterId: "tabulark:delimited" | "tabulark:arrow-ipc";
+  readonly adapterId: OfficialAdapterId;
   readonly adapter: WasmAdapter;
   readonly sourceHandle: string | number;
   tables: readonly TableDescriptor[];
@@ -62,7 +70,7 @@ interface DatasetState {
   scanDone: boolean;
   scanError?: ProtocolFault;
   scanPromise?: Promise<void>;
-  /** Pending adapter-v1 open action owned by the background indexer. */
+  /** Pending adapter-v2 open action owned by the background indexer. */
   scanStep?: Record<string, unknown>;
   scanOperationHandle?: string | number;
   pendingProgress?: ScanProgress;
@@ -70,7 +78,9 @@ interface DatasetState {
   eventsReady: boolean;
   readonly pendingWarnings: unknown[];
   readonly waiters: Set<() => void>;
-  readonly rangeCache: ByteLruCache<WireTableBatch>;
+  readonly rangeCache: ByteLruCache<CachedRangeBatch>;
+  /** Excel keeps its staged workbook bytes alive after open completes. */
+  readonly openedWorksheetReservation?: MemoryReservation;
   /** Releases the engine-wide source slot exactly once. */
   readonly releaseSourceSlot: () => void;
 }
@@ -86,7 +96,13 @@ interface OpenTableState {
   readonly datasetHandle: string;
   readonly tableId: string;
   readonly adapterTableHandle: string | number;
+  metadata: TableMetadata;
   closed: boolean;
+}
+
+interface CachedRangeBatch {
+  readonly batch: WireTableBatch;
+  readonly reservation: MemoryReservation;
 }
 
 interface ActiveOpenRequest {
@@ -95,6 +111,7 @@ interface ActiveOpenRequest {
   datasetHandle?: string;
   adapter?: WasmAdapter;
   operationHandle?: string | number;
+  openedWorksheetReservation?: MemoryReservation;
   cancelled: boolean;
   readonly cancellation: RequestCancellation;
 }
@@ -119,18 +136,27 @@ interface RequestCancellation {
 }
 
 interface HelloPayload {
-  readonly adapters: readonly AdapterRegistrationPayload[];
+  readonly adapters: readonly HelloAdapterPayload[];
   readonly memoryBudgetBytes: number;
 }
 
+interface HelloAdapterPayload {
+  readonly id: OfficialAdapterId;
+}
+
 interface AdapterRegistrationPayload {
-  readonly id: "tabulark:delimited" | "tabulark:arrow-ipc";
+  readonly id: OfficialAdapterId;
   readonly moduleUrl: string;
+}
+
+interface ReservedBlobRead {
+  readonly buffer: ArrayBuffer;
+  readonly release: () => void;
 }
 
 interface OpenSourcePayload {
   readonly source: Blob | ArrayBuffer;
-  readonly adapterId: "tabulark:delimited" | "tabulark:arrow-ipc";
+  readonly adapterId: OfficialAdapterId;
   readonly options: Record<string, unknown>;
 }
 
@@ -139,11 +165,13 @@ let nextDatasetHandle = 1;
 let nextTableHandle = 1;
 let rangeCacheBudgetBytes = 0;
 let memoryLimits: MemoryBudgetLimits | undefined;
+let memoryLedger: MemoryReservationLedger | undefined;
 let sourceSlotsInUse = 0;
 let rangeRequestsInFlight = 0;
 let adapterRegistrations = new Map<string, AdapterRegistrationPayload>();
 const adapterLoads = new Map<string, Promise<WasmAdapter>>();
 const loadedAdapters = new Map<string, WasmAdapter>();
+const adapterRuntimeReservations = new Map<string, MemoryReservation>();
 const datasets = new Map<string, DatasetState>();
 const tables = new Map<string, OpenTableState>();
 const activeRequests = new Map<string, ActiveRequest>();
@@ -173,7 +201,11 @@ async function dispatch(value: unknown): Promise<void> {
 
   try {
     const result = await runOperation(request);
-    postSuccess(request.requestId, result.kind, result.data, result.transfer);
+    try {
+      postSuccess(request.requestId, result.kind, result.data, result.transfer);
+    } finally {
+      result.release?.();
+    }
     if (request.op === "listTables") {
       flushPendingDatasetEvents(request.payload);
     }
@@ -187,7 +219,12 @@ async function dispatch(value: unknown): Promise<void> {
 
 async function runOperation(
   request: ProtocolRequest,
-): Promise<{ kind: Parameters<typeof postSuccess>[1]; data?: unknown; transfer?: Transferable[] }> {
+): Promise<{
+  kind: Parameters<typeof postSuccess>[1];
+  data?: unknown;
+  transfer?: Transferable[];
+  release?: () => void;
+}> {
   switch (request.op) {
     case "hello":
       return { kind: "hello", data: await hello(request.payload) };
@@ -199,6 +236,10 @@ async function runOperation(
       return { kind: "table", data: openTable(request.payload) };
     case "getMetadata":
       return { kind: "metadata", data: getMetadata(request.payload) };
+    case "getPresentation":
+      return { kind: "presentation", data: getPresentation(request.payload) };
+    case "readPresentationRange":
+      return { kind: "presentationRange", data: readPresentationRange(request.payload) };
     case "readRange":
       return readRange(request.requestId, request.payload);
     case "cancel":
@@ -219,9 +260,6 @@ async function runOperation(
 }
 
 async function hello(value: unknown): Promise<unknown> {
-  if (memoryLimits) {
-    return helloResult();
-  }
   const payload = expectRecord(value, "hello payload") as unknown as HelloPayload;
   if (!Number.isSafeInteger(payload.memoryBudgetBytes) || payload.memoryBudgetBytes <= 0) {
     throw new ProtocolFault("INVALID_ARGUMENT", "memoryBudgetBytes must be a positive safe integer");
@@ -233,21 +271,36 @@ async function hello(value: unknown): Promise<unknown> {
   for (const entry of payload.adapters) {
     if (
       !isRecord(entry)
-      || (entry.id !== "tabulark:delimited" && entry.id !== "tabulark:arrow-ipc")
-      || typeof entry.moduleUrl !== "string"
-      || entry.moduleUrl.length === 0
+      || !isOfficialAdapterId(entry.id)
+      || Object.keys(entry).some((key) => key !== "id")
     ) {
       throw new ProtocolFault("INVALID_ARGUMENT", "hello contains an invalid official adapter");
     }
     if (registrations.has(entry.id)) {
       throw new ProtocolFault("INVALID_ARGUMENT", `Adapter ${entry.id} is registered more than once`);
     }
-    registrations.set(entry.id, Object.freeze({ id: entry.id, moduleUrl: entry.moduleUrl }));
+    registrations.set(entry.id, Object.freeze({
+      id: entry.id,
+      moduleUrl: adapterModuleUrl(entry.id),
+    }));
+  }
+
+  if (memoryLimits) {
+    const sameIds = registrations.size === adapterRegistrations.size
+      && [...registrations.keys()].every((id) => adapterRegistrations.has(id));
+    if (payload.memoryBudgetBytes !== memoryLimits.memoryBudgetBytes || !sameIds) {
+      throw new ProtocolFault(
+        "INVALID_ARGUMENT",
+        "The Worker hello handshake cannot be reconfigured after initialization",
+      );
+    }
+    return helloResult();
   }
 
   const limits = deriveMemoryBudgetLimits(payload.memoryBudgetBytes);
   adapterRegistrations = registrations;
   memoryLimits = limits;
+  memoryLedger = new MemoryReservationLedger(payload.memoryBudgetBytes);
   rangeCacheBudgetBytes = limits.workerDatasetRangeCacheBytes;
   return helloResult();
 }
@@ -290,7 +343,7 @@ async function openSource(requestId: string, value: unknown): Promise<unknown> {
   try {
     const limits = requireMemoryLimits();
     const payload = expectRecord(value, "openSource payload") as unknown as OpenSourcePayload;
-    if (payload.adapterId !== "tabulark:delimited" && payload.adapterId !== "tabulark:arrow-ipc") {
+    if (!isOfficialAdapterId(payload.adapterId)) {
       throw new ProtocolFault("INVALID_ARGUMENT", "openSource adapterId is not registered");
     }
     if (!isRecord(payload.options) || Array.isArray(payload.options)) {
@@ -304,6 +357,12 @@ async function openSource(requestId: string, value: unknown): Promise<unknown> {
         throw new ProtocolFault(
           "RESOURCE_LIMIT",
           `ArrayBuffer sources larger than ${limits.maxArrayBufferBytes} bytes must be supplied as a Blob`,
+          false,
+          {
+            resource: "source-staging",
+            requiredBytes: payload.source.byteLength,
+            availableBytes: limits.maxArrayBufferBytes,
+          },
         );
       }
       source = new Blob([payload.source]);
@@ -316,7 +375,13 @@ async function openSource(requestId: string, value: unknown): Promise<unknown> {
     active.adapter = runtime;
 
     const initialStep = runtime.beginOpen(adapterOpenOptions(payload, limits), source.size);
-    const openRaw = await runOpenUntilPublished(runtime, source, initialStep, active);
+    const openRaw = await runOpenUntilPublished(
+      runtime,
+      source,
+      initialStep,
+      active,
+      payload.adapterId,
+    );
     const progressiveOpen = isProgressiveOpenStep(openRaw);
     if (openRaw.sourceHandle === undefined || openRaw.sourceHandle === null) {
       throw new ProtocolFault("RUNTIME_FAILURE", "Adapter open did not return a sourceHandle");
@@ -351,10 +416,14 @@ async function openSource(requestId: string, value: unknown): Promise<unknown> {
         ? []
         : Array.isArray(openRaw.warnings) ? [...openRaw.warnings] : [],
       waiters: new Set(),
-      rangeCache: new ByteLruCache(rangeCacheBudgetBytes),
+      rangeCache: createRangeCache(),
+      ...(active.openedWorksheetReservation === undefined
+        ? {}
+        : { openedWorksheetReservation: active.openedWorksheetReservation }),
       releaseSourceSlot,
     };
     dataset = openedDataset;
+    delete active.openedWorksheetReservation;
     datasets.set(datasetHandle, openedDataset);
     releaseSourceSlot = undefined;
     active.datasetHandle = datasetHandle;
@@ -386,8 +455,9 @@ async function openSource(requestId: string, value: unknown): Promise<unknown> {
           // Preserve the original open or cancellation failure.
         }
       }
-      releaseSourceSlot?.();
     }
+    active.openedWorksheetReservation?.release();
+    releaseSourceSlot?.();
   }
 }
 
@@ -430,39 +500,51 @@ function adapterOpenOptions(
     });
   }
 
-  const container = payload.options.container;
-  if (container !== "auto" && container !== "file" && container !== "stream") {
-    throw new ProtocolFault("INVALID_ARGUMENT", "Arrow adapter container must be auto, file, or stream");
+  if (payload.adapterId === "tabulark:arrow-ipc") {
+    const container = payload.options.container;
+    if (container !== "auto" && container !== "file" && container !== "stream") {
+      throw new ProtocolFault("INVALID_ARGUMENT", "Arrow adapter container must be auto, file, or stream");
+    }
+    return Object.freeze({
+      container,
+      tableName: sourceName ?? "Arrow IPC",
+      limits: Object.freeze({
+        maxSourceBytes: MAX_ARROW_SOURCE_BYTES,
+        maxDecodedBytes: limits.operationBudgetBytes,
+        maxOutputBytes: limits.maxBatchBytes,
+        maxMetadataBytes: limits.maxFieldBytes,
+        maxBlockBytes: Math.min(
+          64 * 1024 * 1024,
+          Math.max(1, Math.floor(limits.operationBudgetBytes / 4)),
+        ),
+        streamChunkBytes: Math.min(
+          32 * 1024,
+          Math.max(1, Math.floor(limits.operationBudgetBytes / 16)),
+        ),
+        maxFields: 16_384,
+        maxNestingDepth: 64,
+        maxRangeCells: 250_000,
+        maxDisplayCellBytes: Math.min(
+          1024 * 1024,
+          Math.max(1, Math.floor(limits.operationBudgetBytes / 16)),
+        ),
+      }),
+    });
+  }
+
+  if (payload.adapterId === "tabulark:parquet") {
+    return Object.freeze({
+      sourceName: sourceName ?? "Parquet",
+    });
+  }
+
+  const format = payload.options.format;
+  if (format !== "auto" && format !== "xls" && format !== "xlsx") {
+    throw new ProtocolFault("INVALID_ARGUMENT", "Excel adapter format must be auto, xls, or xlsx");
   }
   return Object.freeze({
-    container,
-    tableName: sourceName ?? "Arrow IPC",
-    limits: Object.freeze({
-      maxSourceBytes: MAX_ARROW_SOURCE_BYTES,
-      maxDecodedBytes: limits.operationBudgetBytes,
-      maxOutputBytes: limits.maxBatchBytes,
-      maxMetadataBytes: limits.maxFieldBytes,
-      // Keep every Arrow sublimit derived from the engine budget. Omitting
-      // these fields lets serde fill ArrowIpcLimits with its 256 MiB defaults;
-      // that makes a valid low-budget engine (the 8 MiB minimum in particular)
-      // fail validation before it can read a single IPC byte.
-      maxBlockBytes: Math.min(
-        64 * 1024 * 1024,
-        Math.max(1, Math.floor(limits.operationBudgetBytes / 4)),
-      ),
-      streamChunkBytes: Math.min(
-        1024 * 1024,
-        32 * 1024,
-        Math.max(1, Math.floor(limits.operationBudgetBytes / 16)),
-      ),
-      maxFields: 16_384,
-      maxNestingDepth: 64,
-      maxRangeCells: 250_000,
-      maxDisplayCellBytes: Math.min(
-        1024 * 1024,
-        Math.max(1, Math.floor(limits.operationBudgetBytes / 16)),
-      ),
-    }),
+    format,
+    ...(sourceName === undefined ? {} : { sourceName }),
   });
 }
 
@@ -489,11 +571,18 @@ function openTable(value: unknown): unknown {
     raw.tableHandle ?? raw.handle ?? result,
     "openTable tableHandle",
   );
+  const descriptor = dataset.tables.find((candidate) => candidate.id === payload.tableId)
+    ?? { id: payload.tableId, name: payload.tableId };
+  const metadata = normalizeMetadata(
+    raw.metadata ?? dataset.adapter.metadata(adapterTableHandle),
+    descriptor,
+  );
   tables.set(tableHandle, {
     handle: tableHandle,
     datasetHandle: dataset.handle,
     tableId: payload.tableId,
     adapterTableHandle,
+    metadata,
     closed: false,
   });
   return {
@@ -507,15 +596,87 @@ function getMetadata(value: unknown): unknown {
   const payload = expectRecord(value, "getMetadata payload");
   const table = requireTable(payload.tableHandle);
   const dataset = requireDataset(table.datasetHandle);
-  return normalizeMetadata(
+  const metadata = normalizeMetadata(
     dataset.adapter.metadata(table.adapterTableHandle),
-    { id: table.tableId, name: dataset.metadata.name },
+    { id: table.tableId, name: table.metadata.name },
+  );
+  table.metadata = metadata;
+  return metadata;
+}
+
+function getPresentation(value: unknown): unknown {
+  const payload = expectRecord(value, "getPresentation payload");
+  const table = requireTable(payload.tableHandle);
+  const dataset = requireDataset(table.datasetHandle);
+  return normalizePresentationResult(
+    dataset.adapter.presentation(table.adapterTableHandle),
+    table,
   );
 }
 
-/** Adapter ABI v1 may publish a readable indexed prefix beside its next byte action. */
+function readPresentationRange(value: unknown): unknown {
+  const payload = expectRecord(value, "readPresentationRange payload");
+  const table = requireTable(payload.tableHandle);
+  const dataset = requireDataset(table.datasetHandle);
+  const range = normalizeRange(payload.range);
+  const result = dataset.adapter.readPresentationRange(table.adapterTableHandle, range);
+  return normalizePresentationRangeResult(result, table, range);
+}
+
+function normalizePresentationResult(value: unknown, table: OpenTableState): unknown {
+  if (value === null || value === undefined) return null;
+  const raw = expectRecord(value, "table presentation");
+  if (raw.kind !== "spreadsheet-v1") {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter returned an unknown presentation kind");
+  }
+  if (raw.tableId !== undefined && raw.tableId !== table.tableId) {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter presentation belongs to another table");
+  }
+  return {
+    ...raw,
+    kind: "spreadsheet-v1",
+    tableId: table.tableId,
+    revision: numberOr(raw.revision, table.metadata.revision),
+  };
+}
+
+function normalizePresentationRangeResult(
+  value: unknown,
+  table: OpenTableState,
+  requested: RangeRequest,
+): unknown {
+  if (value === null || value === undefined) return null;
+  const raw = expectRecord(value, "presentation range");
+  if (raw.kind !== "spreadsheet-v1") {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter returned an unknown presentation range kind");
+  }
+  if (raw.tableId !== undefined && raw.tableId !== table.tableId) {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter presentation range belongs to another table");
+  }
+  const range = isRecord(raw.range) ? normalizeRange(raw.range) : requested;
+  if (
+    range.rowStart !== requested.rowStart
+    || range.rowCount !== requested.rowCount
+    || range.columnStart !== requested.columnStart
+    || range.columnCount !== requested.columnCount
+  ) {
+    throw new ProtocolFault(
+      "PROTOCOL_INCOMPATIBLE",
+      "Adapter presentation range is not aligned with the requested range",
+    );
+  }
+  return {
+    ...raw,
+    kind: "spreadsheet-v1",
+    tableId: table.tableId,
+    revision: numberOr(raw.revision, table.metadata.revision),
+    range,
+  };
+}
+
+/** Adapter ABI v2 may publish a readable indexed prefix beside its next byte action. */
 function isProgressiveOpenStep(value: unknown): boolean {
-  if (!isRecord(value) || !isRecord(value.action)) {
+  if (!isRecord(value) || value.kind !== "open-progress" || !isRecord(value.action)) {
     return false;
   }
   return value.action.kind === "read-bytes"
@@ -533,19 +694,25 @@ function applyProgressiveOpenStep(
   if (sourceHandle !== dataset.sourceHandle) {
     throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter open changed its sourceHandle");
   }
-  const progress = normalizeOpenProgress(value.progress, dataset.source.size);
+  const metadata = normalizeMetadata(value.metadata, dataset.tables[0]);
+  const progress = value.progress === undefined && value.kind === "open-complete"
+    ? Object.freeze({
+        bytesScanned: dataset.source.size,
+        rowsDiscovered: discoveredRows(metadata),
+        done: true,
+      })
+    : normalizeOpenProgress(value.progress, dataset.source.size);
   if (progress.bytesScanned < dataset.scanOffset) {
     throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter scan bytes regressed");
   }
 
   const previousMetadata = JSON.stringify(dataset.metadata);
-  const metadata = normalizeMetadata(value.metadata, dataset.tables[0]);
   const tableDescriptors = normalizeDescriptors(
     Array.isArray(value.tables) ? value.tables : undefined,
     value.table,
     metadata,
   );
-  const complete = value.status === "complete";
+  const complete = value.kind === "open-complete";
   if (complete !== progress.done) {
     throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter completion and progress disagree");
   }
@@ -636,6 +803,7 @@ async function scanOpenToEnd(dataset: DatasetState): Promise<void> {
         event: "runtimeError",
         datasetHandle: dataset.handle,
         tableId: dataset.metadata.tableId,
+        revision: dataset.metadata.revision,
         payload: serializeFault(failure, "Background source scanning failed"),
       });
     } finally {
@@ -658,6 +826,9 @@ async function scanOpenNextChunk(
   if (!step) {
     throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter scan has no pending read action");
   }
+  if (step.kind !== "open-progress") {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter scan did not return an open-progress step");
+  }
   const action = isRecord(step.action) ? step.action : undefined;
   if (!action || action.kind !== "read-bytes") {
     throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter scan requested an unsupported action");
@@ -666,8 +837,9 @@ async function scanOpenNextChunk(
   const offset = nonNegativeSafeInteger(action.offset, "read-bytes offset");
   const length = nonNegativeSafeInteger(action.length, "read-bytes length");
   const limits = requireMemoryLimits();
+  const readLimit = operationReadLimit(dataset.adapterId, limits);
   if (
-    length > limits.operationBudgetBytes
+    length > readLimit
     || !Number.isSafeInteger(offset + length)
     || offset + length > dataset.source.size
   ) {
@@ -675,7 +847,13 @@ async function scanOpenNextChunk(
       "RESOURCE_LIMIT",
       "Adapter scan read-bytes action exceeds the source or engine memory budget",
       false,
-      { offset, length, sourceLength: dataset.source.size, limit: limits.operationBudgetBytes },
+      {
+        resource: operationResource(dataset.adapterId),
+        requiredBytes: length,
+        availableBytes: readLimit,
+        offset,
+        sourceLength: dataset.source.size,
+      },
     );
   }
   dataset.scanOperationHandle = operation;
@@ -683,20 +861,28 @@ async function scanOpenNextChunk(
     active.operationHandle = operation;
     throwIfCancelled(active);
   }
-  const read = dataset.source.slice(offset, offset + length).arrayBuffer();
-  const bytes = new Uint8Array(active
-    ? await awaitOperationStep(read, active)
-    : await read);
-  if (dataset.closed) {
-    return;
-  }
-  if (active) {
-    throwIfCancelled(active);
-  }
-  const next = expectRecord(
-    dataset.adapter.continueOperation(operation, offset, bytes, offset + length >= dataset.source.size),
-    "adapter scan result",
+  const reservation = reserveOperationMemory(dataset.adapterId, length);
+  const read = await acquireReservedBlobRead(
+    dataset.source.slice(offset, offset + length),
+    reservation,
+    active,
   );
+  let next: Record<string, unknown>;
+  try {
+    const bytes = new Uint8Array(read.buffer);
+    if (dataset.closed) {
+      return;
+    }
+    if (active) {
+      throwIfCancelled(active);
+    }
+    next = expectRecord(
+      dataset.adapter.continueOperation(operation, offset, bytes, offset + length >= dataset.source.size),
+      "adapter scan result",
+    );
+  } finally {
+    read.release();
+  }
   if (dataset.closed) {
     return;
   }
@@ -738,8 +924,11 @@ function publishScanProgress(dataset: DatasetState): void {
     event: "progress",
     datasetHandle: dataset.handle,
     tableId: dataset.metadata.tableId,
+    revision: dataset.metadata.revision,
     payload: {
       sourceHandle: dataset.handle,
+      tableId: dataset.metadata.tableId,
+      revision: dataset.metadata.revision,
       ...progress,
     },
   });
@@ -750,16 +939,23 @@ function emitMetadataUpdate(dataset: DatasetState): void {
     event: "metadata",
     datasetHandle: dataset.handle,
     tableId: dataset.metadata.tableId,
+    revision: dataset.metadata.revision,
     payload: dataset.metadata,
   });
   for (const table of tables.values()) {
-    if (table.datasetHandle === dataset.handle && !table.closed) {
+    if (
+      table.datasetHandle === dataset.handle
+      && table.tableId === dataset.metadata.tableId
+      && !table.closed
+    ) {
+      table.metadata = dataset.metadata;
       emit({
         event: "metadata",
         datasetHandle: dataset.handle,
         tableHandle: table.handle,
         tableId: table.tableId,
-        payload: { ...dataset.metadata, tableId: table.tableId },
+        revision: dataset.metadata.revision,
+        payload: dataset.metadata,
       });
     }
   }
@@ -794,7 +990,12 @@ function notifyScanWaiters(dataset: DatasetState): void {
 async function readRange(
   requestId: string,
   value: unknown,
-): Promise<{ kind: "batch"; data: WireTableBatch; transfer: Transferable[] }> {
+): Promise<{
+  kind: "batch";
+  data: WireTableBatch;
+  transfer: Transferable[];
+  release?: () => void;
+}> {
   const payload = expectRecord(value, "readRange payload");
   const table = requireTable(payload.tableHandle);
   const dataset = requireDataset(table.datasetHandle);
@@ -802,21 +1003,41 @@ async function readRange(
   const request = normalizeRange(payload.range);
   const key = rangeCacheKey(
     table.tableId,
-    dataset.metadata.revision,
-    dataset.metadata.schema.version,
+    table.metadata.revision,
+    table.metadata.schema.version,
     request,
   );
   const cached = dataset.rangeCache.get(key);
   if (cached) {
-    const batch = cloneWireTableBatch(cached);
-    return { kind: "batch", data: batch, transfer: collectBatchTransfers(batch) };
+    const reservation = requireMemoryLedger().reserve(
+      "batch",
+      wireBatchByteLength(cached.batch),
+    );
+    try {
+      const batch = cloneWireTableBatch(cached.batch);
+      return {
+        kind: "batch",
+        data: batch,
+        transfer: collectBatchTransfers(batch),
+        release: reservation.release,
+      };
+    } catch (error) {
+      reservation.release();
+      throw error;
+    }
   }
   if (rangeRequestsInFlight >= MAX_IN_FLIGHT_RANGES) {
     throw new ProtocolFault(
       "RESOURCE_LIMIT",
       `The engine may have at most ${MAX_IN_FLIGHT_RANGES} in-flight range requests`,
       false,
-      { maxActiveRanges: MAX_ACTIVE_RANGES, maxRangeWaiters: MAX_RANGE_WAITERS },
+      {
+        resource: "range-request-slots",
+        required: rangeRequestsInFlight + 1,
+        available: MAX_IN_FLIGHT_RANGES,
+        maxActiveRanges: MAX_ACTIVE_RANGES,
+        maxRangeWaiters: MAX_RANGE_WAITERS,
+      },
     );
   }
   rangeRequestsInFlight += 1;
@@ -843,7 +1064,13 @@ async function readRange(
           "RESOURCE_LIMIT",
           `The range queue may contain at most ${error.maxWaiters} waiters`,
           false,
-          { maxActiveRanges: MAX_ACTIVE_RANGES, maxRangeWaiters: error.maxWaiters },
+          {
+            resource: "range-waiter-slots",
+            required: error.maxWaiters + 1,
+            available: error.maxWaiters,
+            maxActiveRanges: MAX_ACTIVE_RANGES,
+            maxRangeWaiters: error.maxWaiters,
+          },
         );
       }
       throw error;
@@ -854,23 +1081,27 @@ async function readRange(
       dataset.source,
       runtime.beginRead(table.adapterTableHandle, request),
       active,
+      dataset.adapterId,
     );
 
     throwIfCancelled(active);
-    const batch = copyBatch(rawBatch, table, dataset, request);
+    const rawBatchBytes = rawBatchByteLength(rawBatch);
+    const batchReservation = requireMemoryLedger().reserve("batch", rawBatchBytes);
+    let batch: WireTableBatch;
+    try {
+      batch = copyBatch(rawBatch, table, dataset, request);
+    } catch (error) {
+      batchReservation.release();
+      throw error;
+    }
     // A range truncated at the current indexed prefix must be re-read after
     // the Stream grows; retaining it under the original request would turn a
     // transient prefix boundary into a stale permanent cache hit.
     if (batch.complete) {
-      const cachedBatch = cloneWireTableBatch(batch);
-      dataset.rangeCache.set(
-        rangeCacheKey(table.tableId, batch.revision, batch.schemaVersion, request),
-        cachedBatch,
-        wireBatchByteLength(cachedBatch),
-      );
+      cacheBatch(dataset, table, request, batch);
     }
     const transfer = collectBatchTransfers(batch);
-    return { kind: "batch", data: batch, transfer };
+    return { kind: "batch", data: batch, transfer, release: batchReservation.release };
   } finally {
     activeRequests.delete(requestId);
     releasePermit?.();
@@ -938,6 +1169,10 @@ function shutdown(): unknown {
   for (const adapter of loadedAdapters.values()) {
     adapter.dispose();
   }
+  for (const reservation of adapterRuntimeReservations.values()) {
+    reservation.release();
+  }
+  adapterRuntimeReservations.clear();
   loadedAdapters.clear();
   adapterLoads.clear();
   adapterRegistrations.clear();
@@ -951,7 +1186,12 @@ function reserveSourceSlot(): () => void {
       "RESOURCE_LIMIT",
       `The engine may retain at most ${limits.maxSources} sources or in-flight opens`,
       false,
-      { maxSources: limits.maxSources },
+      {
+        resource: "source-slots",
+        required: sourceSlotsInUse + 1,
+        available: limits.maxSources,
+        maxSources: limits.maxSources,
+      },
     );
   }
   sourceSlotsInUse += 1;
@@ -977,6 +1217,41 @@ function awaitOperationStep<T>(operation: Promise<T>, active: ActiveRequest): Pr
   ]);
 }
 
+/**
+ * Acquires a Blob read while keeping its reservation attached to the actual
+ * read lifetime. Blob.arrayBuffer() cannot be cancelled: if the request loses
+ * the cancellation race, the lease is released only after that read settles.
+ */
+async function acquireReservedBlobRead(
+  blob: Blob,
+  reservation: MemoryReservation,
+  active?: ActiveRequest,
+): Promise<ReservedBlobRead> {
+  let operation: Promise<ArrayBuffer>;
+  try {
+    operation = blob.arrayBuffer();
+  } catch (error) {
+    reservation.release();
+    throw error;
+  }
+  try {
+    const buffer = active === undefined
+      ? await operation
+      : await awaitOperationStep(operation, active);
+    return Object.freeze({ buffer, release: reservation.release });
+  } catch (error) {
+    if (active?.cancelled) {
+      void operation.then(
+        () => reservation.release(),
+        () => reservation.release(),
+      );
+    } else {
+      reservation.release();
+    }
+    throw error;
+  }
+}
+
 function flushPendingDatasetEvents(value: unknown): void {
   const payload = isRecord(value) ? value : {};
   if (typeof payload.datasetHandle !== "string") {
@@ -995,8 +1270,11 @@ function flushPendingDatasetEvents(value: unknown): void {
       event: "progress",
       datasetHandle: dataset.handle,
       tableId: dataset.metadata.tableId,
+      revision: dataset.metadata.revision,
       payload: {
         sourceHandle: dataset.handle,
+        tableId: dataset.metadata.tableId,
+        revision: dataset.metadata.revision,
         ...progress,
       },
     });
@@ -1093,6 +1371,7 @@ function closeTableState(
       datasetHandle: table.datasetHandle,
       tableHandle: table.handle,
       tableId: table.tableId,
+      revision: table.metadata.revision,
       payload: { handle: table.handle, kind: "table" },
     });
   }
@@ -1108,6 +1387,7 @@ function closeDatasetState(
   delete dataset.pendingProgress;
   openedDatasetsByRequest.delete(dataset.openRequestId);
   dataset.rangeCache.clear();
+  dataset.openedWorksheetReservation?.release();
   notifyScanWaiters(dataset);
   if (dataset.scanOperationHandle !== undefined) {
     try {
@@ -1140,6 +1420,7 @@ function closeDatasetState(
       event: "closed",
       datasetHandle: dataset.handle,
       tableId: dataset.metadata.tableId,
+      revision: dataset.metadata.revision,
       payload: { handle: dataset.handle, kind: "source" },
     });
   }
@@ -1174,8 +1455,8 @@ function copyBatch(
   const batch: WireTableBatch = {
     layoutVersion: BATCH_LAYOUT_VERSION,
     tableId: typeof raw.tableId === "string" ? raw.tableId : table.tableId,
-    revision: numberOr(raw.revision, dataset.metadata.revision),
-    schemaVersion: numberOr(raw.schemaVersion, dataset.metadata.schema.version),
+    revision: numberOr(raw.revision, table.metadata.revision),
+    schemaVersion: numberOr(raw.schemaVersion, table.metadata.schema.version),
     range,
     buffers,
     columns,
@@ -1184,6 +1465,73 @@ function copyBatch(
   // The Worker validates all descriptor boundaries before caching or transfer.
   new ColumnarTableBatch(batch);
   return batch;
+}
+
+function rawBatchByteLength(value: unknown): number {
+  const raw = expectRecord(value, "range batch");
+  if (!Array.isArray(raw.buffers)) {
+    throw new ProtocolFault("RUNTIME_FAILURE", "Layout-v1 batch buffers must be an array");
+  }
+  let total = 0;
+  for (const [index, buffer] of raw.buffers.entries()) {
+    const bytes = buffer instanceof ArrayBuffer
+      ? buffer.byteLength
+      : ArrayBuffer.isView(buffer) ? buffer.byteLength : undefined;
+    if (bytes === undefined) {
+      throw new ProtocolFault("RUNTIME_FAILURE", `batch buffer ${index} must be a Uint8Array`);
+    }
+    total += bytes;
+    if (!Number.isSafeInteger(total)) {
+      throw new ProtocolFault(
+        "RESOURCE_LIMIT",
+        "Batch buffers exceed the safe integer range",
+        false,
+        {
+          resource: "batch",
+          requiredBytes: total,
+          availableBytes: Number.MAX_SAFE_INTEGER,
+        },
+      );
+    }
+  }
+  return total;
+}
+
+function createRangeCache(): ByteLruCache<CachedRangeBatch> {
+  return new ByteLruCache(rangeCacheBudgetBytes, {
+    onRemove: (_key, entry) => entry.reservation.release(),
+  });
+}
+
+function cacheBatch(
+  dataset: DatasetState,
+  table: OpenTableState,
+  request: RangeRequest,
+  batch: WireTableBatch,
+): void {
+  const byteLength = wireBatchByteLength(batch);
+  if (byteLength > dataset.rangeCache.maxBytes) {
+    return;
+  }
+  let reservation: MemoryReservation;
+  try {
+    reservation = requireMemoryLedger().reserve("range-cache", byteLength);
+  } catch {
+    // Cache admission is optional; the completed read remains usable even
+    // when live adapter, staging and batch reservations consume the budget.
+    return;
+  }
+  try {
+    const cachedBatch = cloneWireTableBatch(batch);
+    dataset.rangeCache.set(
+      rangeCacheKey(table.tableId, batch.revision, batch.schemaVersion, request),
+      Object.freeze({ batch: cachedBatch, reservation }),
+      byteLength,
+    );
+  } catch (error) {
+    reservation.release();
+    throw error;
+  }
 }
 
 function copyBufferPool(value: unknown): ArrayBuffer[] {
@@ -1208,7 +1556,12 @@ function copyGenericColumn(
 
 function copyNativeDescriptor(value: unknown, fallbackLength: number, depth: number): NativeColumnDescriptor {
   if (depth >= 64) {
-    throw new ProtocolFault("RESOURCE_LIMIT", "Native descriptor nesting may not exceed 64");
+    throw new ProtocolFault(
+      "RESOURCE_LIMIT",
+      "Native descriptor nesting may not exceed 64",
+      false,
+      { resource: "descriptor-nesting", required: depth + 1, available: 64 },
+    );
   }
   const raw = expectRecord(value, "native column descriptor");
   const encoding = typeof raw.encoding === "string" ? raw.encoding : "";
@@ -1480,6 +1833,18 @@ function numberOr(value: unknown, fallback: number): number {
   return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : fallback;
 }
 
+function adapterModuleUrl(id: OfficialAdapterId): string {
+  const testUrls = (globalThis as unknown as {
+    readonly __tabularkTestOnlyAdapterModuleUrls?: Readonly<Record<string, unknown>>;
+  }).__tabularkTestOnlyAdapterModuleUrls;
+  const testUrl = testUrls?.[id];
+  // This hook is Worker-global rather than protocol-visible. It lets
+  // same-realm tests substitute bindings without accepting caller URLs.
+  return typeof testUrl === "string" && testUrl.length > 0
+    ? testUrl
+    : officialAdapterModuleUrl(id);
+}
+
 async function loadAdapter(id: string): Promise<WasmAdapter> {
   if (shuttingDown) {
     throw new ProtocolFault("HANDLE_CLOSED", "The Worker runtime is not available");
@@ -1491,10 +1856,16 @@ async function loadAdapter(id: string): Promise<WasmAdapter> {
   const existing = adapterLoads.get(id);
   if (existing) return existing;
   const limits = requireMemoryLimits();
+  if (!isOfficialAdapterId(id)) {
+    throw new ProtocolFault("INVALID_ARGUMENT", `Adapter ${id} is not official`);
+  }
+  const runtimeBudgetBytes = adapterRuntimeBudget(id, limits);
+  const reservation = requireMemoryLedger().reserve("adapter-runtime", runtimeBudgetBytes);
+  adapterRuntimeReservations.set(id, reservation);
   const loading = WasmAdapter.load(registration.moduleUrl, registration.id, {
-    memoryBudgetBytes: limits.adapterRuntimeBudgetBytes,
-    indexBudgetBytes: limits.indexBudgetBytes,
-    tileCacheBudgetBytes: limits.adapterTileCacheBudgetBytes,
+    memoryBudgetBytes: runtimeBudgetBytes,
+    indexBudgetBytes: Math.min(limits.indexBudgetBytes, Math.floor(runtimeBudgetBytes / 2)),
+    tileCacheBudgetBytes: Math.min(limits.adapterTileCacheBudgetBytes, Math.floor(runtimeBudgetBytes / 2)),
     chunkBytes: Math.min(CHUNK_BYTES, limits.operationBudgetBytes),
     checkpointRows: 1_024,
     maxFieldBytes: limits.maxFieldBytes,
@@ -1509,10 +1880,34 @@ async function loadAdapter(id: string): Promise<WasmAdapter> {
   }).catch((error) => {
     adapterLoads.delete(id);
     loadedAdapters.delete(id);
+    adapterRuntimeReservations.get(id)?.release();
+    adapterRuntimeReservations.delete(id);
     throw error;
   });
   adapterLoads.set(id, loading);
   return loading;
+}
+
+function adapterRuntimeBudget(id: OfficialAdapterId, limits: MemoryBudgetLimits): number {
+  const registrations = [...adapterRegistrations.keys()].filter(isOfficialAdapterId);
+  const totalWeight = registrations.reduce(
+    (total, adapterId) => total + officialAdapterManifestEntry(adapterId).resources.runtimeWeight,
+    0,
+  );
+  const weight = officialAdapterManifestEntry(id).resources.runtimeWeight;
+  return Math.max(1, Math.floor(limits.adapterRuntimePoolBytes * weight / Math.max(1, totalWeight)));
+}
+
+function operationResource(id: OfficialAdapterId): "source-staging" | "compressed-page" {
+  return id === "tabulark:parquet" ? "compressed-page" : "source-staging";
+}
+
+function operationReadLimit(id: OfficialAdapterId, limits: MemoryBudgetLimits): number {
+  return id === "tabulark:excel" ? limits.maxArrayBufferBytes : limits.operationBudgetBytes;
+}
+
+function reserveOperationMemory(id: OfficialAdapterId, bytes: number): MemoryReservation {
+  return requireMemoryLedger().reserve(operationResource(id), bytes);
 }
 
 /**
@@ -1525,6 +1920,7 @@ async function runOpenUntilPublished(
   source: Blob,
   initial: unknown,
   active: ActiveOpenRequest,
+  adapterId: OfficialAdapterId,
 ): Promise<Record<string, unknown>> {
   let step = initial;
   let complete = false;
@@ -1537,17 +1933,20 @@ async function runOpenUntilPublished(
         published = true;
         return raw;
       }
-      const action = isRecord(raw.action) ? raw.action : undefined;
-      if (!action) {
-        if (raw.status !== "complete") {
-          throw new ProtocolFault(
-            "PROTOCOL_INCOMPATIBLE",
-            "Adapter open returned neither a read action, an indexed prefix, nor completion",
-          );
-        }
+      if (raw.kind === "open-complete") {
         complete = true;
         delete active.operationHandle;
         return raw;
+      }
+      if (raw.kind !== "read-bytes") {
+        throw new ProtocolFault(
+          "PROTOCOL_INCOMPATIBLE",
+          "Adapter open returned an invalid discriminated step",
+        );
+      }
+      const action = isRecord(raw.action) ? raw.action : undefined;
+      if (!action) {
+        throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter read-bytes step has no action");
       }
       if (action.kind !== "read-bytes") {
         throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter requested an unsupported action");
@@ -1556,8 +1955,9 @@ async function runOpenUntilPublished(
       const offset = nonNegativeSafeInteger(action.offset, "read-bytes offset");
       const length = nonNegativeSafeInteger(action.length, "read-bytes length");
       const limits = requireMemoryLimits();
+      const readLimit = operationReadLimit(adapterId, limits);
       if (
-        length > limits.operationBudgetBytes
+        length > readLimit
         || !Number.isSafeInteger(offset + length)
         || offset + length > source.size
       ) {
@@ -1565,18 +1965,45 @@ async function runOpenUntilPublished(
           "RESOURCE_LIMIT",
           "Adapter read-bytes action exceeds the source or engine memory budget",
           false,
-          { offset, length, sourceLength: source.size, limit: limits.operationBudgetBytes },
+          {
+            resource: operationResource(adapterId),
+            requiredBytes: length,
+            availableBytes: readLimit,
+            offset,
+            sourceLength: source.size,
+          },
         );
       }
-      const read = source.slice(offset, offset + length).arrayBuffer();
-      const bytes = new Uint8Array(await awaitOperationStep(read, active));
-      throwIfCancelled(active);
-      step = adapter.continueOperation(
-        active.operationHandle,
-        offset,
-        bytes,
-        offset + length >= source.size,
+      const reservation = reserveOperationMemory(adapterId, length);
+      const read = await acquireReservedBlobRead(
+        source.slice(offset, offset + length),
+        reservation,
+        active,
       );
+      try {
+        const bytes = new Uint8Array(read.buffer);
+        throwIfCancelled(active);
+        if (
+          adapterId === "tabulark:excel"
+          && active.openedWorksheetReservation === undefined
+        ) {
+          // Excel retains the staged workbook after the one-shot source read;
+          // keep that ownership visible to the same global ledger after the
+          // transient source-staging reservation is released.
+          active.openedWorksheetReservation = requireMemoryLedger().reserve(
+            "opened-worksheet",
+            source.size,
+          );
+        }
+        step = adapter.continueOperation(
+          active.operationHandle,
+          offset,
+          bytes,
+          offset + length >= source.size,
+        );
+      } finally {
+        read.release();
+      }
     }
   } finally {
     if (!complete && !published && active.operationHandle !== undefined) {
@@ -1595,6 +2022,7 @@ async function runAdapterOperation(
   source: Blob,
   initial: unknown,
   active: ActiveOpenRequest | ActiveRangeRequest,
+  adapterId: OfficialAdapterId,
 ): Promise<unknown> {
   let step = initial;
   let complete = false;
@@ -1602,14 +2030,20 @@ async function runAdapterOperation(
     for (;;) {
       throwIfCancelled(active);
       const raw = expectRecord(step, "adapter operation result");
-      const action = isRecord(raw.action) ? raw.action : undefined;
-      if (!action) {
-        if (raw.status !== "complete") {
-          throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter returned neither a read action nor completion");
-        }
+      if (raw.kind === "read-complete") {
         complete = true;
         delete active.operationHandle;
-        return raw.batch ?? step;
+        return raw.batch;
+      }
+      if (raw.kind !== "read-bytes") {
+        throw new ProtocolFault(
+          "PROTOCOL_INCOMPATIBLE",
+          "Adapter read returned an invalid discriminated step",
+        );
+      }
+      const action = isRecord(raw.action) ? raw.action : undefined;
+      if (!action) {
+        throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter read-bytes step has no action");
       }
       if (action.kind !== "read-bytes") {
         throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter requested an unsupported action");
@@ -1618,8 +2052,9 @@ async function runAdapterOperation(
       const offset = nonNegativeSafeInteger(action.offset, "read-bytes offset");
       const length = nonNegativeSafeInteger(action.length, "read-bytes length");
       const limits = requireMemoryLimits();
+      const readLimit = operationReadLimit(adapterId, limits);
       if (
-        length > limits.operationBudgetBytes
+        length > readLimit
         || !Number.isSafeInteger(offset + length)
         || offset + length > source.size
       ) {
@@ -1627,18 +2062,33 @@ async function runAdapterOperation(
           "RESOURCE_LIMIT",
           "Adapter read-bytes action exceeds the source or engine memory budget",
           false,
-          { offset, length, sourceLength: source.size, limit: limits.operationBudgetBytes },
+          {
+            resource: operationResource(adapterId),
+            requiredBytes: length,
+            availableBytes: readLimit,
+            offset,
+            sourceLength: source.size,
+          },
         );
       }
-      const read = source.slice(offset, offset + length).arrayBuffer();
-      const bytes = new Uint8Array(await awaitOperationStep(read, active));
-      throwIfCancelled(active);
-      step = adapter.continueOperation(
-        active.operationHandle,
-        offset,
-        bytes,
-        offset + length >= source.size,
+      const reservation = reserveOperationMemory(adapterId, length);
+      const read = await acquireReservedBlobRead(
+        source.slice(offset, offset + length),
+        reservation,
+        active,
       );
+      try {
+        const bytes = new Uint8Array(read.buffer);
+        throwIfCancelled(active);
+        step = adapter.continueOperation(
+          active.operationHandle,
+          offset,
+          bytes,
+          offset + length >= source.size,
+        );
+      } finally {
+        read.release();
+      }
     }
   } finally {
     if (!complete && active.operationHandle !== undefined) {
@@ -1670,6 +2120,13 @@ function requireMemoryLimits(): MemoryBudgetLimits {
     throw new ProtocolFault("HANDLE_CLOSED", "The Worker runtime is not available");
   }
   return memoryLimits;
+}
+
+function requireMemoryLedger(): MemoryReservationLedger {
+  if (!memoryLedger) {
+    throw new ProtocolFault("HANDLE_CLOSED", "The Worker memory ledger is not available");
+  }
+  return memoryLedger;
 }
 
 function requireDataset(value: unknown): DatasetState {
@@ -1712,7 +2169,16 @@ function isRequest(value: unknown): value is ProtocolRequest {
 
 function postSuccess(
   requestId: string,
-  kind: "hello" | "dataset" | "tables" | "table" | "metadata" | "batch" | "acknowledged",
+  kind:
+    | "hello"
+    | "dataset"
+    | "tables"
+    | "table"
+    | "metadata"
+    | "presentation"
+    | "presentationRange"
+    | "batch"
+    | "acknowledged",
   data: unknown,
   transfer: Transferable[] = [],
 ): void {
@@ -1748,6 +2214,8 @@ const _operations: readonly Operation[] = [
   "listTables",
   "openTable",
   "getMetadata",
+  "getPresentation",
+  "readPresentationRange",
   "readRange",
   "cancel",
   "closeTable",

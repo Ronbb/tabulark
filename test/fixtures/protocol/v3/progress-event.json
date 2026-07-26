@@ -1,0 +1,15 @@
+{
+  "protocolVersion": 3,
+  "event": "progress",
+  "datasetHandle": "d1",
+  "tableId": "table-0",
+  "revision": 3,
+  "payload": {
+    "sourceHandle": "d1",
+    "tableId": "table-0",
+    "revision": 3,
+    "bytesScanned": 1048576,
+    "rowsDiscovered": 4096,
+    "done": false
+  }
+}

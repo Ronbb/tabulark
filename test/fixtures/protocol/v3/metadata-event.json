@@ -1,0 +1,58 @@
+{
+  "protocolVersion": 3,
+  "event": "metadata",
+  "datasetHandle": "d2",
+  "tableHandle": "t2",
+  "tableId": "sheet-1",
+  "revision": 7,
+  "payload": {
+    "tableId": "sheet-1",
+    "name": "Revenue",
+    "revision": 7,
+    "extent": {
+      "rows": { "kind": "exact", "value": 6 },
+      "columns": { "kind": "exact", "value": 4 }
+    },
+    "schema": {
+      "version": 1,
+      "columns": [
+        {
+          "id": "c0",
+          "name": "A",
+          "index": 0,
+          "dataType": { "type": "utf8" },
+          "nullable": true
+        },
+        {
+          "id": "c1",
+          "name": "B",
+          "index": 1,
+          "dataType": { "type": "utf8" },
+          "nullable": true
+        },
+        {
+          "id": "c2",
+          "name": "C",
+          "index": 2,
+          "dataType": { "type": "utf8" },
+          "nullable": true
+        },
+        {
+          "id": "c3",
+          "name": "D",
+          "index": 3,
+          "dataType": { "type": "utf8" },
+          "nullable": true
+        }
+      ]
+    },
+    "capabilities": {
+      "randomAccess": "full",
+      "typedValues": false,
+      "search": false,
+      "sort": false,
+      "filter": false,
+      "multiTable": true
+    }
+  }
+}

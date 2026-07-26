@@ -1,6 +1,6 @@
 //! Core types for Tabulark.
 //!
-//! This crate supplies protocol-v2 model types, the delimited runtime, and an
+//! This crate supplies protocol-v3 model types, the delimited runtime, and an
 //! opt-in Apache Arrow IPC adapter. Its public API remains experimental while
 //! the built-in adapter ABI is validated before a stable release.
 
@@ -13,6 +13,9 @@ pub mod arrow;
 
 #[cfg(feature = "csv")]
 pub mod csv;
+
+#[cfg(feature = "parquet")]
+pub mod parquet;
 
 #[cfg(feature = "csv")]
 pub mod runtime;

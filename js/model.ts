@@ -11,7 +11,6 @@ const INDEX_BUDGET_MAX_BYTES = 64 * 1024 * 1024;
 const WORKER_RANGE_CACHE_MAX_BYTES = 96 * 1024 * 1024;
 const MAIN_THREAD_RANGE_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const FIELD_AND_BATCH_MAX_BYTES = 8 * 1024 * 1024;
-const MAX_OFFICIAL_ADAPTER_RUNTIMES = 2;
 
 export const MAX_SOURCES = 2;
 export const MAX_ACTIVE_RANGES = 2;
@@ -19,8 +18,8 @@ export const MAX_RANGE_WAITERS = 8;
 
 export interface MemoryBudgetLimits {
   readonly memoryBudgetBytes: number;
-  /** Maximum retained budget handed to one official adapter runtime. */
-  readonly adapterRuntimeBudgetBytes: number;
+  /** Shared retained capacity allocated among the adapters actually registered. */
+  readonly adapterRuntimePoolBytes: number;
   /** Maximum transient/decoded budget retained by one active adapter operation. */
   readonly operationBudgetBytes: number;
   readonly indexBudgetBytes: number;
@@ -41,25 +40,18 @@ export function deriveMemoryBudgetLimits(memoryBudgetBytes: number): MemoryBudge
   assertPositiveSafeInteger(memoryBudgetBytes, "memoryBudgetBytes");
   const oneEighth = Math.floor(memoryBudgetBytes / 8);
   const oneThirtySecond = Math.floor(memoryBudgetBytes / 32);
-  // Reserve one half of the engine budget for JS-owned caches and copies.
-  // Split the other half between the two official runtimes, then divide each
-  // runtime slice across its possible retained sources. Active range output is
-  // capped separately by maxBatchBytes and the Worker-wide permit queue.
-  const adapterRuntimeBudgetBytes = Math.max(
-    1,
-    Math.floor(memoryBudgetBytes / (2 * MAX_OFFICIAL_ADAPTER_RUNTIMES)),
-  );
-  const operationBudgetBytes = Math.max(
-    1,
-    Math.floor(adapterRuntimeBudgetBytes / MAX_SOURCES),
-  );
+  // The Worker allocates this pool through one reservation ledger using the
+  // adapters actually registered for an engine. This deliberately avoids a
+  // hard-coded split based on a historic number of built-in adapters.
+  const adapterRuntimePoolBytes = Math.max(1, Math.floor(memoryBudgetBytes / 2));
+  const operationBudgetBytes = Math.max(1, Math.floor(memoryBudgetBytes / 8));
   const workerRangeCacheBytes = Math.min(
     WORKER_RANGE_CACHE_MAX_BYTES,
     Math.floor((memoryBudgetBytes / 8) * 3),
   );
   return Object.freeze({
     memoryBudgetBytes,
-    adapterRuntimeBudgetBytes,
+    adapterRuntimePoolBytes,
     operationBudgetBytes,
     indexBudgetBytes: Math.min(INDEX_BUDGET_MAX_BYTES, oneEighth),
     adapterTileCacheBudgetBytes: Math.min(WORKER_RANGE_CACHE_MAX_BYTES, operationBudgetBytes),
@@ -73,6 +65,74 @@ export function deriveMemoryBudgetLimits(memoryBudgetBytes: number): MemoryBudge
     maxActiveRanges: MAX_ACTIVE_RANGES,
     maxRangeWaiters: MAX_RANGE_WAITERS,
   });
+}
+
+export type MemoryResourceKind =
+  | "adapter-runtime"
+  | "source-staging"
+  | "compressed-page"
+  | "decompression"
+  | "opened-worksheet"
+  | "batch"
+  | "range-cache";
+
+export interface MemoryReservation {
+  readonly resource: MemoryResourceKind;
+  readonly bytes: number;
+  release(): void;
+}
+
+/**
+ * Single-accounting ledger for Worker-owned bounded allocations.
+ *
+ * A reservation is deliberately idempotent so cancellation, close and failure
+ * races can all execute their normal cleanup paths without double accounting.
+ */
+export class MemoryReservationLedger {
+  readonly #capacityBytes: number;
+  #usedBytes = 0;
+
+  constructor(capacityBytes: number) {
+    assertPositiveSafeInteger(capacityBytes, "capacityBytes");
+    this.#capacityBytes = capacityBytes;
+  }
+
+  get capacityBytes(): number {
+    return this.#capacityBytes;
+  }
+
+  get usedBytes(): number {
+    return this.#usedBytes;
+  }
+
+  get availableBytes(): number {
+    return this.#capacityBytes - this.#usedBytes;
+  }
+
+  reserve(resource: MemoryResourceKind, bytes: number): MemoryReservation {
+    if (!Number.isSafeInteger(bytes) || bytes < 0) {
+      throw invalidArgument("Reservation bytes must be a non-negative safe integer");
+    }
+    const availableBytes = this.availableBytes;
+    if (bytes > availableBytes) {
+      throw new TabularkError(
+        "RESOURCE_LIMIT",
+        `Insufficient memory reservation capacity for ${resource}`,
+        { details: { resource, requiredBytes: bytes, availableBytes } },
+      );
+    }
+    this.#usedBytes += bytes;
+    let released = false;
+    return Object.freeze({
+      resource,
+      bytes,
+      release: () => {
+        if (released) return;
+        released = true;
+        this.#usedBytes -= bytes;
+      },
+    });
+  }
 }
 
 export type AxisExtent =
@@ -184,6 +244,94 @@ export interface TableMetadata {
   readonly capabilities: Readonly<TableCapabilities>;
 }
 
+export type WorksheetVisibility = "visible" | "hidden" | "very-hidden";
+
+/** One sparse row or column override supplied by a spreadsheet presentation. */
+export interface PresentationAxisEntry {
+  readonly index: number;
+  /** CSS pixel extent when the source supplies an explicit dimension. */
+  readonly size?: number;
+  readonly hidden?: boolean;
+}
+
+export interface PresentationColor {
+  /** CSS-compatible resolved color, when the workbook supplied one. */
+  readonly css?: string;
+}
+
+export interface PresentationFont {
+  readonly family?: string;
+  readonly size?: number;
+  readonly bold?: boolean;
+  readonly italic?: boolean;
+  readonly underline?: boolean;
+  readonly color?: PresentationColor;
+}
+
+export interface PresentationBorderSide {
+  readonly style?: "none" | "thin" | "medium" | "thick" | "dashed" | "dotted" | "double";
+  readonly color?: PresentationColor;
+}
+
+/** Static cell styling that 0.1 preserves from spreadsheet input. */
+export interface PresentationStyle {
+  readonly numberFormat?: string;
+  readonly font?: PresentationFont;
+  readonly foregroundColor?: PresentationColor;
+  readonly backgroundColor?: PresentationColor;
+  readonly fillColor?: PresentationColor;
+  readonly borders?: Readonly<{
+    readonly top?: PresentationBorderSide;
+    readonly right?: PresentationBorderSide;
+    readonly bottom?: PresentationBorderSide;
+    readonly left?: PresentationBorderSide;
+  }>;
+  readonly horizontalAlignment?: "general" | "left" | "center" | "right" | "justify";
+  readonly verticalAlignment?: "top" | "center" | "bottom" | "justify";
+  readonly wrapText?: boolean;
+}
+
+export interface MergedCellRegion {
+  readonly rowStart: number;
+  readonly rowEnd: number;
+  readonly columnStart: number;
+  readonly columnEnd: number;
+}
+
+/**
+ * Presentation metadata for a worksheet. It is intentionally static: formula
+ * calculation and document round-tripping are outside the 0.1 contract.
+ */
+export interface SpreadsheetPresentation {
+  readonly kind: "spreadsheet-v1";
+  readonly tableId: string;
+  readonly revision: number;
+  readonly visibility: WorksheetVisibility;
+  readonly frozenRows: number;
+  readonly frozenColumns: number;
+  readonly rows: readonly PresentationAxisEntry[];
+  readonly columns: readonly PresentationAxisEntry[];
+  /** Deduplicated styles addressed by `SpreadsheetPresentationRange.styleIds`. */
+  readonly styles: readonly PresentationStyle[];
+}
+
+export type TablePresentation = SpreadsheetPresentation;
+
+export interface SpreadsheetPresentationRange {
+  readonly kind: "spreadsheet-v1";
+  readonly tableId: string;
+  readonly revision: number;
+  readonly range: Readonly<ReturnedRange>;
+  /** Rows and columns are exactly aligned with `range`; null means no style. */
+  readonly styleIds: readonly (readonly (number | null)[])[];
+  readonly mergedCells: readonly MergedCellRegion[];
+  /** Sparse layout entries that intersect this requested range. */
+  readonly rows: readonly PresentationAxisEntry[];
+  readonly columns: readonly PresentationAxisEntry[];
+}
+
+export type PresentationRange = SpreadsheetPresentationRange;
+
 export interface TableDescriptor {
   readonly id: string;
   readonly name: string;
@@ -242,7 +390,8 @@ export interface NativeColumnDescriptor {
   readonly typeId?: number;
 }
 
-export interface TableBatchColumn {
+/** @internal Layout-v1 column descriptor received from an official WASM runtime. */
+export interface WireTableBatchColumn {
   readonly columnId: string;
   readonly native: NativeColumnDescriptor;
   readonly display: DisplayColumnDescriptor;
@@ -307,16 +456,30 @@ export interface ToRowsOptions {
   readonly maxCells?: number;
 }
 
+/**
+ * Logical, column-oriented access to one returned batch column.
+ *
+ * Values are indexed relative to `TableBatch.range.rowStart`; physical buffer
+ * regions and adapter transport details intentionally remain private.
+ */
+export interface TableBatchColumn {
+  readonly columnId: string;
+  readonly columnIndex: number;
+  readonly rowCount: number;
+  getValue(rowOffset: number): NativeValue | null;
+  getDisplayValue(rowOffset: number): string | null;
+  toValues(options?: ToRowsOptions): (NativeValue | null)[];
+  toDisplayValues(options?: ToRowsOptions): (string | null)[];
+}
+
+/** Stable logical batch contract. Wire buffers and ABI layout stay private. */
 export interface TableBatch {
-  readonly layoutVersion: typeof BATCH_LAYOUT_VERSION;
   readonly tableId: string;
   readonly revision: number;
   readonly schemaVersion: number;
   readonly range: Readonly<ReturnedRange>;
-  readonly buffers: readonly Uint8Array[];
   readonly columns: readonly TableBatchColumn[];
   readonly complete: boolean;
-  readonly byteLength: number;
   toRows(options?: ToRowsOptions): (NativeValue | null)[][];
   toDisplayRows(options?: ToRowsOptions): (string | null)[][];
 }
@@ -330,21 +493,20 @@ export interface WireTableBatch {
   readonly schemaVersion: number;
   readonly range: ReturnedRange;
   readonly buffers: readonly WireBatchBuffer[];
-  readonly columns: readonly TableBatchColumn[];
+  readonly columns: readonly WireTableBatchColumn[];
   readonly complete: boolean;
 }
 
 /** Owns and validates one generic layout-v1 batch received from the Worker. */
 export class ColumnarTableBatch implements TableBatch {
-  readonly layoutVersion = BATCH_LAYOUT_VERSION;
   readonly tableId: string;
   readonly revision: number;
   readonly schemaVersion: number;
   readonly range: Readonly<ReturnedRange>;
-  readonly buffers: readonly Uint8Array[];
   readonly columns: readonly TableBatchColumn[];
   readonly complete: boolean;
-  readonly byteLength: number;
+  readonly #buffers: readonly Uint8Array[];
+  readonly #wireColumns: readonly WireTableBatchColumn[];
 
   constructor(value: WireTableBatch) {
     if (value.layoutVersion !== BATCH_LAYOUT_VERSION) {
@@ -356,11 +518,16 @@ export class ColumnarTableBatch implements TableBatch {
     this.revision = value.revision;
     this.schemaVersion = value.schemaVersion;
     this.range = Object.freeze({ ...value.range });
-    this.buffers = Object.freeze(value.buffers.map(asUint8Array));
-    this.columns = Object.freeze(value.columns.map((column) => freezeColumn(column)));
+    this.#buffers = Object.freeze(value.buffers.map(asUint8Array));
+    this.#wireColumns = Object.freeze(value.columns.map((column) => freezeWireColumn(column)));
     this.complete = value.complete;
-    this.byteLength = this.buffers.reduce((total, buffer) => total + buffer.byteLength, 0);
-    validateBatch(this);
+    validateWireBatch(this.range, this.#buffers, this.#wireColumns);
+    this.columns = Object.freeze(this.#wireColumns.map((column, index) => new LogicalBatchColumn(
+      column,
+      this.#buffers,
+      this.range.rowCount,
+      this.range.columnStart + index,
+    )));
   }
 
   toRows(options: ToRowsOptions = {}): (NativeValue | null)[][] {
@@ -371,9 +538,8 @@ export class ColumnarTableBatch implements TableBatch {
       () => Array<NativeValue | null>(this.columns.length),
     );
     for (let columnIndex = 0; columnIndex < this.columns.length; columnIndex += 1) {
-      const descriptor = this.columns[columnIndex]!.native;
       for (let rowIndex = 0; rowIndex < this.range.rowCount; rowIndex += 1) {
-        rows[rowIndex]![columnIndex] = decodeNativeValue(descriptor, rowIndex, this.buffers, 0);
+        rows[rowIndex]![columnIndex] = this.columns[columnIndex]!.getValue(rowIndex);
       }
     }
     return rows;
@@ -382,33 +548,88 @@ export class ColumnarTableBatch implements TableBatch {
   toDisplayRows(options: ToRowsOptions = {}): (string | null)[][] {
     const maxCells = normalizeCellLimit(options.maxCells);
     assertCellLimit(this.range.rowCount, this.columns.length, maxCells);
-    const decoder = new TextDecoder();
     const rows: (string | null)[][] = Array.from(
       { length: this.range.rowCount },
       () => Array<string | null>(this.columns.length),
     );
 
     for (let columnIndex = 0; columnIndex < this.columns.length; columnIndex += 1) {
-      const display = this.columns[columnIndex]!.display;
-      const physicalOffset = display.offset ?? 0;
-      const offsets = regionView(display.offsets, this.buffers, "display offsets");
-      const data = regionView(display.data, this.buffers, "display data");
       for (let rowIndex = 0; rowIndex < this.range.rowCount; rowIndex += 1) {
-        const physicalIndex = physicalOffset + rowIndex;
-        if (!validAt(display.validity, physicalIndex, this.buffers)) {
-          rows[rowIndex]![columnIndex] = null;
-          continue;
-        }
-        const start = readUnsignedOffset(offsets, physicalIndex, 4);
-        const end = readUnsignedOffset(offsets, physicalIndex + 1, 4);
-        if (end < start || end > data.byteLength) {
-          throw invalidArgument(`Column ${this.columns[columnIndex]!.columnId} has invalid display offsets`);
-        }
-        rows[rowIndex]![columnIndex] = decoder.decode(data.subarray(start, end));
+        rows[rowIndex]![columnIndex] = this.columns[columnIndex]!.getDisplayValue(rowIndex);
       }
     }
     return rows;
   }
+}
+
+class LogicalBatchColumn implements TableBatchColumn {
+  readonly columnId: string;
+  readonly columnIndex: number;
+  readonly rowCount: number;
+  readonly #wire: WireTableBatchColumn;
+  readonly #buffers: readonly Uint8Array[];
+
+  constructor(
+    wire: WireTableBatchColumn,
+    buffers: readonly Uint8Array[],
+    rowCount: number,
+    columnIndex: number,
+  ) {
+    this.columnId = wire.columnId;
+    this.columnIndex = columnIndex;
+    this.rowCount = rowCount;
+    this.#wire = wire;
+    this.#buffers = buffers;
+    Object.freeze(this);
+  }
+
+  getValue(rowOffset: number): NativeValue | null {
+    assertBatchRowOffset(rowOffset, this.rowCount);
+    return decodeNativeValue(this.#wire.native, rowOffset, this.#buffers, 0);
+  }
+
+  getDisplayValue(rowOffset: number): string | null {
+    assertBatchRowOffset(rowOffset, this.rowCount);
+    return decodeDisplayValue(this.#wire.display, rowOffset, this.#buffers, this.columnId);
+  }
+
+  toValues(options: ToRowsOptions = {}): (NativeValue | null)[] {
+    const maxCells = normalizeCellLimit(options.maxCells);
+    assertCellLimit(this.rowCount, 1, maxCells);
+    return Array.from({ length: this.rowCount }, (_, index) => this.getValue(index));
+  }
+
+  toDisplayValues(options: ToRowsOptions = {}): (string | null)[] {
+    const maxCells = normalizeCellLimit(options.maxCells);
+    assertCellLimit(this.rowCount, 1, maxCells);
+    return Array.from({ length: this.rowCount }, (_, index) => this.getDisplayValue(index));
+  }
+}
+
+function assertBatchRowOffset(rowOffset: number, rowCount: number): void {
+  if (!Number.isSafeInteger(rowOffset) || rowOffset < 0 || rowOffset >= rowCount) {
+    throw invalidArgument(`Batch row offset must be an integer from 0 through ${Math.max(0, rowCount - 1)}`);
+  }
+}
+
+function decodeDisplayValue(
+  display: DisplayColumnDescriptor,
+  rowOffset: number,
+  buffers: readonly Uint8Array[],
+  columnId: string,
+): string | null {
+  const physicalIndex = (display.offset ?? 0) + rowOffset;
+  if (!validAt(display.validity, physicalIndex, buffers)) {
+    return null;
+  }
+  const offsets = regionView(display.offsets, buffers, "display offsets");
+  const data = regionView(display.data, buffers, "display data");
+  const start = readUnsignedOffset(offsets, physicalIndex, 4);
+  const end = readUnsignedOffset(offsets, physicalIndex + 1, 4);
+  if (end < start || end > data.byteLength) {
+    throw invalidArgument(`Column ${columnId} has invalid display offsets`);
+  }
+  return new TextDecoder().decode(data.subarray(start, end));
 }
 
 export function validateRange(request: RangeRequest): RangeRequest {
@@ -426,7 +647,15 @@ export function validateRange(request: RangeRequest): RangeRequest {
     throw new TabularkError(
       "RESOURCE_LIMIT",
       `A range may contain at most ${MAX_RANGE_CELLS} cells`,
-      { details: { cells, limit: MAX_RANGE_CELLS } },
+      {
+        details: {
+          resource: "range-cells",
+          required: cells,
+          available: MAX_RANGE_CELLS,
+          cells,
+          limit: MAX_RANGE_CELLS,
+        },
+      },
     );
   }
   return Object.freeze({ ...request });
@@ -587,17 +816,21 @@ function normalizeField(value: unknown, depth: number): ArrowField {
   });
 }
 
-function validateBatch(batch: TableBatch): void {
-  validateRange(batch.range);
-  if (batch.columns.length !== batch.range.columnCount) {
+function validateWireBatch(
+  range: Readonly<ReturnedRange>,
+  buffers: readonly Uint8Array[],
+  columns: readonly WireTableBatchColumn[],
+): void {
+  validateRange(range);
+  if (columns.length !== range.columnCount) {
     throw invalidArgument(
-      `Batch has ${batch.columns.length} columns; expected ${batch.range.columnCount}`,
+      `Batch has ${columns.length} columns; expected ${range.columnCount}`,
     );
   }
-  for (const [index, column] of batch.columns.entries()) {
-    validateDisplay(column.display, batch.range.rowCount, batch.buffers, column.columnId);
-    validateNative(column.native, batch.buffers, 0, `columns[${index}].native`);
-    if (column.native.length < batch.range.rowCount) {
+  for (const [index, column] of columns.entries()) {
+    validateDisplay(column.display, range.rowCount, buffers, column.columnId);
+    validateNative(column.native, buffers, 0, `columns[${index}].native`);
+    if (column.native.length < range.rowCount) {
       throw invalidArgument(`Column ${column.columnId} is shorter than the returned range`);
     }
   }
@@ -1136,7 +1369,7 @@ function unwrapExtension(dataType: ArrowDataType): ArrowDataType {
   return current;
 }
 
-function freezeColumn(column: TableBatchColumn): TableBatchColumn {
+function freezeWireColumn(column: WireTableBatchColumn): WireTableBatchColumn {
   return Object.freeze({
     columnId: column.columnId,
     native: freezeNative(column.native),
@@ -1219,7 +1452,15 @@ function assertCellLimit(rows: number, columns: number, maxCells: number): void 
     throw new TabularkError(
       "RESOURCE_LIMIT",
       `Decoding ${cellCount} cells exceeds the toRows limit of ${maxCells}`,
-      { details: { cellCount, maxCells } },
+      {
+        details: {
+          resource: "row-materialization-cells",
+          required: cellCount,
+          available: maxCells,
+          cellCount,
+          maxCells,
+        },
+      },
     );
   }
 }

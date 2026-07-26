@@ -144,7 +144,9 @@ test.describe("mobile landing page", () => {
 
     const format = page.getByTestId("format");
     await format.focus();
-    await page.keyboard.press("End");
+    await page.keyboard.press("Home");
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("ArrowDown");
     await expect(format).toHaveValue("arrow");
     await expect(page.getByTestId("advanced-options")).toBeHidden();
     await expect(page.getByTestId("arrow-options")).toBeVisible();

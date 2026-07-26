@@ -6,13 +6,35 @@ import test from "node:test";
 import { startTestServer, stopTestServer } from "./browser/server.mjs";
 
 test("performance scenarios and size budgets remain reproducible and bounded", async () => {
-  const [manifest, budget] = await Promise.all([
+  const [manifest, budget, formatBudget, packageJson] = await Promise.all([
     readJson("./performance/scenarios.json"),
     readJson("./performance/size-budget.json"),
+    readJson("./performance/format-budget.json"),
+    readJson("../package.json"),
   ]);
 
   assert.equal(manifest.schemaVersion, 1);
   assert.equal(budget.schemaVersion, 2);
+  assert.equal(formatBudget.schemaVersion, 1);
+  assert.equal(
+    packageJson.scripts["benchmark:formats"],
+    "node test/performance/run-format-smoke.mjs",
+  );
+  assert.deepEqual(Object.keys(formatBudget.adapters).sort(), ["excel", "parquet"]);
+  for (const [adapter, limits] of Object.entries(formatBudget.adapters)) {
+    for (const field of [
+      "maxEngineStartupMs",
+      "maxAdapterColdOpenMs",
+      "maxRangeReadMs",
+      "maxMemoryPeakDeltaBytes",
+    ]) {
+      assert.ok(Number.isSafeInteger(limits[field]) && limits[field] > 0, `${adapter}.${field}`);
+    }
+    assert.ok(
+      limits.maxMemoryPeakDeltaBytes <= 64 * 1024 * 1024,
+      `${adapter} memory cap must not exceed the 64 MiB platform budget`,
+    );
+  }
   for (const [name, scenario] of Object.entries(manifest.scenarios)) {
     if (scenario.kind === "arrow") {
       assert.match(
@@ -88,10 +110,14 @@ test("performance scenarios and size budgets remain reproducible and bounded", a
     "arrowRaw",
     "coreBrotli",
     "coreRaw",
+    "excelBrotli",
+    "excelRaw",
     "npmPacked",
     "npmUnpacked",
     "pagesBrotli",
     "pagesRaw",
+    "parquetBrotli",
+    "parquetRaw",
   ]);
   for (const maximum of Object.values(budget.maximumBytes)) {
     assert.ok(Number.isSafeInteger(maximum) && maximum > 0);
@@ -99,36 +125,24 @@ test("performance scenarios and size budgets remain reproducible and bounded", a
   const packageBaseline = await readJson("./performance/baselines/package-sizes.json");
   assert.equal(budget.maximumBytes.coreRaw, 524288, "M3 core raw cap must not widen");
   assert.equal(budget.maximumBytes.coreBrotli, 147456, "M3 core Brotli cap must not widen");
-  assert.equal(
-    budget.maximumBytes.arrowRaw,
-    withDeliveryHeadroom(packageBaseline.arrow.rawBytes),
-    "Arrow raw budget",
-  );
-  assert.equal(
-    budget.maximumBytes.arrowBrotli,
-    withDeliveryHeadroom(packageBaseline.arrow.brotliBytes),
-    "Arrow Brotli budget",
-  );
-  assert.equal(
-    budget.maximumBytes.npmPacked,
-    withDeliveryHeadroom(packageBaseline.npm.packedBytes),
-    "npm packed budget",
-  );
-  assert.equal(
-    budget.maximumBytes.npmUnpacked,
-    withDeliveryHeadroom(packageBaseline.npm.unpackedBytes),
-    "npm unpacked budget",
-  );
-  assert.equal(
-    budget.maximumBytes.pagesRaw,
-    withDeliveryHeadroom(packageBaseline.pages.rawBytes),
-    "Pages raw budget",
-  );
-  assert.equal(
-    budget.maximumBytes.pagesBrotli,
-    withDeliveryHeadroom(packageBaseline.pages.brotliBytes),
-    "Pages Brotli budget",
-  );
+  assert.equal(budget.maximumBytes.arrowRaw, 2555904, "M4 Arrow raw cap must not widen");
+  assert.equal(budget.maximumBytes.arrowBrotli, 393216, "M4 Arrow Brotli cap must not widen");
+  for (const [budgetKey, group, field] of [
+    ["parquetRaw", "parquet", "rawBytes"],
+    ["parquetBrotli", "parquet", "brotliBytes"],
+    ["excelRaw", "excel", "rawBytes"],
+    ["excelBrotli", "excel", "brotliBytes"],
+    ["npmPacked", "npm", "packedBytes"],
+    ["npmUnpacked", "npm", "unpackedBytes"],
+    ["pagesRaw", "pages", "rawBytes"],
+    ["pagesBrotli", "pages", "brotliBytes"],
+  ]) {
+    assert.equal(
+      budget.maximumBytes[budgetKey],
+      withDeliveryHeadroom(packageBaseline[group][field]),
+      `${budgetKey} delivery headroom`,
+    );
+  }
 });
 
 test("performance server opts into cross-origin isolation explicitly", async () => {

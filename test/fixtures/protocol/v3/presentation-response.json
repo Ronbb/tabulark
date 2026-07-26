@@ -1,0 +1,19 @@
+{
+  "protocolVersion": 3,
+  "requestId": "presentation-v3",
+  "status": "success",
+  "result": {
+    "kind": "presentation",
+    "data": {
+      "kind": "spreadsheet-v1",
+      "tableId": "sheet-1",
+      "revision": 0,
+      "visibility": "hidden",
+      "frozenRows": 1,
+      "frozenColumns": 0,
+      "rows": [],
+      "columns": [],
+      "styles": []
+    }
+  }
+}

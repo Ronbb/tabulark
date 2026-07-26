@@ -15,6 +15,7 @@ keywords = ["table", "preview", "wasm", "data", "canvas"]
 include = [
     "/src/**",
     "/examples/generate_arrow_fixture.rs",
+    "/examples/generate_parquet_fixture.rs",
     "/Cargo.toml",
     "/README.md",
     "/LICENSE-MIT",
@@ -27,6 +28,10 @@ crate-type = ["cdylib", "rlib"]
 [[example]]
 name = "generate_arrow_fixture"
 required-features = ["arrow"]
+
+[[example]]
+name = "generate_parquet_fixture"
+required-features = ["parquet"]
 
 [features]
 default = ["csv"]
@@ -49,15 +54,21 @@ arrow = [
     "arrow-cast/force_validate",
     "arrow-data/force_validate",
 ]
+parquet = [
+    "arrow",
+    "dep:bytes",
+    "dep:parquet",
+]
 
 [dependencies]
 arrow-array = { version = "=59.1.0", default-features = false, optional = true }
 arrow-buffer = { version = "=59.1.0", default-features = false, optional = true }
 arrow-cast = { version = "=59.1.0", default-features = false, optional = true }
 arrow-data = { version = "=59.1.0", default-features = false, optional = true }
-arrow-ipc = { version = "=59.1.0", default-features = false, features = ["lz4", "zstd"], optional = true }
+arrow-ipc = { version = "=59.1.0", default-features = false, features = ["lz4"], optional = true }
 arrow-schema = { version = "=59.1.0", default-features = false, optional = true }
 arrow-select = { version = "=59.1.0", default-features = false, optional = true }
+bytes = { version = "1.10.1", optional = true }
 csv-core = { version = "0.1.13", optional = true }
 flatbuffers = { version = "=25.12.19", default-features = false, optional = true }
 js-sys = { version = "=0.3.77", optional = true }
@@ -65,12 +76,28 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 serde-wasm-bindgen = { version = "0.6.5", optional = true }
 wasm-bindgen = { version = "=0.2.100", optional = true }
+# Zstd is enabled by the official Arrow and Parquet WASM wrappers, where the
+# workspace patch below replaces zstd-sys with the Rust-only compatibility
+# crate. Keeping it out of this published crate's production dependency
+# features prevents Cargo from silently dropping the patch on crates.io.
+parquet = { version = "=59.1.0", default-features = false, features = ["arrow", "brotli", "flate2-rust_backend", "lz4", "snap"], optional = true }
+
+[dev-dependencies]
+# Unit tests cover the same Zstd paths as the official WASM wrappers. These
+# test-only feature activations do not enter the published crate's normal graph.
+arrow-ipc = { version = "=59.1.0", default-features = false, features = ["zstd"] }
+parquet = { version = "=59.1.0", default-features = false, features = ["zstd"] }
+
+[patch.crates-io]
+zstd = { path = "crates/zstd-pure-compat" }
 
 [workspace]
 members = [
     ".",
     "crates/tabulark-arrow-wasm",
     "crates/tabulark-delimited-wasm",
+    "crates/tabulark-excel-wasm",
+    "crates/tabulark-parquet-wasm",
 ]
 default-members = ["."]
 resolver = "3"

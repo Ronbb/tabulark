@@ -1,5 +1,6 @@
 import type { SerializedError } from "../protocol.js";
 import { isRecord } from "../protocol.js";
+import { normalizeResourceLimitDetails } from "../errors.js";
 
 export class ProtocolFault extends Error {
   readonly code: string;
@@ -17,7 +18,9 @@ export class ProtocolFault extends Error {
     this.name = "ProtocolFault";
     this.code = code;
     this.retryable = retryable;
-    this.details = details;
+    this.details = code === "RESOURCE_LIMIT"
+      ? normalizeResourceLimitDetails(details)
+      : details;
   }
 }
 
@@ -42,10 +45,36 @@ export function faultFromUnknown(error: unknown, fallback: string): ProtocolFaul
 
 export function serializeFault(error: unknown, fallback: string): SerializedError {
   const fault = faultFromUnknown(error, fallback);
+  const details = fault.code === "RESOURCE_LIMIT"
+    ? normalizeResourceLimitDetails(fault.details)
+    : fault.details;
   return {
     code: fault.code,
     message: fault.message,
     retryable: fault.retryable,
-    ...(fault.details === undefined ? {} : { details: fault.details }),
+    ...(details === undefined
+      ? {}
+      : { details: normalizeFaultDetails(fault.code, details) }),
   };
+}
+
+/**
+ * Keep legacy Rust adapter diagnostics legible while the v2 adapters converge
+ * on the public resource vocabulary. Counts intentionally remain `required` /
+ * `available`; byte reservations use the explicit `*Bytes` names.
+ */
+function normalizeFaultDetails(code: string, details: unknown): unknown {
+  if (code !== "RESOURCE_LIMIT" || !isRecord(details)) {
+    return details;
+  }
+  const resource = typeof details.resource === "string"
+    ? details.resource
+    : typeof details.resourceCategory === "string"
+      ? details.resourceCategory
+      : undefined;
+  if (resource === undefined || details.resource === resource) {
+    return details;
+  }
+  const { resourceCategory: _legacyResourceCategory, ...rest } = details;
+  return { ...rest, resource };
 }

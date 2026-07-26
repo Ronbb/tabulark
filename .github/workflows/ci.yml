@@ -15,13 +15,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  rust:
-    name: Rust
+  rust-stable:
+    name: Rust stable
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
+      - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -30,13 +30,37 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: cargo fmt --all --check
+        run: |
+          cargo fmt --all --check
+          cargo fmt --manifest-path crates/zstd-pure-compat/Cargo.toml --check
+          cargo fmt --manifest-path crates/zstd-pure-compat/compat-check/Cargo.toml --check
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo clippy --manifest-path crates/zstd-pure-compat/Cargo.toml --all-targets --locked -- -D warnings
+          cargo clippy --manifest-path crates/zstd-pure-compat/compat-check/Cargo.toml --all-targets --locked -- -D warnings
 
       - name: Run Rust tests
-        run: cargo test --workspace --all-features --locked
+        run: |
+          cargo test --workspace --all-features --locked
+          cargo test --manifest-path crates/zstd-pure-compat/Cargo.toml --locked
+          cargo check --manifest-path crates/zstd-pure-compat/compat-check/Cargo.toml --locked
+
+      - name: Enforce pure-Rust official codec graphs
+        shell: bash
+        run: |
+          for package in tabulark-arrow-wasm tabulark-parquet-wasm; do
+            tree="$(cargo tree --package "$package" --edges normal --locked)"
+            grep -F 'ruzstd v0.8.1' <<<"$tree"
+            if grep -Eq 'zstd-(sys|safe)' <<<"$tree"; then
+              echo "$package contains a forbidden C-backed Zstd dependency" >&2
+              exit 1
+            fi
+          done
+          fuzz_tree="$(cargo tree --manifest-path fuzz/Cargo.toml --edges normal --locked)"
+          grep -F 'ruzstd v0.8.1' <<<"$fuzz_tree"
+          ! grep -Eq 'zstd-(sys|safe)' <<<"$fuzz_tree"
 
       - name: Check fuzz harness
         run: cargo test --manifest-path fuzz/Cargo.toml --locked
@@ -45,25 +69,85 @@ jobs:
         run: |
           cargo run --manifest-path fuzz/Cargo.toml --bin csv_lifecycle --locked
           cargo run --manifest-path fuzz/Cargo.toml --bin arrow_lifecycle --locked
+          cargo run --manifest-path fuzz/Cargo.toml --bin parquet_lifecycle --locked
+          cargo run --manifest-path fuzz/Cargo.toml --bin excel_lifecycle --locked
 
-      - name: Check WebAssembly target
+      - name: Check all WebAssembly wrappers
         run: |
           cargo check --package tabulark-delimited-wasm --target wasm32-unknown-unknown --locked
           cargo check --package tabulark-arrow-wasm --target wasm32-unknown-unknown --locked
+          cargo check --package tabulark-parquet-wasm --target wasm32-unknown-unknown --locked
+          cargo check --package tabulark-excel-wasm --target wasm32-unknown-unknown --locked
 
       - name: Check crate package
-        run: cargo package --locked
+        shell: bash
+        run: |
+          cargo package --locked
+          package_manifest="$(find target/package -mindepth 2 -maxdepth 2 -path '*/tabulark-*/Cargo.toml' -print -quit)"
+          test -n "$package_manifest"
+          published_tree="$(cargo tree --manifest-path "$package_manifest" --all-features --edges normal)"
+          if grep -Eq '(^|[[:space:]])(zstd|ruzstd|zstd-safe|zstd-sys) v' <<<"$published_tree"; then
+            echo "Published experimental Rust graph unexpectedly enables Zstd after patch stripping" >&2
+            exit 1
+          fi
+
+  rust-msrv:
+    name: Rust 1.85 MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.85.0
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.85
+
+      - name: Check all features on the MSRV
+        run: cargo check --workspace --all-targets --all-features --locked
+
+      - name: Run workspace tests on the MSRV
+        run: |
+          cargo test --workspace --all-features --locked
+          cargo +1.85.0 test --manifest-path crates/zstd-pure-compat/Cargo.toml --locked
+          cargo +1.85.0 check --manifest-path crates/zstd-pure-compat/compat-check/Cargo.toml --locked
+
+      - name: Check all WebAssembly wrappers on the MSRV
+        run: |
+          cargo +1.85.0 check --package tabulark-delimited-wasm --target wasm32-unknown-unknown --locked
+          cargo +1.85.0 check --package tabulark-arrow-wasm --target wasm32-unknown-unknown --locked
+          cargo +1.85.0 check --package tabulark-parquet-wasm --target wasm32-unknown-unknown --locked
+          cargo +1.85.0 check --package tabulark-excel-wasm --target wasm32-unknown-unknown --locked
+
+  licenses:
+    name: Dependency advisories and licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check dependency advisory and license policy
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses
 
   javascript:
-    name: JavaScript
+    name: JavaScript and clean consumer (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: "24"
+          node-version: ${{ matrix.node }}
           cache: npm
 
       - name: Install dependencies
@@ -78,23 +162,21 @@ jobs:
         shell: bash
         run: |
           version="$(cargo metadata --format-version 1 --locked --no-default-features --features wasm | jq -er '[.packages[] | select(.name == "wasm-bindgen") | .version][0]')"
-          if ! command -v wasm-bindgen > /dev/null || ! wasm-bindgen --version | grep -Fx "wasm-bindgen $version" > /dev/null; then
-            target="x86_64-unknown-linux-musl"
-            archive="wasm-bindgen-${version}-${target}.tar.gz"
-            checksum="${archive}.sha256sum"
-            curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
-              --output "$RUNNER_TEMP/$archive" \
-              "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/${archive}"
-            curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
-              --output "$RUNNER_TEMP/$checksum" \
-              "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/${checksum}"
-            expected="$(awk '{ print $1 }' "$RUNNER_TEMP/$checksum")"
-            printf '%s  %s\n' "$expected" "$RUNNER_TEMP/$archive" | sha256sum --check
-            tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
-            echo "$RUNNER_TEMP/wasm-bindgen-${version}-${target}" >> "$GITHUB_PATH"
-          fi
+          target="x86_64-unknown-linux-musl"
+          archive="wasm-bindgen-${version}-${target}.tar.gz"
+          checksum="${archive}.sha256sum"
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
+            --output "$RUNNER_TEMP/$archive" \
+            "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/${archive}"
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
+            --output "$RUNNER_TEMP/$checksum" \
+            "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/${checksum}"
+          expected="$(awk '{ print $1 }' "$RUNNER_TEMP/$checksum")"
+          printf '%s  %s\n' "$expected" "$RUNNER_TEMP/$archive" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/wasm-bindgen-${version}-${target}" >> "$GITHUB_PATH"
 
-      - name: Build JavaScript and WebAssembly
+      - name: Build JavaScript and four WebAssembly adapters
         run: npm run build
 
       - name: Check synchronized versions
@@ -106,15 +188,15 @@ jobs:
       - name: Run JavaScript tests
         run: npm test
 
-      - name: Smoke-test large fixture generation
-        run: node test/performance/generate-csv.mjs --size 2MiB --output target/bench/smoke.csv
-
-      - name: Check npm package
+      - name: Check clean packed consumer
         run: npm run package:check
 
+      - name: Check Pages assembly
+        if: matrix.node == 24
+        run: npm run pages:check
+
   browser:
-    name: Chromium Worker, accessibility, and visual integration
-    # Screenshot baselines are maintained against Playwright Chromium on this image.
+    name: Chromium Worker, accessibility, presentation, and visual integration
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -128,21 +210,19 @@ jobs:
         shell: bash
         run: |
           version="$(cargo metadata --format-version 1 --locked --no-default-features --features wasm | jq -er '[.packages[] | select(.name == "wasm-bindgen") | .version][0]')"
-          if ! command -v wasm-bindgen > /dev/null || ! wasm-bindgen --version | grep -Fx "wasm-bindgen $version" > /dev/null; then
-            target="x86_64-unknown-linux-musl"
-            archive="wasm-bindgen-${version}-${target}.tar.gz"
-            checksum="${archive}.sha256sum"
-            curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
-              --output "$RUNNER_TEMP/$archive" \
-              "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/${archive}"
-            curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
-              --output "$RUNNER_TEMP/$checksum" \
-              "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/${checksum}"
-            expected="$(awk '{ print $1 }' "$RUNNER_TEMP/$checksum")"
-            printf '%s  %s\n' "$expected" "$RUNNER_TEMP/$archive" | sha256sum --check
-            tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
-            echo "$RUNNER_TEMP/wasm-bindgen-${version}-${target}" >> "$GITHUB_PATH"
-          fi
+          target="x86_64-unknown-linux-musl"
+          archive="wasm-bindgen-${version}-${target}.tar.gz"
+          checksum="${archive}.sha256sum"
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
+            --output "$RUNNER_TEMP/$archive" \
+            "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/${archive}"
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
+            --output "$RUNNER_TEMP/$checksum" \
+            "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/${checksum}"
+          expected="$(awk '{ print $1 }' "$RUNNER_TEMP/$checksum")"
+          printf '%s  %s\n' "$expected" "$RUNNER_TEMP/$archive" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/wasm-bindgen-${version}-${target}" >> "$GITHUB_PATH"
 
       - name: Install Node.js
         uses: actions/setup-node@v6
@@ -156,6 +236,18 @@ jobs:
       - name: Install Chromium
         run: npx --no-install playwright install --with-deps chromium
 
+      - name: Record exact Chromium version
+        shell: bash
+        run: |
+          mkdir -p target/bench
+          node --input-type=module <<'NODE' > target/bench/chromium-version.txt
+          import { chromium } from "@playwright/test";
+          const browser = await chromium.launch({ headless: true });
+          console.log(`Playwright 1.61.1 / Chromium ${await browser.version()}`);
+          await browser.close();
+          NODE
+          cat target/bench/chromium-version.txt
+
       - name: Build JavaScript and WebAssembly
         run: npm run build
 
@@ -168,6 +260,9 @@ jobs:
       - name: Run Arrow delivery performance smoke
         run: npm run benchmark:arrow
 
+      - name: Run Parquet and Excel delivery performance smoke
+        run: npm run benchmark:formats
+
       - name: Enforce package and site size budgets
         run: npm run benchmark:size
 
@@ -177,8 +272,10 @@ jobs:
         with:
           name: performance-smoke-${{ github.sha }}
           path: |
+            target/bench/chromium-version.txt
             target/bench/performance-smoke.json
             target/bench/performance-arrow-*.json
+            target/bench/performance-format-adapters.json
             target/bench/package-sizes.json
           if-no-files-found: ignore
           retention-days: 14

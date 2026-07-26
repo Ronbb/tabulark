@@ -4,7 +4,7 @@ const fixtureUrl = "/test/fixtures/arrow/v1/m4-sample.arrow";
 const progressiveStreamFixtureUrl = "/test/performance/fixtures/arrow/m4-stream-none.arrows";
 const progressiveWorkerUrl = "/test/browser/progressive-arrow-worker.mjs";
 
-test("opens the committed Arrow IPC fixture with recursive native values and display rows", async ({ page }) => {
+test("opens the committed Arrow IPC fixture with recursive logical values and display rows", async ({ page }) => {
   await page.goto("/test/browser/harness.html");
 
   const result = await page.evaluate(async ({ fixture }) => {
@@ -43,13 +43,11 @@ test("opens the committed Arrow IPC fixture with recursive native values and dis
         })),
         rows: batch.toRows(),
         display: batch.toDisplayRows(),
-        descriptor: {
-          dictionary: batch.columns[4].native.dictionary !== undefined,
-          listChildren: batch.columns[5].native.children?.length ?? 0,
-          structChildren: batch.columns[6].native.children?.length ?? 0,
+        columns: {
+          dictionary: batch.columns[4].toValues(),
+          list: batch.columns[5].toValues(),
+          struct: batch.columns[6].toValues(),
         },
-        bufferCount: batch.buffers.length,
-        byteLength: batch.byteLength,
       };
     } finally {
       await table?.close();
@@ -85,9 +83,9 @@ test("opens the committed Arrow IPC fixture with recursive native values and dis
   expect(result.display[0][1]).toBe("123.4567");
   expect(result.display[0][3]).toBe("你好，Arrow");
   expect(result.display[0][5]).not.toMatch(/[\t\r\n]/u);
-  expect(result.descriptor).toEqual({ dictionary: true, listChildren: 1, structChildren: 2 });
-  expect(result.bufferCount).toBeGreaterThan(0);
-  expect(result.byteLength).toBeGreaterThan(0);
+  expect(result.columns.dictionary[0]).toBe("待处理");
+  expect(result.columns.list[0]).toEqual(["数据", "preview"]);
+  expect(result.columns.struct[0]).toEqual({ city: "上海", score: 98 });
 });
 
 test("publishes and reads an Arrow Stream prefix before upgrading stable handles at EOF", async ({ page }) => {
@@ -283,8 +281,8 @@ test("publishes and reads an Arrow Stream prefix before upgrading stable handles
   expect(result.blockedRead).toEqual({
     kind: "source-read-blocked",
     completedSourceBytes: 32 * 1024,
-    pendingSourceBytes: result.sourceBytes - 32 * 1024,
-    sourceReadCount: 2,
+    pendingSourceBytes: 8 * 1024,
+    sourceReadCount: 5,
   });
   expect(result.prefix).toEqual({
     randomAccess: "indexed-prefix",
@@ -294,6 +292,8 @@ test("publishes and reads an Arrow Stream prefix before upgrading stable handles
   expect(result.laterRequest.rowStart).toBeGreaterThanOrEqual(result.prefix.rows.value);
   expect(result.done).toEqual({
     sourceHandle: result.datasetHandle,
+    tableId: "table-0",
+    revision: 0,
     bytesScanned: result.sourceBytes,
     rowsDiscovered: 512,
     done: true,

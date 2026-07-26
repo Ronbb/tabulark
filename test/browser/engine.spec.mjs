@@ -302,8 +302,9 @@ test("enforces low-budget input limits and keeps the same engine reusable", asyn
   expect(result.arrayBufferFailure).toMatchObject({
     code: "RESOURCE_LIMIT",
     details: {
-      byteLength: result.maxArrayBufferBytes + 1,
-      limit: result.maxArrayBufferBytes,
+      resource: "source-staging",
+      requiredBytes: result.maxArrayBufferBytes + 1,
+      availableBytes: result.maxArrayBufferBytes,
     },
   });
   expect(result.arrayBufferByteLength).toBe(result.maxArrayBufferBytes + 1);
@@ -411,7 +412,8 @@ test("propagates an unexpected Worker error to live table handles", async ({ pag
     let engine;
     let controller;
     try {
-      const { createEngine, createTableController, delimitedAdapter } = await import("/dist/index.js");
+      const { createEngine, delimitedAdapter } = await import("/dist/index.js");
+      const { createTableController } = await import("/dist/experimental.js");
       engine = await createEngine({ adapters: [delimitedAdapter] });
       const dataset = await engine.open(new Blob(["value\na\n"]), {
         adapter: delimitedAdapter,

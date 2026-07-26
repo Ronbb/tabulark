@@ -31,6 +31,8 @@ const RESPONSE_KINDS = new Set<ResponseKind>([
   "tables",
   "table",
   "metadata",
+  "presentation",
+  "presentationRange",
   "batch",
   "acknowledged",
 ]);
@@ -311,6 +313,7 @@ function isValidProtocolEvent(value: unknown): value is ProtocolEvent {
     || !optionalNonEmptyString(value.datasetHandle)
     || !optionalNonEmptyString(value.tableHandle)
     || !optionalNonEmptyString(value.tableId)
+    || !optionalNonNegativeInteger(value.revision)
   ) {
     return false;
   }
@@ -333,6 +336,10 @@ function isSerializedError(value: unknown): boolean {
 
 function optionalNonEmptyString(value: unknown): boolean {
   return value === undefined || (typeof value === "string" && value.length > 0);
+}
+
+function optionalNonNegativeInteger(value: unknown): boolean {
+  return value === undefined || (Number.isSafeInteger(value) && (value as number) >= 0);
 }
 
 function looksLikeProtocolResponse(value: unknown): boolean {

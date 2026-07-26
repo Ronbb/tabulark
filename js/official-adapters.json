@@ -1,0 +1,89 @@
+{
+  "manifestVersion": 1,
+  "adapters": [
+    {
+      "id": "tabulark:delimited",
+      "entrypoint": ".",
+      "exportName": "delimitedAdapter",
+      "wasm": {
+        "packageName": "tabulark-delimited-wasm",
+        "crateArtifact": "tabulark_delimited",
+        "outputName": "tabulark_delimited",
+        "outputDirectory": "dist/wasm/delimited",
+        "modulePath": "./wasm/delimited/tabulark_delimited.js",
+        "runtimeExport": "WasmRuntime"
+      },
+      "options": {
+        "allowedKeys": ["dialect", "header", "mode", "delimiter", "sourceName"]
+      },
+      "resources": {
+        "sourceAccess": "streaming",
+        "supportsPresentation": false,
+        "runtimeWeight": 1
+      }
+    },
+    {
+      "id": "tabulark:arrow-ipc",
+      "entrypoint": "./arrow",
+      "exportName": "arrowIpcAdapter",
+      "wasm": {
+        "packageName": "tabulark-arrow-wasm",
+        "crateArtifact": "tabulark_arrow",
+        "outputName": "tabulark_arrow",
+        "outputDirectory": "dist/wasm/arrow",
+        "modulePath": "./wasm/arrow/tabulark_arrow.js",
+        "runtimeExport": "WasmRuntime"
+      },
+      "options": {
+        "allowedKeys": ["container", "sourceName"]
+      },
+      "resources": {
+        "sourceAccess": "range",
+        "supportsPresentation": false,
+        "runtimeWeight": 1
+      }
+    },
+    {
+      "id": "tabulark:parquet",
+      "entrypoint": "./parquet",
+      "exportName": "parquetAdapter",
+      "wasm": {
+        "packageName": "tabulark-parquet-wasm",
+        "crateArtifact": "tabulark_parquet",
+        "outputName": "tabulark_parquet",
+        "outputDirectory": "dist/wasm/parquet",
+        "modulePath": "./wasm/parquet/tabulark_parquet.js",
+        "runtimeExport": "WasmRuntime"
+      },
+      "options": {
+        "allowedKeys": ["sourceName"]
+      },
+      "resources": {
+        "sourceAccess": "range",
+        "supportsPresentation": false,
+        "runtimeWeight": 2
+      }
+    },
+    {
+      "id": "tabulark:excel",
+      "entrypoint": "./excel",
+      "exportName": "excelAdapter",
+      "wasm": {
+        "packageName": "tabulark-excel-wasm",
+        "crateArtifact": "tabulark_excel",
+        "outputName": "tabulark_excel",
+        "outputDirectory": "dist/wasm/excel",
+        "modulePath": "./wasm/excel/tabulark_excel.js",
+        "runtimeExport": "WasmRuntime"
+      },
+      "options": {
+        "allowedKeys": ["format", "sourceName"]
+      },
+      "resources": {
+        "sourceAccess": "staged",
+        "supportsPresentation": true,
+        "runtimeWeight": 2
+      }
+    }
+  ]
+}

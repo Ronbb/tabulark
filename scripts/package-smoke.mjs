@@ -8,6 +8,19 @@ import { fileURLToPath } from "node:url";
 const repositoryRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const targetRoot = resolve(repositoryRoot, "target");
 const smokeRoot = resolve(targetRoot, "package-smoke");
+const officialManifest = JSON.parse(await readFile(
+  resolve(repositoryRoot, "js", "official-adapters.json"),
+  "utf8",
+));
+const stableBundles = officialManifest.adapters.map(({ entrypoint }) => (
+  entrypoint === "." ? "index" : entrypoint.replace(/^\.\//u, "")
+));
+const runtimeAdapterImports = officialManifest.adapters.map((adapter, index) => (
+  `import { ${adapter.exportName} as adapter${index} } from ${JSON.stringify(packageSpecifier(adapter.entrypoint))};\n`
+)).join("");
+const runtimeAdapterChecks = officialManifest.adapters.map((adapter, index) => (
+  `if (adapter${index}.id !== ${JSON.stringify(adapter.id)}) throw new Error(${JSON.stringify(`${adapter.exportName} mismatch`)});\n`
+)).join("");
 assertInsideTarget(smokeRoot);
 await rm(smokeRoot, { force: true, recursive: true });
 await mkdir(smokeRoot, { recursive: true });
@@ -46,26 +59,27 @@ runNpm([
 
 const packageRoot = resolve(smokeRoot, "node_modules", "tabulark");
 const requiredFiles = [
-  "dist/index.js",
-  "dist/index.js.map",
-  "dist/index.d.ts",
-  "dist/arrow.js",
-  "dist/arrow.js.map",
-  "dist/arrow.d.ts",
+  ...stableBundles.flatMap((bundle) => [
+    `dist/${bundle}.js`,
+    `dist/${bundle}.js.map`,
+    `dist/${bundle}.d.ts`,
+  ]),
+  "dist/experimental.js",
+  "dist/experimental.js.map",
+  "dist/experimental.d.ts",
   "dist/worker.js",
   "dist/worker.js.map",
   "dist/worker.d.ts",
-  "dist/wasm/delimited/tabulark_delimited.js",
-  "dist/wasm/delimited/tabulark_delimited.d.ts",
-  "dist/wasm/delimited/tabulark_delimited_bg.wasm",
-  "dist/wasm/delimited/tabulark_delimited_bg.wasm.d.ts",
-  "dist/wasm/arrow/tabulark_arrow.js",
-  "dist/wasm/arrow/tabulark_arrow.d.ts",
-  "dist/wasm/arrow/tabulark_arrow_bg.wasm",
-  "dist/wasm/arrow/tabulark_arrow_bg.wasm.d.ts",
+  ...officialManifest.adapters.flatMap(({ wasm }) => [
+    `${wasm.outputDirectory}/${wasm.outputName}.js`.replace(/^dist\//u, "dist/"),
+    `${wasm.outputDirectory}/${wasm.outputName}.d.ts`.replace(/^dist\//u, "dist/"),
+    `${wasm.outputDirectory}/${wasm.outputName}_bg.wasm`.replace(/^dist\//u, "dist/"),
+    `${wasm.outputDirectory}/${wasm.outputName}_bg.wasm.d.ts`.replace(/^dist\//u, "dist/"),
+  ]),
   "LICENSE-MIT",
   "LICENSE-APACHE",
   "THIRD_PARTY_NOTICES.md",
+  "CHANGELOG.md",
 ];
 for (const relativePath of requiredFiles) {
   const metadata = await lstat(resolve(packageRoot, relativePath)).catch(() => undefined);
@@ -83,8 +97,18 @@ if (
 ) {
   throw new Error("The packed runtime must not declare or bundle production dependencies");
 }
-assertExport(installedManifest, ".", "./dist/index.js", "./dist/index.d.ts");
-assertExport(installedManifest, "./arrow", "./dist/arrow.js", "./dist/arrow.d.ts");
+for (const adapter of officialManifest.adapters) {
+  const bundle = adapter.entrypoint === "."
+    ? "index"
+    : adapter.entrypoint.replace(/^\.\//u, "");
+  assertExport(
+    installedManifest,
+    adapter.entrypoint,
+    `./dist/${bundle}.js`,
+    `./dist/${bundle}.d.ts`,
+  );
+}
+assertExport(installedManifest, "./experimental", "./dist/experimental.js", "./dist/experimental.d.ts");
 
 for (const retiredPath of [
   "dist/wasm/tabulark.js",
@@ -99,24 +123,44 @@ for (const retiredPath of [
 }
 await writeFile(
   resolve(smokeRoot, "consumer.mjs"),
-  `import { ADAPTER_API_VERSION, PROTOCOL_VERSION, delimitedAdapter } from "tabulark";\n`
-    + `import { arrowIpcAdapter } from "tabulark/arrow";\n`
-    + `if (PROTOCOL_VERSION !== 2 || ADAPTER_API_VERSION !== 1) throw new Error("version export mismatch");\n`
-    + `if (delimitedAdapter.id !== "tabulark:delimited") throw new Error("delimited export mismatch");\n`
-    + `if (arrowIpcAdapter.id !== "tabulark:arrow-ipc") throw new Error("arrow export mismatch");\n`,
+  `import * as stable from "tabulark";\n`
+    + runtimeAdapterImports
+    + `import { CanvasTablePainter, createTableController } from "tabulark/experimental";\n`
+    + `for (const privateName of ["PROTOCOL_VERSION", "ADAPTER_API_VERSION", "BATCH_LAYOUT_VERSION", "ColumnarTableBatch"]) {\n`
+    + `  if (privateName in stable) throw new Error(\`private export leaked: \${privateName}\`);\n`
+    + `}\n`
+    + runtimeAdapterChecks
+    + `if (typeof createTableController !== "function") throw new Error("experimental export mismatch");\n`
+    + `if (typeof CanvasTablePainter !== "function") throw new Error("experimental painter mismatch");\n`
+    + `await import("tabulark/protocol").then(\n`
+    + `  () => { throw new Error("private protocol subpath is exported"); },\n`
+    + `  (error) => { if (error?.code !== "ERR_PACKAGE_PATH_NOT_EXPORTED") throw error; },\n`
+    + `);\n`,
   "utf8",
 );
 run(process.execPath, [resolve(smokeRoot, "consumer.mjs")], smokeRoot);
 
 await writeFile(
   resolve(smokeRoot, "consumer.ts"),
-  `import { createEngine, delimitedAdapter, type TableBatch } from "tabulark";\n`
+  `import { createCanvasTableView, createEngine, delimitedAdapter, type TableBatch, type TablePresentation } from "tabulark";\n`
     + `import { arrowIpcAdapter, type ArrowIpcAdapterOptions } from "tabulark/arrow";\n`
+    + `import { parquetAdapter, type ParquetAdapterOptions } from "tabulark/parquet";\n`
+    + `import { excelAdapter, type ExcelAdapterOptions } from "tabulark/excel";\n`
+    + `import { CanvasTablePainter, createTableController } from "tabulark/experimental";\n`
     + `const arrowOptions: ArrowIpcAdapterOptions = { container: "auto" };\n`
-    + `const engine = createEngine({ adapters: [delimitedAdapter, arrowIpcAdapter] });\n`
+    + `const parquetOptions: ParquetAdapterOptions = { sourceName: "sample.parquet" };\n`
+    + `const excelOptions: ExcelAdapterOptions = { format: "auto", sourceName: "sample.xlsx" };\n`
+    + `const engine = createEngine({ adapters: [delimitedAdapter, arrowIpcAdapter, parquetAdapter, excelAdapter] });\n`
     + `declare const batch: TableBatch;\n`
     + `const display: readonly (readonly (string | null)[])[] = batch.toDisplayRows();\n`
-    + `void arrowOptions; void engine; void display;\n`,
+    + `const first = batch.columns[0]?.getValue(0);\n`
+    + `declare const presentation: TablePresentation | null;\n`
+    + `// @ts-expect-error wire buffers are private implementation details\n`
+    + `batch.buffers;\n`
+    + `// @ts-expect-error native descriptors are private implementation details\n`
+    + `batch.columns[0]?.native;\n`
+    + `void arrowOptions; void parquetOptions; void excelOptions; void engine; void display; void first; void presentation;\n`
+    + `void createCanvasTableView; void CanvasTablePainter; void createTableController;\n`,
   "utf8",
 );
 await writeFile(
@@ -142,7 +186,7 @@ run(process.execPath, [
 ], smokeRoot);
 
 console.log(
-  `Validated ${packResult.filename}: root and /arrow exports, declarations, maps, and both WASM artifacts.`,
+  `Validated ${packResult.filename}: five entrypoints, stable API boundary, declarations, maps, and four WASM artifacts.`,
 );
 
 function runNpm(args, cwd) {
@@ -174,6 +218,10 @@ function assertInsideTarget(path) {
   if (path === targetRoot || !path.startsWith(`${targetRoot}${sep}`)) {
     throw new Error(`Refusing package-smoke operation outside target/: ${path}`);
   }
+}
+
+function packageSpecifier(entrypoint) {
+  return entrypoint === "." ? "tabulark" : `tabulark${entrypoint.slice(1)}`;
 }
 
 function assertExport(manifest, key, expectedImport, expectedTypes) {

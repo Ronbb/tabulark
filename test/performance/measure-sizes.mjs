@@ -11,21 +11,43 @@ const brotliCompressAsync = promisify(brotliCompress);
 const execFileAsync = promisify(execFile);
 const repositoryRoot = resolve(fileURLToPath(new URL("../../", import.meta.url)));
 const options = parseArguments(process.argv.slice(2));
+const officialManifest = JSON.parse(await readFile(
+  resolve(repositoryRoot, "js", "official-adapters.json"),
+  "utf8",
+));
+const adapterById = new Map(officialManifest.adapters.map((adapter) => [adapter.id, adapter]));
+const delimitedArtifact = requiredAdapter("tabulark:delimited");
+const arrowArtifact = requiredAdapter("tabulark:arrow-ipc");
+const parquetArtifact = requiredAdapter("tabulark:parquet");
+const excelArtifact = requiredAdapter("tabulark:excel");
 const coreRuntimePaths = [
   "dist/index.js",
   "dist/worker.js",
-  "dist/wasm/delimited/tabulark_delimited.js",
-  "dist/wasm/delimited/tabulark_delimited_bg.wasm",
+  ...wasmRuntimePaths(delimitedArtifact),
 ];
 const arrowRuntimePaths = [
-  "dist/arrow.js",
-  "dist/wasm/arrow/tabulark_arrow.js",
-  "dist/wasm/arrow/tabulark_arrow_bg.wasm",
+  entrypointBundle(arrowArtifact),
+  ...wasmRuntimePaths(arrowArtifact),
+];
+const parquetRuntimePaths = [
+  entrypointBundle(parquetArtifact),
+  ...wasmRuntimePaths(parquetArtifact),
+];
+const excelRuntimePaths = [
+  entrypointBundle(excelArtifact),
+  ...wasmRuntimePaths(excelArtifact),
 ];
 
 const coreRuntimeFiles = await measurePaths(coreRuntimePaths);
 const arrowRuntimeFiles = await measurePaths(arrowRuntimePaths);
-const runtimeFiles = [...coreRuntimeFiles, ...arrowRuntimeFiles];
+const parquetRuntimeFiles = await measurePaths(parquetRuntimePaths);
+const excelRuntimeFiles = await measurePaths(excelRuntimePaths);
+const runtimeFiles = [
+  ...coreRuntimeFiles,
+  ...arrowRuntimeFiles,
+  ...parquetRuntimeFiles,
+  ...excelRuntimeFiles,
+];
 const pagesFiles = await walkFiles(resolve(repositoryRoot, "target/pages"));
 const pagesMeasured = [];
 for (const path of pagesFiles) {
@@ -37,6 +59,8 @@ const report = {
   compression: { algorithm: "brotli", quality: 11 },
   core: measuredGroup(coreRuntimeFiles),
   arrow: measuredGroup(arrowRuntimeFiles),
+  parquet: measuredGroup(parquetRuntimeFiles),
+  excel: measuredGroup(excelRuntimeFiles),
   runtime: {
     rawBytes: sum(runtimeFiles, "rawBytes"),
     brotliBytes: sum(runtimeFiles, "brotliBytes"),
@@ -56,6 +80,10 @@ const actual = {
   coreBrotli: report.core.brotliBytes,
   arrowRaw: report.arrow.rawBytes,
   arrowBrotli: report.arrow.brotliBytes,
+  parquetRaw: report.parquet.rawBytes,
+  parquetBrotli: report.parquet.brotliBytes,
+  excelRaw: report.excel.rawBytes,
+  excelBrotli: report.excel.brotliBytes,
   npmPacked: report.npm.packedBytes,
   npmUnpacked: report.npm.unpackedBytes,
   pagesRaw: report.pages.rawBytes,
@@ -154,6 +182,25 @@ async function measureNpmPackage() {
 
 function sum(values, field) {
   return values.reduce((total, value) => total + value[field], 0);
+}
+
+function requiredAdapter(id) {
+  const adapter = adapterById.get(id);
+  if (adapter === undefined) throw new Error(`official adapter manifest is missing ${id}`);
+  return adapter;
+}
+
+function entrypointBundle(adapter) {
+  const name = adapter.entrypoint === "." ? "index" : adapter.entrypoint.replace(/^\.\//u, "");
+  return `dist/${name}.js`;
+}
+
+function wasmRuntimePaths(adapter) {
+  const { outputDirectory, outputName } = adapter.wasm;
+  return [
+    `${outputDirectory}/${outputName}.js`,
+    `${outputDirectory}/${outputName}_bg.wasm`,
+  ];
 }
 
 function parseArguments(args) {

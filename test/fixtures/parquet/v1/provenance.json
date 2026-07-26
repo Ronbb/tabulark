@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "producer": "tabulark/parquet-rs and Apache parquet-testing/Impala",
+  "generator": "examples/generate_parquet_fixture.rs",
+  "files": [
+    {
+      "path": "tabulark-rust.parquet",
+      "bytes": 1703,
+      "sha256": "ff84dbaa52f35b78f858d34c870b447e713556ad6ecc3dc806d27c901496a58c",
+      "compression": "SNAPPY",
+      "rowGroups": 2,
+      "producer": "tabulark / parquet-rs 59.1.0"
+    },
+    {
+      "path": "apache-parquet-testing-alltypes-plain.parquet",
+      "bytes": 1851,
+      "sha256": "12a618d20a59ee0967fef45e7ec1ff6d451e724838edc1bbeac780ca15e8fcc4",
+      "compression": "UNCOMPRESSED",
+      "producer": "Impala version 1.3.0-INTERNAL",
+      "upstream": {
+        "repository": "https://github.com/apache/parquet-testing",
+        "revision": "2af9e9ad1c034436043867a96169fc65a91cf000",
+        "path": "data/alltypes_plain.parquet",
+        "blob": "a63f5dca7c3821909748f34752966a0d7e08d47f",
+        "license": "Apache-2.0",
+        "licenseFile": "APACHE-PARQUET-TESTING-LICENSE.txt"
+      }
+    }
+  ]
+}

@@ -1,8 +1,8 @@
-/** Version 2 introduces registered adapters and generic typed batches. */
-export const PROTOCOL_VERSION = 2 as const;
+/** Version 3 introduces multi-table presentation and discriminated adapter steps. */
+export const PROTOCOL_VERSION = 3 as const;
 
 /** Version of the private, built-in Rust adapter contract. */
-export const ADAPTER_API_VERSION = 1 as const;
+export const ADAPTER_API_VERSION = 2 as const;
 
 /** Version of the descriptor + deduplicated-buffer batch transport. */
 export const BATCH_LAYOUT_VERSION = 1 as const;
@@ -15,6 +15,8 @@ export type Operation =
   | "listTables"
   | "openTable"
   | "getMetadata"
+  | "getPresentation"
+  | "readPresentationRange"
   | "readRange"
   | "cancel"
   | "closeTable"
@@ -34,6 +36,8 @@ export type ResponseKind =
   | "tables"
   | "table"
   | "metadata"
+  | "presentation"
+  | "presentationRange"
   | "batch"
   | "acknowledged";
 
@@ -82,6 +86,8 @@ export interface ProtocolEvent<T = unknown> {
   readonly datasetHandle?: string;
   readonly tableHandle?: string;
   readonly tableId?: string;
+  /** Revision associated with a table-scoped event, when known. */
+  readonly revision?: number;
   readonly payload: T;
 }
 

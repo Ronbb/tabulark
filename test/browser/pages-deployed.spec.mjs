@@ -5,7 +5,9 @@ test.skip(
   "This smoke runs only after the GitHub Pages deployment step.",
 );
 
-test("deployed Pages opens CSV, TSV, and Arrow, switches, copies, and stays console-clean", async ({
+test.setTimeout(120_000);
+
+test("deployed Pages opens all supported local formats and stays console-clean", async ({
   context,
   page,
 }) => {
@@ -21,7 +23,7 @@ test("deployed Pages opens CSV, TSV, and Arrow, switches, copies, and stays cons
     failedRequests.push(`${request.method()} ${request.url()}: ${request.failure()?.errorText ?? "failed"}`);
   });
   page.on("request", (request) => {
-    if (request.url().includes("_bg.wasm")) wasmRequests.push(request.url());
+    if (isOfficialAdapterArtifact(request.url())) wasmRequests.push(request.url());
   });
 
   await page.goto("./");
@@ -33,8 +35,10 @@ test("deployed Pages opens CSV, TSV, and Arrow, switches, copies, and stays cons
     timeout: 20_000,
   });
   await expect(page.getByTestId("status")).toContainText("2,000 rows are ready");
-  expect(wasmRequests.filter((url) => url.includes("tabulark_delimited_bg.wasm"))).toHaveLength(1);
-  expect(wasmRequests.filter((url) => url.includes("tabulark_arrow_bg.wasm"))).toHaveLength(0);
+  expectAdapterRequests(wasmRequests, "delimited", 1);
+  expectAdapterRequests(wasmRequests, "arrow", 0);
+  expectAdapterRequests(wasmRequests, "parquet", 0);
+  expectAdapterRequests(wasmRequests, "excel", 0);
 
   await page.getByTestId("format").selectOption("tsv");
   await page.getByTestId("source-input").setInputFiles({
@@ -53,8 +57,8 @@ test("deployed Pages opens CSV, TSV, and Arrow, switches, copies, and stays cons
   await page.keyboard.press("Shift+ArrowRight");
   await page.keyboard.press("Control+C");
   await expect.poll(async () => navigatorText(page)).toBe("Ada\t部署 smoke");
-  expect(wasmRequests.filter((url) => url.includes("tabulark_delimited_bg.wasm"))).toHaveLength(1);
-  expect(wasmRequests.filter((url) => url.includes("tabulark_arrow_bg.wasm"))).toHaveLength(0);
+  expectAdapterRequests(wasmRequests, "delimited", 1);
+  expectAdapterRequests(wasmRequests, "arrow", 0);
 
   await page.getByTestId("arrow-sample-button").click();
   await expect(page.getByTestId("app")).toHaveAttribute("data-state", "ready", {
@@ -66,8 +70,8 @@ test("deployed Pages opens CSV, TSV, and Arrow, switches, copies, and stays cons
   await expect(grid).toHaveAttribute("aria-busy", "false");
   await expect(grid).toContainText("你好，Arrow");
   await expect(page.locator("[data-tabulark-view]")).toHaveCount(1);
-  expect(wasmRequests.filter((url) => url.includes("tabulark_delimited_bg.wasm"))).toHaveLength(1);
-  expect(wasmRequests.filter((url) => url.includes("tabulark_arrow_bg.wasm"))).toHaveLength(1);
+  expectAdapterRequests(wasmRequests, "delimited", 1);
+  expectAdapterRequests(wasmRequests, "arrow", 1);
   await grid.focus();
   await page.keyboard.press("Shift+ArrowRight");
   await page.keyboard.press("Control+C");
@@ -83,7 +87,38 @@ test("deployed Pages opens CSV, TSV, and Arrow, switches, copies, and stays cons
   grid = page.locator("[data-tabulark-a11y-grid]");
   await expect(grid).toHaveAttribute("aria-busy", "false");
   await expect(grid).toContainText("你好，Arrow");
-  expect(wasmRequests.filter((url) => url.includes("tabulark_arrow_bg.wasm"))).toHaveLength(1);
+  expectAdapterRequests(wasmRequests, "arrow", 1);
+
+  await openDeployedFixture(
+    page,
+    "parquet",
+    "test/fixtures/parquet/v1/tabulark-rust.parquet",
+    "application/vnd.apache.parquet",
+  );
+  await expectReady(page, "4 rows are ready");
+  await expect(page.locator("[data-tabulark-a11y-grid]")).toContainText("São Paulo");
+  expectAdapterRequests(wasmRequests, "parquet", 1);
+  expectAdapterRequests(wasmRequests, "excel", 0);
+
+  await openDeployedFixture(
+    page,
+    "xls",
+    "test/fixtures/excel/v1/tabulark-biff8.xls",
+    "application/vnd.ms-excel",
+  );
+  await expectReady(page, "1 rows are ready");
+  await expect(page.locator("[data-tabulark-a11y-grid]")).toContainText("BIFF8 smoke");
+  expectAdapterRequests(wasmRequests, "excel", 1);
+
+  await openDeployedFixture(
+    page,
+    "xlsx",
+    "test/fixtures/excel/v1/tabulark-ooxml.xlsx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  );
+  await expectReady(page, "4 rows are ready");
+  await expect(page.locator("[data-tabulark-a11y-grid]")).toContainText("城市数据");
+  expectAdapterRequests(wasmRequests, "excel", 1);
 
   expect(browserErrors).toEqual([]);
   expect(failedRequests).toEqual([]);
@@ -91,4 +126,38 @@ test("deployed Pages opens CSV, TSV, and Arrow, switches, copies, and stays cons
 
 async function navigatorText(page) {
   return (await page.evaluate(() => navigator.clipboard.readText())).replaceAll("\r\n", "\n");
+}
+
+function expectAdapterRequests(requests, adapter, count) {
+  expect(requests.filter((url) => (
+    url.includes(`/wasm/${adapter}/tabulark_${adapter}.js`)
+    || url.includes(`/wasm/${adapter}/tabulark_${adapter}_bg.wasm`)
+  ))).toHaveLength(count * 2);
+}
+
+function isOfficialAdapterArtifact(url) {
+  return /\/wasm\/(?:delimited|arrow|parquet|excel)\/tabulark_(?:delimited|arrow|parquet|excel)(?:\.js|_bg\.wasm)(?:[?#]|$)/u.test(url);
+}
+
+async function openDeployedFixture(page, format, path, mimeType) {
+  const bytes = await page.evaluate(async (relativePath) => {
+    const response = await fetch(relativePath);
+    if (!response.ok) throw new Error(`fixture request failed: ${response.status}`);
+    return [...new Uint8Array(await response.arrayBuffer())];
+  }, path);
+  await page.getByTestId("format").selectOption(format);
+  await page.getByTestId("source-input").setInputFiles({
+    name: path.split("/").at(-1),
+    mimeType,
+    buffer: Buffer.from(bytes),
+  });
+  await page.getByTestId("open-button").click();
+}
+
+async function expectReady(page, message) {
+  await expect(page.getByTestId("app")).toHaveAttribute("data-state", "ready", {
+    timeout: 30_000,
+  });
+  await expect(page.getByTestId("status")).toContainText(message);
+  await expect(page.locator("[data-tabulark-a11y-grid]")).toHaveAttribute("aria-busy", "false");
 }

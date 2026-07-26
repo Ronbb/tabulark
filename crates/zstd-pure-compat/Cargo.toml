@@ -1,0 +1,22 @@
+[package]
+name = "zstd"
+version = "0.13.3"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+description = "Narrow zstd 0.13 compatibility layer backed by pure-Rust ruzstd"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+ruzstd = { version = "=0.8.1", default-features = false, features = ["hash", "std"] }
+
+[dev-dependencies]
+# Test-only reference implementation. It is not part of the normal dependency
+# graph and lets the compatibility tests prove both interoperability directions.
+zstd-real = { package = "zstd", version = "=0.13.3", default-features = false }
+
+[workspace]
+resolver = "2"
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -1,40 +1,66 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
-  DEFAULT_MEMORY_BUDGET_BYTES,
-  MAX_ARRAY_BUFFER_BYTES,
-  MAX_RANGE_CELLS,
-  PROJECT_STATUS,
-  PROTOCOL_VERSION,
-  createEngine,
-  createTableShape,
-  delimitedAdapter,
-} from "../dist/index.js";
-import { arrowIpcAdapter } from "../dist/arrow.js";
+import * as stable from "../dist/index.js";
+import * as arrow from "../dist/arrow.js";
+import * as parquet from "../dist/parquet.js";
+import * as excel from "../dist/excel.js";
+import * as experimental from "../dist/experimental.js";
 
-test("exports the pre-alpha project status", () => {
-  assert.equal(PROJECT_STATUS, "pre-alpha");
-});
+const { createEngine, delimitedAdapter } = stable;
 
-test("creates immutable table shape metadata", () => {
-  const shape = createTableShape(12, 4);
-
-  assert.deepEqual(shape, { rows: 12, columns: 4 });
-  assert.equal(Object.isFrozen(shape), true);
-});
-
-test("rejects invalid dimensions", () => {
-  assert.throws(() => createTableShape(-1, 4), RangeError);
-  assert.throws(() => createTableShape(1.5, 4), RangeError);
-  assert.throws(() => createTableShape(Number.MAX_SAFE_INTEGER + 1, 4), RangeError);
-});
-
-test("exports the protocol-v2 limits and version", () => {
-  assert.equal(PROTOCOL_VERSION, 2);
-  assert.equal(DEFAULT_MEMORY_BUDGET_BYTES, 256 * 1024 * 1024);
-  assert.equal(MAX_ARRAY_BUFFER_BYTES, 128 * 1024 * 1024);
-  assert.equal(MAX_RANGE_CELLS, 250_000);
+test("stable and experimental runtime exports match the 0.1 API snapshot", () => {
+  assert.deepEqual(Object.keys(stable).sort(), [
+    "TabularkError",
+    "createCanvasTableView",
+    "createEngine",
+    "delimitedAdapter",
+  ]);
+  assert.deepEqual(Object.keys(arrow).sort(), ["arrowIpcAdapter"]);
+  assert.deepEqual(Object.keys(parquet).sort(), ["parquetAdapter"]);
+  assert.deepEqual(Object.keys(excel).sort(), ["excelAdapter"]);
+  assert.deepEqual(Object.keys(experimental).sort(), [
+    "CanvasTablePainter",
+    "DEFAULT_CANVAS_TABLE_THEME",
+    "DEFAULT_COLUMN_WIDTH",
+    "DEFAULT_HEADER_HEIGHT",
+    "DEFAULT_MAX_COLUMN_WIDTH",
+    "DEFAULT_MIN_COLUMN_WIDTH",
+    "DEFAULT_OVERSCAN_COLUMNS",
+    "DEFAULT_OVERSCAN_ROWS",
+    "DEFAULT_ROW_HEADER_WIDTH",
+    "DEFAULT_ROW_HEIGHT",
+    "DEFAULT_SCROLL_PIXEL_LIMIT",
+    "axisIndexAtOffset",
+    "axisPosition",
+    "axisSize",
+    "cellRect",
+    "clampCell",
+    "columnHeaderRect",
+    "containsCell",
+    "createScrollAxis",
+    "createSparseAxisGeometry",
+    "createSelection",
+    "createTableController",
+    "createTableLayout",
+    "hitTest",
+    "logicalToPhysicalOffset",
+    "moveCell",
+    "nextVisibleAxisIndex",
+    "physicalToLogicalOffset",
+    "rowHeaderRect",
+    "selectionRange",
+    "selectionRect",
+  ].sort());
+  for (const leaked of [
+    "PROTOCOL_VERSION",
+    "ADAPTER_API_VERSION",
+    "BATCH_LAYOUT_VERSION",
+    "ColumnarTableBatch",
+    "createTableController",
+  ]) {
+    assert.equal(leaked in stable, false, `${leaked} must not leak from the stable root`);
+  }
 });
 
 test("rejects engine creation outside a browser", async () => {
@@ -69,13 +95,7 @@ test("requires a unique immutable official adapter allow-list", async () => {
     },
   );
   await assert.rejects(
-    createEngine({
-      adapters: [Object.freeze({
-        id: "tabulark:delimited",
-        adapterApiVersion: 1,
-        kind: "official",
-      })],
-    }),
+    createEngine({ adapters: [Object.freeze({ id: "tabulark:delimited", kind: "official" })] }),
     (error) => {
       assert.equal(error.code, "INVALID_ARGUMENT");
       return true;
@@ -83,34 +103,38 @@ test("requires a unique immutable official adapter allow-list", async () => {
   );
 });
 
-test("official adapter IDs select fixed artifacts across root and arrow entrypoints", async () => {
+test("official adapter IDs select fixed manifest artifacts across all stable entrypoints", async () => {
   const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
   Object.defineProperty(globalThis, "Worker", {
     configurable: true,
     writable: true,
     value: AdapterCaptureWorker,
   });
-  const marker = Symbol.for("tabulark.official-adapter.v1");
+  const marker = Symbol.for("tabulark.official-adapter.v2");
   const injectedUrl = "data:text/javascript,throw new Error('injected')";
   const forgedDelimited = Object.freeze({
     id: "tabulark:delimited",
-    adapterApiVersion: 1,
     kind: "official",
+    moduleUrl: injectedUrl,
     [marker]: Object.freeze({ id: "tabulark:delimited", moduleUrl: injectedUrl }),
   });
 
   let engine;
   try {
-    engine = await createEngine({ adapters: [forgedDelimited, arrowIpcAdapter] });
+    engine = await createEngine({
+      adapters: [forgedDelimited, arrow.arrowIpcAdapter, parquet.parquetAdapter, excel.excelAdapter],
+    });
     const hello = AdapterCaptureWorker.latest.requests.find((request) => request.op === "hello");
     assert.ok(hello);
     assert.deepEqual(hello.payload.adapters.map((adapter) => adapter.id), [
       "tabulark:delimited",
       "tabulark:arrow-ipc",
+      "tabulark:parquet",
+      "tabulark:excel",
     ]);
-    assert.match(hello.payload.adapters[0].moduleUrl, /\/wasm\/delimited\/tabulark_delimited\.js$/);
-    assert.match(hello.payload.adapters[1].moduleUrl, /\/wasm\/arrow\/tabulark_arrow\.js$/);
-    assert.notEqual(hello.payload.adapters[0].moduleUrl, injectedUrl);
+    assert.equal(hello.payload.adapters.every((adapter) => Object.keys(adapter).length === 1), true);
+    assert.equal(hello.payload.adapters.some((adapter) => "moduleUrl" in adapter), false);
+    assert.equal(JSON.stringify(hello.payload).includes(injectedUrl), false);
   } finally {
     await engine?.close();
     if (originalWorker) Object.defineProperty(globalThis, "Worker", originalWorker);
@@ -118,7 +142,7 @@ test("official adapter IDs select fixed artifacts across root and arrow entrypoi
   }
 });
 
-test("delimited adapter options reject structural CSV bytes as delimiters", async () => {
+test("delimited options reject structural CSV bytes as delimiters", async () => {
   const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
   Object.defineProperty(globalThis, "Worker", {
     configurable: true,
@@ -177,8 +201,8 @@ class AdapterCaptureWorker {
     const kind = request.op === "hello" ? "hello" : "acknowledged";
     const data = request.op === "hello"
       ? {
-          protocolVersion: 2,
-          adapterApiVersion: 1,
+          protocolVersion: 3,
+          adapterApiVersion: 2,
           batchLayoutVersion: 1,
           adapters: request.payload.adapters.map((adapter) => adapter.id),
           transferableBatches: true,
@@ -186,7 +210,7 @@ class AdapterCaptureWorker {
       : undefined;
     queueMicrotask(() => {
       const response = {
-        protocolVersion: 2,
+        protocolVersion: 3,
         requestId: request.requestId,
         status: "success",
         result: data === undefined ? { kind } : { kind, data },

@@ -105,5 +105,86 @@ impl Display for TabularkError {
 
 impl Error for TabularkError {}
 
+/// Recognizes the bounded pure-Rust Zstd compatibility layer's resource-limit
+/// diagnostics after Arrow or Parquet has wrapped them in its own error text.
+///
+/// The shim intentionally uses stable decimal messages because the upstream
+/// `zstd` API exposes only `io::Error`. Keep this parser narrow so malformed
+/// frames, checksums, and unrelated decoder failures remain `PARSE_FAILED`.
+#[cfg(any(test, feature = "arrow"))]
+pub(crate) fn zstd_decompression_limit_error(message: &str) -> Option<TabularkError> {
+    let mut fields = message
+        .split_once("zstd resource limit: ")?
+        .1
+        .split_ascii_whitespace();
+    if !matches!(fields.next(), Some("output" | "window")) || fields.next() != Some("required") {
+        return None;
+    }
+    let required = fields.next()?.parse::<u64>().ok()?;
+    if fields.next() != Some("available") {
+        return None;
+    }
+    let available = fields.next()?.parse::<u64>().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+
+    Some(
+        TabularkError::new(
+            ErrorCode::ResourceLimit,
+            "Zstd decompression exceeds the configured resource limit",
+        )
+        .with_detail("resource", "decompression")
+        .with_detail("requiredBytes", required)
+        .with_detail("availableBytes", available),
+    )
+}
+
 /// Result type used throughout the crate.
 pub type Result<T> = std::result::Result<T, TabularkError>;
+
+#[cfg(test)]
+mod tests {
+    use super::{ErrorCode, zstd_decompression_limit_error};
+
+    #[test]
+    fn maps_bounded_zstd_output_and_window_messages_to_resource_limits() {
+        for (message, required, available) in [
+            (
+                "Ipc error: zstd resource limit: output required 8192 available 4096",
+                8192,
+                4096,
+            ),
+            (
+                "External: zstd resource limit: window required 1048576 available 524288",
+                1_048_576,
+                524_288,
+            ),
+            (
+                "zstd resource limit: output required 1536 available 1024",
+                1536,
+                1024,
+            ),
+        ] {
+            let error = zstd_decompression_limit_error(message).expect("recognized shim limit");
+            assert_eq!(error.code(), ErrorCode::ResourceLimit);
+            assert_eq!(error.details()["resource"], "decompression");
+            assert_eq!(error.details()["requiredBytes"], required);
+            assert_eq!(error.details()["availableBytes"], available);
+        }
+    }
+
+    #[test]
+    fn leaves_non_limit_and_ambiguous_zstd_failures_unclassified() {
+        for message in [
+            "zstd content checksum mismatch",
+            "zstd frame declared 12 output bytes but decoded 8",
+            "zstd resource limit: output required unknown available 12",
+            "zstd resource limit: output required 13 available 12 trailing",
+            "zstd resource limit: dictionary required 13 available 12",
+            "zstd resource limit: output available 12 required 13",
+        ] {
+            assert!(zstd_decompression_limit_error(message).is_none());
+        }
+    }
+}
