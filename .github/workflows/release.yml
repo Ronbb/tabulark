@@ -57,6 +57,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.85.0
+          targets: wasm32-unknown-unknown
 
       # Install stable last so every unqualified cargo invocation below,
       # including the ones spawned by npm scripts, uses the release toolchain.

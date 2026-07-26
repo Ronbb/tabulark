@@ -30,6 +30,10 @@ test("release tags cannot bypass main, prerequisite runs, or protected environme
     3,
     "every direct crates.io request must send the release workflow user agent",
   );
+  assert.match(
+    workflow,
+    /name: Install Rust 1\.85 MSRV[\s\S]*?toolchain: 1\.85\.0\s*\n\s+targets: wasm32-unknown-unknown/u,
+  );
 
   const approvalJob = workflow.slice(
     workflow.indexOf("  approve-npm:"),
