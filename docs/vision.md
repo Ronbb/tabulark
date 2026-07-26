@@ -1,7 +1,9 @@
 # Vision
 
-> Tabulark's four-format 0.1.0 implementation is a release candidate. It has
-> not been tagged or published to npm or crates.io.
+> Tabulark's four-format 0.1.0 implementation is released. The immutable tag,
+> registry provenance, and artifact checksums are recorded in
+> [release-0.1.0-evidence.md](release-0.1.0-evidence.md); 0.1.1 compatibility
+> additions and the separately gated M6 work continue on new commits.
 
 Tabulark is a browser-native table preview engine: a small, composable layer
 between local tabular bytes and an application's table UI. It should make the
@@ -25,7 +27,7 @@ Parquet, or Excel. Official adapters normalize datasets, tables, schemas,
 capabilities, ranges, logical batches, errors, presentation, and lifecycle
 while keeping format-specific options and parsing behind their boundary.
 
-The 0.1.0 candidate validates that shape with four independently loadable
+The 0.1.0 release validates that shape with four independently loadable
 Rust/WASM adapters:
 
 - CSV/TSV through `tabulark:delimited`.
@@ -92,9 +94,10 @@ reservation is released on success, failure, cancellation, or close. A budget
 error identifies the constrained resource and required/available capacity.
 
 Format readers should also avoid unnecessary work: Parquet fetches only the
-footer, metadata, selected row groups, and projected column chunks, while Excel
-declares and validates the cost of its bounded whole-workbook staging before it
-allocates.
+footer, metadata, selected row groups, and projected column chunks. The
+compatibility Excel path declares and validates bounded staging before it
+allocates; M6 extends that discipline to resumable ZIP/CFB range reads once the
+separate parser gate is complete.
 
 ### Accessibility is rendering architecture
 
@@ -104,27 +107,28 @@ copy, merged hit regions, and resizing belong to the view contract. Forced
 colors, reduced motion, touch targets, and small-screen layouts are release
 gates rather than optional polish.
 
-Chromium is the sole formal browser gate for 0.1.0. Firefox and WebKit support
+Chromium is the formal browser gate for the released line. Firefox and WebKit support
 will be claimed only after their own reproducible validation exists.
 
 ### Evidence precedes release labels
 
-Implementation is not publication. A release candidate must have versioned and
+Implementation is not publication. A release must have versioned and
 independently produced fixtures, protocol and lifecycle conformance, fuzz seed
 replay, browser behavior, accessibility and visual checks, size/performance
 measurements, clean packed consumers, an assembled package and Pages site, and
 a real deployed-URL smoke attributable to the same revision.
 
-The M4 record is frozen at `1d79837`; it does not stand in for the expanded
-four-adapter matrix. The 0.1.0 label becomes a release only after the protected
-pre-tag and registry delivery process succeeds.
+The M4 record is frozen at `1d79837`; the completed 0.1.0 artifact record is
+separate and immutable. A patch release must use a new tag and the protected
+OIDC delivery process.
 
-## Direction after 0.1.0
+## Direction after 0.1.1 and M6
 
 Once the stable boundary has real-world feedback, compatible 0.1.x additions
 can improve supported logical types, presentation fidelity, diagnostics, and
-performance without exposing the private transport. Larger capabilities remain
-separate design decisions:
+performance without exposing the private transport. M6's large-file foundation
+is the next separately budgeted capability. Larger capabilities remain separate
+design decisions:
 
 - Firefox and WebKit validation.
 - Explicit remote range and streaming sources.

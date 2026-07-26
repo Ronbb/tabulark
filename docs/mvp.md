@@ -1,9 +1,9 @@
 # MVP and milestone status
 
-> **Current status: M4 complete; M5 is an unreleased 0.1.0 release
-> candidate.** M4's CI, GitHub Pages deployment, and deployed-URL smoke
-> succeeded for `1d79837`. The repository's 0.1.0 version fields do not mean a
-> `v0.1.0` tag exists or that npm/crates.io publication has occurred.
+> **Current status: 0.1.0 released; 0.1.1 stabilization and M6 are active.**
+> The immutable `v0.1.0` artifact and registry evidence is recorded in
+> [`release-0.1.0-evidence.md`](release-0.1.0-evidence.md). M6 is a separately
+> gated 2 GiB local-Blob effort and does not move or reuse that tag.
 
 ## Product boundary
 
@@ -13,7 +13,7 @@ through an explicitly selected official adapter in a Worker, exposes bounded
 dataset/table/range APIs, and renders a keyboard-accessible Canvas viewport
 with a bounded semantic grid.
 
-The 0.1.0 candidate contains exactly four official adapter IDs:
+The 0.1.0 release contains exactly four official adapter IDs:
 
 - `tabulark:delimited` for CSV/TSV.
 - `tabulark:arrow-ipc` for Arrow IPC File/Stream.
@@ -69,10 +69,10 @@ and an independently lazy WASM artifact.
 
 M4's required Rust, protocol-v2, fixture, browser, performance, packed-package,
 Pages, deployment, and real deployed-URL evidence is complete and frozen in
-[`m4-completion.md`](m4-completion.md). That evidence is historical: it does
-not claim that the later 0.1.0 format matrix has shipped.
+[`m4-completion.md`](m4-completion.md). The final 0.1.0 release evidence is in
+[`release-0.1.0-evidence.md`](release-0.1.0-evidence.md).
 
-## M5: 0.1.0 release candidate
+## M5: 0.1.0 release
 
 ### Official adapter host and lifecycle
 
@@ -136,24 +136,40 @@ remain out of scope.
 
 ### Delivery evidence
 
-The candidate adds independently produced and SHA-locked Parquet and Excel
+The release adds independently produced and SHA-locked Parquet and Excel
 fixtures, four lifecycle fuzz targets, real-WASM conformance, stable export and
 declaration snapshots, Node 20/22/24 clean consumers, Rust 1.85/stable checks,
 and separate Parquet/Excel size groups. Chromium is the sole 0.1.0 browser
 gate. The assembled and deployed Pages tests open CSV, TSV, Arrow, Parquet,
 XLS, and XLSX while proving that only the selected adapter artifact loads.
 
+### 0.1.1 compatible additions
+
+The patch line adds bounded structured diagnostics and independent diagnostic
+subscriptions, logical dataset/table capability snapshots, opt-in privacy-safe
+performance samples, and a Canvas `colorScheme` option. Existing event unions,
+logical batch fields, and adapter selection remain compatible.
+
+## M6: 2 GiB local-file foundation
+
+M6 defines 2 GiB as exactly `2,147,483,648` bytes. `sourceMode: "large"` is an
+opt-in host policy for local `File`/`Blob` sources; it never raises the bounded
+`ArrayBuffer` staging limit or reserves memory proportional to source size.
+Reads remain range/stream based, offsets are checked as safe 64-bit values, and
+an over-limit source is rejected before adapter startup with structured
+`RESOURCE_LIMIT` details. The 0.1.1 tree contains bounded range plumbing for
+CSV, Arrow, and Parquet plus a private range-backed OOXML (`format: "xlsx"`)
+prototype; BIFF8 CFB support and the four-format generated-container gates
+remain active M6 work. No 0.2.0 tag is created until those gates pass.
+
 ## Release boundary
 
-M5 is not complete merely because implementation or local tests are green.
+M5 was not complete merely because implementation or local tests were green.
 The same commit must pass CI, Pages assembly/deployment, the actual deployed-URL
 smoke, format/lifecycle/budget/fuzz/size gates, clean consumers, registry
-availability and ownership checks, and trusted-publisher confirmation. Only
-then may `v0.1.0` trigger protected crates.io -> npm -> GitHub Release ->
-registry-smoke delivery. See [`testing.md`](testing.md) and
-[`releasing.md`](releasing.md).
-
-No release tag has been created and 0.1.0 has not been published.
+availability and ownership checks, and trusted-publisher confirmation. That
+process completed for 0.1.0; future patch releases use a new immutable tag.
+See [`testing.md`](testing.md) and [`releasing.md`](releasing.md).
 
 ## Out of scope for 0.1.0
 

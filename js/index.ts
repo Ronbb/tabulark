@@ -2,13 +2,17 @@
 export { createEngine } from "./client.js";
 export { delimitedAdapter } from "./adapters.js";
 export type {
+  DatasetCapabilities,
   DatasetEvent,
   DatasetSession,
   EngineOptions,
   OpenSourceOptions,
+  PerformanceSample,
   ReadRangeOptions,
   RuntimeProgress,
+  SourceMode,
   SourceWarning,
+  TabularkDiagnostic,
   TableEvent,
   TableHandle,
   TabularkEngine,

@@ -1,11 +1,13 @@
-# Testing and release-candidate validation
+# Testing, release validation, and M6 gates
 
 > **M4 evidence is frozen.** Commit `1d79837` passed CI, GitHub Pages
 > deployment, and the deployed-URL smoke test; the exact record remains in
-> [`m4-completion.md`](m4-completion.md). The current tree is the 0.1.0 release
-> candidate, not a tagged or published npm/crates.io release.
+> [`m4-completion.md`](m4-completion.md). The 0.1.0 release is complete; exact
+> tag, registry, Pages, recovery, and checksum evidence is in
+> [`release-0.1.0-evidence.md`](release-0.1.0-evidence.md). The current tree
+> contains the compatible 0.1.1 line and separately gated M6 work.
 
-## Release-candidate scope
+## Stable release scope
 
 The active matrix covers four official, independently lazy Rust/WASM adapters:
 
@@ -206,6 +208,8 @@ Playwright exercises the real module Worker and all four real WASM artifacts:
 - Canvas virtualization, scrolling, resize, terminal errors, CJK paint and
   measurement, axe WCAG 2.1 A/AA scans, forced colors, reduced motion, mobile
   layouts, visible focus, and 44px touch controls remain release gates.
+- `large-excel.spec.mjs` exercises the private range-backed OOXML path with a
+  real XLSX fixture and verifies that the Excel WASM artifact is not loaded.
 
 Strict visual snapshots run on Ubuntu 24.04 at one device pixel per CSS pixel.
 They stabilize Canvas geometry rather than claiming cross-platform glyph
@@ -270,9 +274,40 @@ that same verified npm tarball with provenance, creates the GitHub Release, and
 smoke-tests the registry package on Node 20/22/24, and compiles/runs a clean
 Cargo consumer against the exact crates.io version.
 
-None of those delivery steps has run for 0.1.0 yet. Do not create `v0.1.0` or
-describe 0.1.0 as published until the exact candidate commit has green CI and
-Pages/deployed smoke evidence and every pre-tag check in
-[`releasing.md`](releasing.md) succeeds. A local green run is useful evidence,
-but it neither replaces the protected release approvals nor publishes a
-registry version.
+Those delivery steps completed for 0.1.0; see the frozen evidence record before
+using its artifacts. A local green run is useful evidence, but it neither
+replaces protected release approvals nor authorizes moving an existing tag.
+Patch releases must use a new immutable tag. M6's real 2 GiB gate is recorded
+separately and is not satisfied by the small Pages smoke.
+
+## M6 large-file gate
+
+The binary source ceiling is exactly `2 * 1024^3 = 2,147,483,648` bytes. CI
+creates and removes sparse, valid containers in sequence; no giant fixture is
+committed. Every format must exercise a first viewport and a non-adjacent or
+greater-than-`2^31` range where the container permits it. The gate records the
+fixed Chromium version, first-view latency, bytes read, peak reservation, and
+failure trace.
+
+The host must pass the original `File`/`Blob` to `engine.open()` in
+`sourceMode: "large"`. It may call `Blob.slice()` only for bounded reads; a
+whole-source `arrayBuffer()`, `FileReader`, upload, or source-sized budget
+reservation fails review. Over-limit inputs are rejected before adapter load
+with `RESOURCE_LIMIT` details `{ resource, requiredBytes, availableBytes }`.
+
+The independent M6 budget is:
+
+| Resource | Gate |
+| --- | --- |
+| Source size | at most 2,147,483,648 bytes |
+| Engine retained working set | at most configured 256 MiB |
+| Core/Arrow existing budgets | unchanged |
+| Index/cache/decoded batches | bounded and released exactly once on cancel, failure, and close |
+
+The planned Excel ZIP64/CFB large-offset fixtures additionally cover compressed
+and stored entries, cached formulas, merges, hidden sheets, styles, unsafe
+paths, entity expansion, entry counts, and declared expansion ceilings. The
+current 0.1.1 tree has not yet passed those generated-container gates (the
+OOXML prototype test is not a 2 GiB or CFB acceptance gate); until
+all four real format gates pass, M6 remains unreleased and no 0.2.0 tag is
+created.

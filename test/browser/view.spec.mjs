@@ -15,6 +15,7 @@ async function openSample(page) {
 test.describe("Canvas table view", () => {
   test("renders a visual Canvas with a bounded semantic viewport", async ({ page }) => {
     const { view, grid } = await openSample(page);
+    await expect(view).toHaveAttribute("data-tabulark-color-scheme", "light");
     const canvas = view.locator("canvas.tabulark-canvas");
 
     await expect(canvas).toHaveAttribute("aria-hidden", "true");
@@ -36,6 +37,109 @@ test.describe("Canvas table view", () => {
     // The semantic tree represents only visible/overscan cells, never all 2,000 rows.
     expect(await grid.locator('[role="row"]').count()).toBeLessThan(100);
     expect(await grid.locator('[role="gridcell"]').count()).toBeLessThan(600);
+  });
+
+  test("keeps the Playground Canvas and page palette in sync while auto-switching", async ({
+    page,
+  }) => {
+    let paintCount = 0;
+    await page.addInitScript(() => {
+      const prototype = CanvasRenderingContext2D.prototype;
+      const original = prototype.clearRect;
+      prototype.clearRect = function (...args) {
+        if (this.canvas?.matches?.("[data-tabulark-canvas]")) {
+          globalThis.__tabularkThemePaintCount =
+            (globalThis.__tabularkThemePaintCount ?? 0) + 1;
+        }
+        return original.apply(this, args);
+      };
+    });
+    await page.emulateMedia({ colorScheme: "dark", forcedColors: "none" });
+    const opened = await openSample(page);
+    const view = opened.view;
+    await expect(view).toHaveAttribute("data-tabulark-color-scheme", "dark");
+    await expect.poll(() => page.evaluate(() => (
+      globalThis.__tabularkThemePaintCount ?? 0
+    ))).toBeGreaterThan(0);
+    const darkSurface = await view.evaluate((element) => ({
+      background: getComputedStyle(element).backgroundColor,
+      color: getComputedStyle(element).color,
+    }));
+    expect(darkSurface.background).toBe("rgb(24, 34, 53)");
+    expect(darkSurface.color).toBe("rgb(237, 240, 247)");
+    const beforeSwitch = await page.evaluate(() => globalThis.__tabularkThemePaintCount ?? 0);
+
+    await page.emulateMedia({ colorScheme: "light", forcedColors: "none" });
+    await expect(view).toHaveAttribute("data-tabulark-color-scheme", "light");
+    await expect.poll(() => page.evaluate(() => (
+      globalThis.__tabularkThemePaintCount ?? 0
+    ))).toBeGreaterThan(beforeSwitch);
+    const lightSurface = await view.evaluate((element) => ({
+      background: getComputedStyle(element).backgroundColor,
+      color: getComputedStyle(element).color,
+    }));
+    expect(lightSurface.background).toBe("rgb(255, 255, 255)");
+    expect(lightSurface.color).toBe("rgb(23, 32, 51)");
+  });
+
+  test("keeps the compatibility default light and supports an explicit dark palette", async ({
+    page,
+  }) => {
+    await page.emulateMedia({ colorScheme: "dark", forcedColors: "none" });
+    await page.goto("/test/browser/harness.html");
+    const result = await page.evaluate(async () => {
+      const { createCanvasTableView, createEngine, delimitedAdapter } = await import("/dist/index.js");
+      const host = document.createElement("div");
+      const darkHost = document.createElement("div");
+      Object.assign(host.style, { height: "240px", width: "440px" });
+      Object.assign(darkHost.style, { height: "240px", width: "440px" });
+      document.body.replaceChildren(host, darkHost);
+
+      const engine = await createEngine({ adapters: [delimitedAdapter] });
+      const dataset = await engine.open(new Blob(["name,value\nalpha,1\nbeta,2\n"]), {
+        adapter: delimitedAdapter,
+        adapterOptions: { dialect: "csv", header: "first-row", mode: "strict" },
+      });
+      const table = await dataset.openTable(dataset.tables[0].id);
+      const compatibilityView = createCanvasTableView({
+        container: host,
+        presentation: "ignore",
+        table,
+      });
+      const explicitDarkView = createCanvasTableView({
+        colorScheme: "dark",
+        container: darkHost,
+        presentation: "ignore",
+        table,
+      });
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const readSurface = (element) => ({
+        background: getComputedStyle(element).backgroundColor,
+        color: getComputedStyle(element).color,
+        scheme: element.dataset.tabularkColorScheme,
+      });
+      const output = {
+        compatibility: readSurface(compatibilityView.element),
+        explicitDark: readSurface(explicitDarkView.element),
+      };
+      explicitDarkView.destroy();
+      compatibilityView.destroy();
+      await table.close();
+      await dataset.close();
+      await engine.close();
+      return output;
+    });
+
+    expect(result.compatibility).toEqual({
+      background: "rgb(255, 255, 255)",
+      color: "rgb(23, 32, 51)",
+      scheme: "light",
+    });
+    expect(result.explicitDark).toEqual({
+      background: "rgb(24, 34, 53)",
+      color: "rgb(237, 240, 247)",
+      scheme: "dark",
+    });
   });
 
   test("supports keyboard range selection and copy as TSV", async ({ context, page }) => {

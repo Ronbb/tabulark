@@ -637,22 +637,33 @@ export function validateRange(request: RangeRequest): RangeRequest {
     assertNonNegativeSafeInteger(value, name);
   }
   if (
-    !Number.isSafeInteger(request.rowStart + request.rowCount)
-    || !Number.isSafeInteger(request.columnStart + request.columnCount)
+    request.rowCount > Number.MAX_SAFE_INTEGER - request.rowStart
+    || request.columnCount > Number.MAX_SAFE_INTEGER - request.columnStart
   ) {
     throw new TabularkError("INVALID_RANGE", "Range end must be a safe integer");
   }
   const cells = request.rowCount * request.columnCount;
-  if (!Number.isSafeInteger(cells) || cells > MAX_RANGE_CELLS) {
+  // Bound each dimension as well as the product. A zero-height/zero-width
+  // range still reaches adapter loops and must not smuggle an unbounded axis
+  // through the `0 * Number.MAX_SAFE_INTEGER` product.
+  if (
+    request.rowCount > MAX_RANGE_CELLS
+    || request.columnCount > MAX_RANGE_CELLS
+    || !Number.isSafeInteger(cells)
+    || cells > MAX_RANGE_CELLS
+  ) {
+    const required = Number.isSafeInteger(cells)
+      ? Math.max(cells, request.rowCount, request.columnCount)
+      : Number.MAX_SAFE_INTEGER;
     throw new TabularkError(
       "RESOURCE_LIMIT",
       `A range may contain at most ${MAX_RANGE_CELLS} cells`,
       {
         details: {
           resource: "range-cells",
-          required: cells,
+          required,
           available: MAX_RANGE_CELLS,
-          cells,
+          cells: Number.isSafeInteger(cells) ? cells : Number.MAX_SAFE_INTEGER,
           limit: MAX_RANGE_CELLS,
         },
       },

@@ -1,10 +1,10 @@
 # Tabulark
 
-> **Status: M4 complete; 0.1.0 release candidate in progress.** The M4
-> CSV/TSV and Apache Arrow IPC milestone completed at `1d79837`, including CI,
-> GitHub Pages, and a deployed-URL smoke. The package has not yet been published
-> as 0.1.0; see the [M4 completion record](docs/m4-completion.md) and the
-> [release policy](docs/releasing.md).
+> **Status: 0.1.0 released; 0.1.1 stabilization and M6 are in progress.**
+> The immutable `v0.1.0` tag and its registry/Pages evidence are recorded in
+> [the release evidence](docs/release-0.1.0-evidence.md). The 0.1.1 line adds
+> compatible diagnostics, capability queries, performance observation, and
+> synchronized Canvas themes. M6 is separately gated 2 GiB local-Blob work.
 
 Tabulark is a WebAssembly-first browser primitive for previewing local tabular
 data without uploading it. A module Worker owns parsing, bounded byte access,
@@ -65,6 +65,7 @@ const engine = await createEngine({
 
 const csv = await engine.open(csvFile, {
   adapter: delimitedAdapter,
+  sourceMode: "auto", // use "large" for a local File/Blob up to 2 GiB
   adapterOptions: {
     dialect: "csv",
     header: "first-row",
@@ -83,13 +84,30 @@ const workbook = await engine.open(excelFile, {
 });
 ```
 
-Adapter selection is explicit. Excel's `format: "auto"` and Arrow's
+In the stable API, adapter selection is explicit. Excel's `format: "auto"` and Arrow's
 `container: "auto"` inspect source bytes; filename extensions never select or
 authenticate a format.
+
+The bundled playground is a convenience layer: it uses the local file name,
+MIME type, and (when needed) a bounded signature read to choose the explicit
+adapter call for you. Applications using the stable API should continue to
+select and register an adapter themselves.
 
 `ArrayBuffer` ownership is retained by default. Set `transferInput: true` only
 when intentionally detaching an `ArrayBuffer`; using it with a `Blob` or
 `File` returns `INVALID_ARGUMENT`.
+
+`sourceMode: "auto"` keeps the conservative source policy. The opt-in
+`sourceMode: "large"` path accepts a local `File`/`Blob` no larger than
+`2,147,483,648` bytes (2 GiB); it does not raise the existing `ArrayBuffer`
+staging limit or allocate a work set proportional to the file. A larger source
+fails before an open request is sent to the Worker, with `RESOURCE_LIMIT` details containing
+`resource`, `requiredBytes`, and `availableBytes`.
+
+The range-backed large-mode Excel path currently covers OOXML `format: "xlsx"`.
+BIFF8 `format: "xls"` remains on the bounded compatibility staging path until
+the separate CFB large-offset gate passes; use the capability snapshot rather
+than assuming every Excel container is eligible for 2 GiB range access.
 
 ### Tables, logical batches, and presentation
 
@@ -225,7 +243,8 @@ npm run benchmark:size
 npm run benchmark:formats
 ```
 
-Chromium is the sole formal 0.1.0 browser gate. CI records its exact version.
+Chromium remains the formal browser gate. CI records its exact version for each
+release line; the 0.1.0 value is preserved in the release evidence record.
 The Pages post-deploy smoke opens CSV, Arrow IPC, Parquet, XLS, and XLSX and
 asserts that only used adapter artifacts were requested.
 
@@ -236,9 +255,10 @@ compatible additions are allowed, but removals and breaking changes wait for
 0.2.0. Rust APIs, the Worker protocol, adapter ABI, wire DTOs, and
 `/experimental` remain experimental/private.
 
-No `v0.1.0` tag is created until every release gate and registry/OIDC
-precondition passes. npm and crates.io publishing is serialized behind protected
-GitHub Environments with required reviewer approval. See
+The `v0.1.0` tag is immutable and must never be moved or reused. npm and
+crates.io publishing is serialized behind protected GitHub Environments with
+required reviewer approval; recovery finalizes artifacts without republishing.
+See
 [docs/releasing.md](docs/releasing.md) for the immutable-release and patch
 recovery policy.
 

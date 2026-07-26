@@ -20,10 +20,12 @@ a registry release.
   [https://ronbb.github.io/tabulark/](https://ronbb.github.io/tabulark/).
 
 The evidence above covers the M4 CSV/TSV and Arrow IPC delivery surface only.
-It must not be used as evidence for Parquet, Excel, or the later 0.1.0 release
-train; those have their own gates in `docs/releasing.md`.
+It remains historical and must not be substituted for the final 0.1.0 record
+or the M6 gates; the final artifact evidence is in
+[`release-0.1.0-evidence.md`](release-0.1.0-evidence.md).
 
 ## Registry state
 
-At the time this record was written, `tabulark` 0.1.0 was absent from npm and
-crates.io. Existing 0.0.4 registry packages do not constitute a 0.1.0 release.
+At the time this historical record was written, `tabulark` 0.1.0 was absent
+from npm and crates.io. That statement is not current registry status; see the
+final release evidence for the completed publication.

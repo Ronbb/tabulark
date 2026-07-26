@@ -1,9 +1,9 @@
 # Architecture
 
-> **M4 is complete; this document describes the 0.1.0 release-candidate
-> architecture.** The prior M4 CI, Pages, and deployed smoke evidence is frozen
-> in [m4-completion.md](m4-completion.md). It is not evidence that 0.1.0 has
-> been published.
+> **0.1.0 is released; this document describes the 0.1.1/M6 architecture.**
+> The immutable tag and artifact evidence are frozen in
+> [release-0.1.0-evidence.md](release-0.1.0-evidence.md). M6's 2 GiB path is
+> still gated independently and does not alter `v0.1.0`.
 
 ## Boundary and invariants
 
@@ -51,9 +51,11 @@ Canvas viewport + bounded ARIA grid + copy/keyboard interaction
 
 `createEngine({ adapters })` validates and freezes the selected official
 allow-list but does not fetch WASM. The first open for a descriptor imports its
-glue and artifact; concurrent first opens coalesce. The Worker never parses a
-format in JavaScript. It only brokers bounded source bytes, drives the adapter
-operation state machine, validates opaque transport values, and owns cleanup.
+glue and artifact; concurrent first opens coalesce. The compiled adapters are
+not reimplemented on the main thread. The explicit M6 large-mode OOXML path is
+the one private exception: its Worker host parser reads ZIP/ZIP64 ranges and
+drives the same adapter seam. In every path the Worker brokers bounded source
+bytes, validates opaque transport values, and owns cleanup.
 
 ## Private protocol and adapter ABI
 
@@ -151,7 +153,12 @@ signature—not extension—selects XLS versus XLSX. XLS is limited to Excel
 97–2003 BIFF8; XLSM, XLSB, ODS, earlier BIFF, and encrypted workbooks return
 `UNSUPPORTED_FEATURE`.
 
-Excel stages a bounded full workbook before opening worksheets. It validates
+The compatibility path stages a bounded workbook before opening worksheets.
+Large-mode OOXML `format: "xlsx"` now has a private resumable ZIP/ZIP64
+range-backed host parser; it reads only bounded tail, central-directory, and
+selected entry ranges. BIFF8 CFB range access remains a separately gated target.
+The completed range adapters never turn a large source into an `ArrayBuffer` or
+reserve the source size as their working set. The Excel target validates
 ZIP/CFB entry counts and sizes, total ZIP expansion, worksheet dimensions and
 cells, styles, layout entries, and merge count; unsafe relationship paths,
 external XML entities/DOCTYPE, and compression-bomb conditions fail before

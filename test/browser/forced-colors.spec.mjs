@@ -38,6 +38,7 @@ test.describe("forced-colors Canvas table contract", () => {
     });
     await page.emulateMedia({ forcedColors: "none" });
     const { grid, view } = await openSample(page);
+    await expect(view).toHaveAttribute("data-tabulark-color-scheme", "light");
     await expect(view).toHaveAttribute("data-tabulark-forced-colors", "none");
 
     await page.emulateMedia({ forcedColors: "active" });

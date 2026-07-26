@@ -30,6 +30,29 @@ interface RawWasmRuntime {
   free?(): void;
 }
 
+/** Private runtime seam shared by the compiled adapters and range-backed hosts. */
+export interface AdapterRuntime {
+  /** True for the legacy WASM path that retains a staged workbook source. */
+  readonly retainsSourceBytes?: boolean;
+  metadata(sourceHandle: string | number): unknown | Promise<unknown>;
+  presentation(tableHandle: string | number): unknown | Promise<unknown>;
+  readPresentationRange(tableHandle: string | number, request: unknown): unknown | Promise<unknown>;
+  beginOpen(options: unknown, sourceLength: number): unknown | Promise<unknown>;
+  continueOperation(
+    operationHandle: string | number,
+    absoluteOffset: number,
+    bytes: Uint8Array,
+    eof: boolean,
+  ): unknown | Promise<unknown>;
+  openTable(sourceHandle: string | number, tableId: string): unknown | Promise<unknown>;
+  beginRead(tableHandle: string | number, request: unknown): unknown | Promise<unknown>;
+  cancelOperation(operationHandle: string | number): unknown;
+  closeTable(tableHandle: string | number): unknown;
+  closeSource(sourceHandle: string | number): unknown;
+  shutdown(): unknown;
+  dispose?(): void;
+}
+
 interface WasmBindings {
   default(input?: unknown): Promise<unknown> | unknown;
   WasmRuntime?: new (config: unknown) => RawWasmRuntime;
@@ -80,7 +103,8 @@ export type AdapterOperationStep = AdapterOpenStep | AdapterReadStep;
  * Bulk arrays are copied by the Worker before they are transferred, never by
  * this adapter, so the runtime may safely return views into WebAssembly memory.
  */
-export class WasmAdapter {
+export class WasmAdapter implements AdapterRuntime {
+  readonly retainsSourceBytes = true;
   readonly #runtime: RawWasmRuntime;
 
   private constructor(runtime: RawWasmRuntime) {
@@ -183,9 +207,13 @@ export class WasmAdapter {
     this.#call("closeSource", () => this.#runtime.closeSource(sourceHandle));
   }
 
+  shutdown(): void {
+    this.#call("shutdown", () => this.#runtime.shutdown());
+  }
+
   dispose(): void {
     try {
-      this.#runtime.shutdown();
+      this.shutdown();
     } catch {
       // free() still owns the wasm-bindgen allocation after shutdown failure.
     }

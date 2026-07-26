@@ -4,6 +4,42 @@ const localPages = "/target/pages/index.html";
 
 test.setTimeout(120_000);
 
+test("playground auto-selects XLSX adapter when an uploaded file has no manual format choice", async ({ page }) => {
+  const wasmRequests = [];
+  page.on("request", (request) => {
+    if (isOfficialAdapterArtifact(request.url())) wasmRequests.push(request.url());
+  });
+  await page.goto(localPages);
+  await expect(page.getByTestId("app")).toHaveAttribute("data-state", "idle");
+
+  // The playground starts on CSV. Uploading an OOXML workbook must update the
+  // format control from the file metadata before Open preview is pressed;
+  // this is the path users take when they simply choose a local .xlsx file.
+  await expect(page.getByTestId("format")).toHaveValue("csv");
+  const bytes = await page.evaluate(async () => {
+    const response = await fetch("test/fixtures/excel/v1/tabulark-ooxml.xlsx");
+    if (!response.ok) throw new Error(`fixture request failed: ${response.status}`);
+    return [...new Uint8Array(await response.arrayBuffer())];
+  });
+  await page.getByTestId("source-input").setInputFiles({
+    name: "模版 权限视图参考V1.xlsx",
+    mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    buffer: Buffer.from(bytes),
+  });
+
+  await expect(page.getByTestId("format")).toHaveValue("xlsx");
+  await expect(page.getByTestId("file-summary")).toContainText("XLSX");
+  await expect(page.getByTestId("file-summary")).toContainText("2 GiB local-file mode");
+  await page.getByTestId("open-button").click();
+  await expectReady(page, "4 rows are ready");
+  const grid = page.locator("[data-tabulark-a11y-grid]");
+  await expect(grid).toContainText("城市数据");
+  await expect(grid).toContainText("上海");
+  // Explicit large-mode OOXML is served by the bounded range-backed host
+  // parser, so it does not need to fetch the staged Excel WASM artifact.
+  expectRequests(wasmRequests, { delimited: 0, arrow: 0, parquet: 0, excel: 0 });
+});
+
 test("all five supported local formats use only their requested lazy adapter artifacts", async ({ page }) => {
   const wasmRequests = [];
   const errors = [];

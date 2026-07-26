@@ -56,6 +56,14 @@ await Promise.all([
     entryPoints: [fileURLToPath(new URL("js/worker.ts", rootUrl))],
     outfile: fileURLToPath(new URL("dist/worker.js", rootUrl)),
   }),
+  // The large XLSX parser is loaded by the Worker only for an explicit
+  // `sourceMode: "large"` + `format: "xlsx"` open. Keep it out of the core
+  // Worker bundle so the established core delivery budget remains intact.
+  build({
+    ...shared,
+    entryPoints: [fileURLToPath(new URL("js/worker/large-excel-adapter.ts", rootUrl))],
+    outfile: fileURLToPath(new URL("dist/worker/large-excel-adapter.js", rootUrl)),
+  }),
 ]);
 
 function run(command, args) {

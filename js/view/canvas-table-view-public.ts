@@ -40,6 +40,12 @@ export interface CanvasTableViewOptions {
   readonly table: TableHandle;
   readonly controllerOptions?: CanvasTableViewControllerOptions;
   /**
+   * Selects the table palette. `light` is the compatibility default;
+   * `auto` follows the browser's `prefers-color-scheme` media query.
+   * Forced-colors mode always takes precedence over this setting.
+   */
+  readonly colorScheme?: "auto" | "light" | "dark";
+  /**
    * Applies static spreadsheet presentation metadata when available.
    * Workbook colors never override the system palette in forced-colors mode.
    */

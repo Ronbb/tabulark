@@ -1,4 +1,5 @@
 import {
+  TabularkError,
   createCanvasTableView,
   createEngine,
   delimitedAdapter,
@@ -11,6 +12,7 @@ const ARROW_SAMPLE_URL = new URL(
   "../../test/fixtures/arrow/v1/m4-sample.arrow",
   import.meta.url,
 );
+const MAX_LARGE_SOURCE_BYTES = 2 * 1024 * 1024 * 1024;
 
 const TERMINAL_ENGINE_CODES = new Set([
   "HANDLE_CLOSED",
@@ -90,23 +92,36 @@ let latestWarning = "";
 let progressAnnouncementTimer = 0;
 let pendingProgressAnnouncement = "";
 let lastProgressAnnouncementAt = 0;
+// File-format detection is intentionally kept in the playground layer. The
+// public engine still requires an explicit official adapter, while this UI can
+// choose one from the local file's metadata/signature before calling open().
+let sourceSelectionRevision = 0;
+let formatSelectionRevision = 0;
+let pendingFormatDetection = Promise.resolve();
 
 sourceInput.addEventListener("change", () => {
   const source = sourceInput.files?.[0];
   if (source === undefined) {
     return;
   }
+  const selectionRevision = ++sourceSelectionRevision;
+  const formatRevision = formatSelectionRevision;
   rememberSource(source, source.name);
+  pendingFormatDetection = selectDetectedFormat(source, selectionRevision, formatRevision);
   updateSourceOptions();
   updateSourceSummary();
   if (currentState === "ready") {
+    const modeLabel = typeof File !== "undefined" && source instanceof File
+      ? "2 GiB local-file mode with bounded range reads"
+      : "bounded source mode";
     setStatus(
-      `Selected ${source.name} (${formatBytes(source.size)}). The current preview remains open until you choose Open preview.`,
+      `Selected ${source.name} (${formatBytes(source.size)}), ${modeLabel}. The current preview remains open until you choose Open preview.`,
     );
   }
 });
 
 formatInput.addEventListener("change", () => {
+  formatSelectionRevision += 1;
   updateSourceOptions();
   updateSourceSummary();
 });
@@ -118,13 +133,24 @@ form.addEventListener("submit", (event) => {
     sourceInput.click();
     return;
   }
-  rememberSource(source, source.name);
-  void openSource(source, source.name);
+  const selectionRevision = sourceSelectionRevision;
+  // A signature read is asynchronous for files without a useful extension.
+  // Wait for it so a fast click cannot open the source with the previous
+  // (usually CSV) selection.
+  void pendingFormatDetection.then(() => {
+    if (selectionRevision !== sourceSelectionRevision) {
+      return;
+    }
+    rememberSource(source, source.name);
+    void openSource(source, source.name);
+  });
 });
 
 sampleButton.addEventListener("click", () => {
   const sample = createSampleCsv(2_000);
   const source = new Blob([sample], { type: "text/csv" });
+  sourceSelectionRevision += 1;
+  pendingFormatDetection = Promise.resolve();
   sourceInput.value = "";
   formatInput.value = "csv";
   headerInput.value = "first-row";
@@ -136,6 +162,8 @@ sampleButton.addEventListener("click", () => {
 });
 
 arrowSampleButton.addEventListener("click", () => {
+  sourceSelectionRevision += 1;
+  pendingFormatDetection = Promise.resolve();
   void openArrowSample();
 });
 
@@ -167,10 +195,10 @@ window.addEventListener("pageshow", (event) => {
     return;
   }
   if (retrySource === undefined) {
-    transition("idle", "Choose CSV, TSV, Arrow IPC, Parquet, XLS, or XLSX explicitly, then open a local source or sample.");
+    transition("idle", "Choose a local source; the playground detects its adapter before opening it.");
     showEmptyState(
       "No table open",
-      "Choose a local CSV, TSV, Arrow IPC, Parquet, XLS, or XLSX source. Nothing is uploaded.",
+      "Choose a local CSV, TSV, Arrow IPC, Parquet, XLS, or XLSX source. The adapter is detected locally and nothing is uploaded.",
     );
     return;
   }
@@ -200,9 +228,12 @@ async function openArrowSample() {
     if (!response.ok) {
       throw new Error(`Arrow sample request failed with HTTP ${response.status}`);
     }
-    const bytes = await response.arrayBuffer();
+    // Keep the fixture on the Blob path too: the Playground should exercise
+    // the same bounded local-source contract as a user-selected File, rather
+    // than materialising the response as an ArrayBuffer on the main thread.
+    const blob = await response.blob();
     if (!isCurrent(operation)) return;
-    const source = new File([bytes], "m4-sample.arrow", {
+    const source = new File([blob], "m4-sample.arrow", {
       type: "application/vnd.apache.arrow.file",
     });
     sourceInput.value = "";
@@ -228,6 +259,9 @@ async function openSource(source, displayName) {
     displayName,
     size: typeof source.size === "number" ? source.size : source.byteLength,
   });
+  const sourceMode = typeof File !== "undefined" && source instanceof File
+    ? "large"
+    : "auto";
   retrySource = sourceSnapshot;
   activeSource = sourceSnapshot;
   const operation = ++activeOperation;
@@ -251,6 +285,27 @@ async function openSource(source, displayName) {
     return;
   }
 
+  if (sourceMode === "large" && sourceSnapshot.size > MAX_LARGE_SOURCE_BYTES) {
+    const limitError = new TabularkError(
+      "RESOURCE_LIMIT",
+      `Large source mode supports local files up to ${formatBytes(MAX_LARGE_SOURCE_BYTES)}.`,
+      {
+        details: {
+          resource: "source-staging",
+          requiredBytes: sourceSnapshot.size,
+          availableBytes: MAX_LARGE_SOURCE_BYTES,
+        },
+      },
+    );
+    transition("error", presentError(limitError), { focus: status });
+    showEmptyState(
+      "Source is too large",
+      `Choose a local File no larger than ${formatBytes(MAX_LARGE_SOURCE_BYTES)}.`,
+    );
+    activeAbort = undefined;
+    return;
+  }
+
   let operationEngine;
   let openedDataset;
   try {
@@ -262,6 +317,7 @@ async function openSource(source, displayName) {
     const openOptions = readOpenOptions();
     openedDataset = await operationEngine.open(source, {
       ...openOptions,
+      sourceMode,
       adapterOptions: {
         ...openOptions.adapterOptions,
         sourceName: displayName,
@@ -298,6 +354,10 @@ async function openSource(source, displayName) {
       container: preview,
       table,
       ariaLabel: `${displayName} table preview`,
+      // Keep the Canvas surface in step with the Playground's page palette.
+      // The high-level view still defaults to light for compatibility outside
+      // this demo; the Playground intentionally follows prefers-color-scheme.
+      colorScheme: "auto",
       onError: (error) => handleViewError(error, operation),
     });
     mountedViewOperation = operation;
@@ -599,13 +659,217 @@ function rememberSource(source, displayName) {
   updateSourceSummary();
 }
 
+const FORMAT_BY_EXTENSION = Object.freeze({
+  csv: "csv",
+  tsv: "tsv",
+  arrow: "arrow",
+  arrows: "arrow",
+  feather: "arrow",
+  parquet: "parquet",
+  xls: "xls",
+  xlsx: "xlsx",
+});
+
+const FORMAT_BY_MIME = Object.freeze({
+  "text/csv": "csv",
+  "text/tab-separated-values": "tsv",
+  "application/vnd.apache.arrow.file": "arrow",
+  "application/vnd.apache.arrow.stream": "arrow",
+  "application/vnd.apache.arrow.feather": "arrow",
+  "application/vnd.apache.arrow": "arrow",
+  "application/vnd.apache.parquet": "parquet",
+  "application/x-parquet": "parquet",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+});
+
+/**
+ * Select the adapter as soon as the browser gives us a reliable name or MIME
+ * hint. A signature fallback below handles files renamed without an extension
+ * (a common result of drag/drop and desktop cache exports).
+ */
+async function selectDetectedFormat(source, selectionRevision, formatRevision) {
+  const metadataFormat = inferFormatFromMetadata(source);
+  if (metadataFormat !== undefined) {
+    applyDetectedFormat(metadataFormat, selectionRevision, formatRevision);
+    // Confirm the hint from the first bytes as well. This keeps a stale or
+    // misleading filename from sending an OOXML workbook through CSV/XLS.
+    const signatureFormat = await inferFormatFromSignature(source);
+    if (signatureFormat !== undefined) {
+      applyDetectedFormat(signatureFormat, selectionRevision, formatRevision);
+      return signatureFormat;
+    }
+    return metadataFormat;
+  }
+
+  const signatureFormat = await inferFormatFromSignature(source);
+  if (signatureFormat !== undefined) {
+    applyDetectedFormat(signatureFormat, selectionRevision, formatRevision);
+    return signatureFormat;
+  }
+  // Do not carry a previous workbook/Arrow choice into an unlabelled text
+  // file. CSV is the least-surprising local fallback and remains overridable.
+  applyDetectedFormat("csv", selectionRevision, formatRevision);
+  return "csv";
+}
+
+function inferFormatFromMetadata(source) {
+  const name = typeof source?.name === "string" ? source.name : "";
+  const extensionStart = name.lastIndexOf(".");
+  if (extensionStart >= 0 && extensionStart < name.length - 1) {
+    const extension = name.slice(extensionStart + 1).toLowerCase();
+    if (Object.hasOwn(FORMAT_BY_EXTENSION, extension)) {
+      return FORMAT_BY_EXTENSION[extension];
+    }
+  }
+
+  const mime = typeof source?.type === "string"
+    ? source.type.split(";", 1)[0].trim().toLowerCase()
+    : "";
+  return Object.hasOwn(FORMAT_BY_MIME, mime) ? FORMAT_BY_MIME[mime] : undefined;
+}
+
+async function inferFormatFromSignature(source) {
+  if (typeof source?.slice !== "function" || typeof source?.size !== "number") {
+    return undefined;
+  }
+  try {
+    const head = await readBlobRange(source, 0, Math.min(16, source.size));
+    if (head === undefined) {
+      return undefined;
+    }
+    if (hasBytesAt(head, [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])) {
+      return "xls";
+    }
+    if (hasAsciiAt(head, "PAR1")) {
+      return "parquet";
+    }
+    if (hasAsciiAt(head, "ARROW1")) {
+      return "arrow";
+    }
+    // OOXML workbooks are ZIP containers. The accepted playground formats do
+    // not include arbitrary ZIP archives, so a ZIP signature is a safe enough
+    // fallback when the filename and MIME type are both absent.
+    if (head[0] === 0x50 && head[1] === 0x4B) {
+      return "xlsx";
+    }
+
+    // Arrow IPC files repeat ARROW1 in their footer; the stream variant has
+    // no fixed header and is therefore identified by its MIME/extension.
+    if (source.size >= 6) {
+      const tail = await readBlobRange(source, Math.max(0, source.size - 6), source.size);
+      if (tail === undefined) {
+        return undefined;
+      }
+      if (hasAsciiAt(tail, "ARROW1")) {
+        return "arrow";
+      }
+    }
+  } catch {
+    // Detection is a convenience. If a browser refuses a tiny Blob read,
+    // leave the current selection in place so the user can still override it.
+  }
+  return undefined;
+}
+
+/**
+ * Reads only a requested Blob slice through its stream. This helper is used
+ * for format hints, never for opening a source; the original File/Blob is
+ * passed directly to the Worker afterwards.
+ */
+async function readBlobRange(source, start, end) {
+  if (typeof source?.slice !== "function" || typeof source?.stream !== "function") {
+    return undefined;
+  }
+  const length = end - start;
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || length < 0) {
+    return undefined;
+  }
+  const reader = source.slice(start, end).stream().getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!(value instanceof Uint8Array)) {
+        return undefined;
+      }
+      total += value.byteLength;
+      if (total > length) {
+        return undefined;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
+}
+
+function applyDetectedFormat(format, selectionRevision, formatRevision) {
+  if (
+    selectionRevision !== sourceSelectionRevision
+    || formatRevision !== formatSelectionRevision
+  ) {
+    return;
+  }
+  formatInput.value = format;
+  updateSourceOptions();
+  updateSourceSummary();
+}
+
+function hasBytesAt(bytes, expected) {
+  if (bytes.length < expected.length) {
+    return false;
+  }
+  return expected.every((value, index) => bytes[index] === value);
+}
+
+function hasAsciiAt(bytes, text) {
+  if (bytes.length < text.length) {
+    return false;
+  }
+  return [...text].every((character, index) => bytes[index] === character.charCodeAt(0));
+}
+
 function updateSourceSummary() {
   if (lastSource === undefined) {
     fileSummary.textContent = "No source selected.";
     return;
   }
   const formatLabel = formatInput.value === "arrow" ? "ARROW IPC" : formatInput.value.toUpperCase();
-  fileSummary.textContent = `${lastDisplayName} · ${formatBytes(lastSourceSize)} · ${formatLabel}`;
+  const isLocalFile = typeof File !== "undefined" && lastSource instanceof File;
+  const modeLabel = isLocalFile
+    ? `2 GiB local-file mode · ${lastSourceSize <= MAX_LARGE_SOURCE_BYTES ? "within limit" : "over limit"}`
+    : "bounded source mode";
+  fileSummary.textContent = `${lastDisplayName} · ${formatBytes(lastSourceSize)} · ${formatLabel} · ${modeLabel} · estimated ${estimateCapability(formatInput.value, isLocalFile, lastSourceSize)}`;
+}
+
+function estimateCapability(format, isLocalFile, sourceSize) {
+  if (isLocalFile && sourceSize > MAX_LARGE_SOURCE_BYTES) {
+    return "open blocked above 2 GiB";
+  }
+  switch (format) {
+    case "csv":
+    case "tsv":
+      return "streaming scan";
+    case "arrow":
+      return arrowContainerInput.value === "stream" ? "progressive IPC scan" : "bounded IPC ranges";
+    case "parquet":
+      return "footer and row-group ranges";
+    case "xlsx":
+      return isLocalFile ? "range-backed OOXML (prototype)" : "bounded workbook staging";
+    case "xls":
+      return "bounded BIFF8 staging";
+    default:
+      return "bounded adapter access";
+  }
 }
 
 function updateSourceOptions() {
@@ -686,10 +950,25 @@ function readyMessage(displayName, rowCount) {
 }
 
 function presentError(error) {
-  return `${errorCode(error)}: ${errorMessage(error)}`;
+  const code = errorCode(error);
+  const details = error?.details;
+  if (
+    code === "RESOURCE_LIMIT"
+    && details !== null
+    && typeof details === "object"
+    && typeof details.resource === "string"
+    && Number.isFinite(details.requiredBytes)
+    && Number.isFinite(details.availableBytes)
+  ) {
+    return `${code}: ${errorMessage(error)} (${details.resource}; required ${formatBytes(details.requiredBytes)}, available ${formatBytes(details.availableBytes)})`;
+  }
+  return `${code}: ${errorMessage(error)}`;
 }
 
 function recoveryMessage(error) {
+  if (errorCode(error) === "RESOURCE_LIMIT") {
+    return "Choose a smaller local File or reduce the requested range; the configured source and memory limits remain unchanged.";
+  }
   if (errorCode(error) === "PARSE_FAILED") {
     return "Review the delimiter, header, or malformed-row setting, then retry the same local source.";
   }
@@ -783,7 +1062,8 @@ function createSampleCsv(rowCount) {
 function formatBytes(value) {
   if (value < 1_024) return `${value} B`;
   if (value < 1_048_576) return `${(value / 1_024).toFixed(1)} KiB`;
-  return `${(value / 1_048_576).toFixed(1)} MiB`;
+  if (value < 1_073_741_824) return `${(value / 1_048_576).toFixed(1)} MiB`;
+  return `${(value / 1_073_741_824).toFixed(1)} GiB`;
 }
 
 function formatCount(value) {

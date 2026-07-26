@@ -114,6 +114,8 @@ test("Worker cancels an in-flight open and releases its source immediately", asy
     "__tabularkWasmConfigs",
     "__tabularkBeginCount",
     "__tabularkClosedSources",
+    "__tabularkCancelCalls",
+    "__tabularkOpenBeginCount",
   ]);
   const listeners = new Set();
   const messages = [];
@@ -126,6 +128,8 @@ test("Worker cancels an in-flight open and releases its source immediately", asy
     __tabularkWasmConfigs: { configurable: true, writable: true, value: [] },
     __tabularkBeginCount: { configurable: true, writable: true, value: 0 },
     __tabularkClosedSources: { configurable: true, writable: true, value: 0 },
+    __tabularkCancelCalls: { configurable: true, writable: true, value: 0 },
+    __tabularkOpenBeginCount: { configurable: true, writable: true, value: 0 },
   });
 
   try {
@@ -160,13 +164,14 @@ test("Worker cancels an in-flight open and releases its source immediately", asy
       adapterId: "tabulark:delimited",
       options: { delimiter: ",", header: "first-row", mode: "lenient" },
     });
-    await eventually(() => globalThis.__tabularkWasmConfigs.length === 1);
+    await eventually(() => globalThis.__tabularkOpenBeginCount === 1);
 
     const cancel = send("cancel", { targetRequestId: opening });
     assert.equal((await responseFor(cancel)).status, "success");
     const openingResponse = await responseFor(opening);
     assert.equal(openingResponse.status, "failure");
     assert.equal(openingResponse.error.code, "CANCELLED");
+    assert.equal(globalThis.__tabularkCancelCalls, 1);
     assert.equal(globalThis.__tabularkClosedSources, 1);
 
     const leakedDataset = send("listTables", { datasetHandle: "d1" });
@@ -1064,10 +1069,11 @@ class BackgroundFailureBlob extends Blob {
   slice(...args) {
     this.#sliceCount += 1;
     if (this.#sliceCount !== 2) return super.slice(...args);
+    const expectedLength = super.slice(...args).size;
     this.waitingForSecondSlice = true;
     return {
       arrayBuffer: () => new Promise((resolve) => {
-        this.#release = () => resolve(new ArrayBuffer(0));
+        this.#release = () => resolve(new ArrayBuffer(expectedLength));
       }),
     };
   }
@@ -1096,6 +1102,9 @@ function mockWasmModuleUrl() {
       adapterId() { return "tabulark:delimited"; }
       beginOpen(_options, sourceLength) {
         const handle = nextOperation++;
+        if (typeof globalThis.__tabularkOpenBeginCount === "number") {
+          globalThis.__tabularkOpenBeginCount += 1;
+        }
         operations.set(handle, { kind: "open" });
         return { kind: "read-bytes", operationHandle: handle, action: { kind: "read-bytes", offset: 0, length: sourceLength } };
       }
@@ -1131,6 +1140,9 @@ function mockWasmModuleUrl() {
         return { kind: "read-bytes", operationHandle: handle, action: { kind: "read-bytes", offset: 0, length: 1 } };
       }
       cancelOperation(handle) {
+        if (typeof globalThis.__tabularkCancelCalls === "number") {
+          globalThis.__tabularkCancelCalls += 1;
+        }
         const operation = operations.get(handle);
         operations.delete(handle);
         if (operation?.kind === "open") globalThis.__tabularkClosedSources += 1;

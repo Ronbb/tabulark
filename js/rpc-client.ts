@@ -16,12 +16,21 @@ interface PendingRequest {
   readonly reject: (reason: unknown) => void;
   readonly expectedKind: ResponseKind;
   readonly cleanup: () => void;
+  readonly onTelemetry?: (telemetry: OperationTelemetry | undefined) => void;
 }
 
 interface RequestOptions {
   readonly transfer?: Transferable[];
   readonly signal?: AbortSignal;
   readonly timeoutMs?: number;
+  /** Private opt-in operation telemetry callback. */
+  readonly measure?: boolean;
+  readonly onTelemetry?: (telemetry: OperationTelemetry | undefined) => void;
+}
+
+export interface OperationTelemetry {
+  readonly bytesRead: number;
+  readonly peakReservationBytes: number;
 }
 
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 2_000;
@@ -118,10 +127,17 @@ export class WorkerRpcClient {
         reject,
         expectedKind,
         cleanup,
+        ...(options.onTelemetry === undefined ? {} : { onTelemetry: options.onTelemetry }),
       });
       try {
         this.#worker.postMessage(
-          { protocolVersion: PROTOCOL_VERSION, requestId, op, payload },
+          {
+            protocolVersion: PROTOCOL_VERSION,
+            requestId,
+            op,
+            payload,
+            ...(options.measure === true ? { measure: true } : {}),
+          },
           options.transfer ?? [],
         );
       } catch (error) {
@@ -136,12 +152,15 @@ export class WorkerRpcClient {
     });
   }
 
-  async shutdown(timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
+  async shutdown(
+    timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS,
+    options: Pick<RequestOptions, "measure" | "onTelemetry"> = {},
+  ): Promise<void> {
     if (this.#closed) {
       return;
     }
     try {
-      await this.request("shutdown", {}, "acknowledged", { timeoutMs });
+      await this.request("shutdown", {}, "acknowledged", { timeoutMs, ...options });
     } catch {
       // Termination below is still required after a failed graceful shutdown.
     } finally {
@@ -194,6 +213,10 @@ export class WorkerRpcClient {
     pending.cleanup();
 
     if (value.status === "failure") {
+      optionsTelemetry(
+        pending,
+        (value as ProtocolFailureWithTelemetry).telemetry,
+      );
       pending.reject(TabularkError.fromSerialized(value.error));
       return;
     }
@@ -206,6 +229,10 @@ export class WorkerRpcClient {
       this.#failRuntime(error);
       return;
     }
+    optionsTelemetry(
+      pending,
+      (value.result as ProtocolResultWithTelemetry).telemetry,
+    );
     pending.resolve(value.result.data);
   };
 
@@ -277,6 +304,39 @@ export class WorkerRpcClient {
     }
   }
 }
+
+function optionsTelemetry(
+  pending: PendingRequest,
+  value: unknown,
+): void {
+  if (!pending.onTelemetry) {
+    return;
+  }
+  if (
+    typeof value === "object"
+    && value !== null
+    && !Array.isArray(value)
+    && Number.isSafeInteger((value as { bytesRead?: unknown }).bytesRead)
+    && Number.isSafeInteger((value as { peakReservationBytes?: unknown }).peakReservationBytes)
+  ) {
+    const bytesRead = (value as { bytesRead: number }).bytesRead;
+    const peakReservationBytes = (value as { peakReservationBytes: number }).peakReservationBytes;
+    pending.onTelemetry({
+      bytesRead: bytesRead >= 0 ? bytesRead : 0,
+      peakReservationBytes: peakReservationBytes >= 0 ? peakReservationBytes : 0,
+    });
+  } else {
+    pending.onTelemetry(undefined);
+  }
+}
+
+type ProtocolResultWithTelemetry = {
+  readonly telemetry?: unknown;
+};
+
+type ProtocolFailureWithTelemetry = {
+  readonly telemetry?: unknown;
+};
 
 function isValidProtocolResponse(value: unknown): value is ProtocolResponse {
   if (

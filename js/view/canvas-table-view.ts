@@ -33,6 +33,30 @@ const KEYBOARD_RESIZE_COARSE_STEP = 32;
 const AUTOSIZE_HORIZONTAL_PADDING = 24;
 const MAX_PRESENTATION_WINDOW_CELLS = 100_000;
 
+/**
+ * Palette used when a high-level view is explicitly or automatically dark.
+ * Keep these tokens aligned with the Playground's dark CSS palette so the
+ * Canvas surface does not look like a separate theme from its host page.
+ */
+const DARK_CANVAS_TABLE_THEME: Readonly<CanvasTableTheme> = Object.freeze({
+  background: "#182235",
+  foreground: "#edf0f7",
+  mutedForeground: "#b5c0d4",
+  headerBackground: "#202c42",
+  headerForeground: "#edf0f7",
+  alternateRowBackground: "#202c42",
+  gridLine: "#526079",
+  selectionBackground: "rgba(167, 139, 250, 0.24)",
+  selectionBorder: "#a78bfa",
+  activeCellBorder: "#c4b5fd",
+  loadingBackground: "#526079",
+  font: '13px ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif',
+  headerFont: '600 13px ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif',
+});
+
+type CanvasColorScheme = "auto" | "light" | "dark";
+type ResolvedCanvasColorScheme = Exclude<CanvasColorScheme, "auto">;
+
 let nextViewId = 1;
 
 export interface CanvasTableViewOptions {
@@ -42,6 +66,12 @@ export interface CanvasTableViewOptions {
   /** Provide either a controller or a table, never both. */
   readonly controller?: TableViewController;
   readonly controllerOptions?: TableControllerOptions;
+  /**
+   * Selects the table palette. `light` is the compatibility default;
+   * `auto` follows the browser's `prefers-color-scheme` media query.
+   * Forced-colors mode always takes precedence over this setting.
+   */
+  readonly colorScheme?: CanvasColorScheme;
   /**
    * Applies static spreadsheet sizing metadata when a TableHandle provides it.
    * Workbook colors never override the system palette in forced-colors mode.
@@ -94,7 +124,9 @@ class View implements CanvasTableView {
   readonly #ownsController: boolean;
   readonly #writeClipboard: ((text: string) => Promise<void> | void) | undefined;
   readonly #onError: ((error: unknown) => void) | undefined;
-  readonly #baseTheme: Readonly<CanvasTableTheme>;
+  readonly #themeOverrides: Readonly<Partial<CanvasTableTheme>>;
+  readonly #colorScheme: CanvasColorScheme;
+  readonly #colorSchemeQuery: MediaQueryList | undefined;
   readonly #presentationTable: TableHandle | undefined;
   #theme: Readonly<CanvasTableTheme>;
   readonly #forcedColorsQuery: MediaQueryList;
@@ -108,6 +140,7 @@ class View implements CanvasTableView {
   #copyAbort: AbortController | null = null;
   #announcementFrame = 0;
   #forcedColors = false;
+  #resolvedColorScheme: ResolvedCanvasColorScheme = "light";
   #presentation: SpreadsheetPresentation | null = null;
   #presentationRanges: readonly PresentationRange[] = [];
   #mergedCells: readonly MergedCellRegion[] = [];
@@ -126,6 +159,10 @@ class View implements CanvasTableView {
     if (presentation !== "auto" && presentation !== "ignore") {
       throw invalidArgument("presentation must be auto or ignore");
     }
+    const colorScheme = options.colorScheme ?? "light";
+    if (colorScheme !== "auto" && colorScheme !== "light" && colorScheme !== "dark") {
+      throw invalidArgument("colorScheme must be auto, light, or dark");
+    }
     this.#ownsController = options.table !== undefined;
     this.controller = options.controller
       ?? createTableController(options.table!, options.controllerOptions);
@@ -133,12 +170,19 @@ class View implements CanvasTableView {
     this.#writeClipboard = options.writeClipboard;
     this.#onError = options.onError;
     this.#presentationTable = presentation === "auto" ? options.table : undefined;
-    this.#baseTheme = Object.freeze({ ...DEFAULT_CANVAS_TABLE_THEME, ...options.theme });
+    this.#colorScheme = colorScheme;
+    this.#themeOverrides = Object.freeze({ ...options.theme });
     this.#forcedColorsQuery = ownerWindow.matchMedia("(forced-colors: active)");
     this.#forcedColors = this.#forcedColorsQuery.matches;
-    this.#theme = this.#forcedColors
-      ? forcedColorsCanvasTableTheme(this.#baseTheme)
-      : this.#baseTheme;
+    this.#colorSchemeQuery = colorScheme === "auto"
+      ? ownerWindow.matchMedia("(prefers-color-scheme: dark)")
+      : undefined;
+    this.#resolvedColorScheme = colorScheme === "dark"
+      ? "dark"
+      : colorScheme === "auto" && this.#colorSchemeQuery?.matches === true
+        ? "dark"
+        : "light";
+    this.#theme = this.#resolveTheme();
 
     this.element = ownerDocument.createElement("div");
     this.element.className = "tabulark-view";
@@ -285,7 +329,10 @@ class View implements CanvasTableView {
     this.element.addEventListener("keydown", this.#onKeyDown);
     this.element.addEventListener("focusin", this.#onFocusIn);
     this.element.addEventListener("focusout", this.#onFocusOut);
-    this.#forcedColorsQuery.addEventListener("change", this.#onForcedColorsChange);
+    addMediaQueryListener(this.#forcedColorsQuery, this.#onForcedColorsChange);
+    if (this.#colorSchemeQuery !== undefined) {
+      addMediaQueryListener(this.#colorSchemeQuery, this.#onColorSchemeChange);
+    }
 
     if (typeof ownerWindow.ResizeObserver === "function") {
       this.#resizeObserver = new ownerWindow.ResizeObserver(() => this.#updateViewport());
@@ -335,7 +382,10 @@ class View implements CanvasTableView {
     this.element.removeEventListener("keydown", this.#onKeyDown);
     this.element.removeEventListener("focusin", this.#onFocusIn);
     this.element.removeEventListener("focusout", this.#onFocusOut);
-    this.#forcedColorsQuery.removeEventListener("change", this.#onForcedColorsChange);
+    removeMediaQueryListener(this.#forcedColorsQuery, this.#onForcedColorsChange);
+    if (this.#colorSchemeQuery !== undefined) {
+      removeMediaQueryListener(this.#colorSchemeQuery, this.#onColorSchemeChange);
+    }
     this.#accessibleGrid.destroy();
     this.element.remove();
     if (this.#ownsController) {
@@ -360,9 +410,18 @@ class View implements CanvasTableView {
       return;
     }
     this.#forcedColors = event.matches;
-    this.#theme = this.#forcedColors
-      ? forcedColorsCanvasTableTheme(this.#baseTheme)
-      : this.#baseTheme;
+    this.#theme = this.#resolveTheme();
+    this.#painter.setTheme(this.#theme, { forcedColors: this.#forcedColors });
+    this.#applyThemeToElements();
+    this.#scheduleFrame();
+  };
+
+  readonly #onColorSchemeChange = (event: MediaQueryListEvent): void => {
+    if (this.#destroyed || this.#colorScheme !== "auto") {
+      return;
+    }
+    this.#resolvedColorScheme = event.matches ? "dark" : "light";
+    this.#theme = this.#resolveTheme();
     this.#painter.setTheme(this.#theme, { forcedColors: this.#forcedColors });
     this.#applyThemeToElements();
     this.#scheduleFrame();
@@ -1174,6 +1233,7 @@ class View implements CanvasTableView {
   }
 
   #applyThemeToElements(): void {
+    this.element.dataset.tabularkColorScheme = this.#resolvedColorScheme;
     this.element.dataset.tabularkForcedColors = this.#forcedColors ? "active" : "none";
     this.element.style.background = this.#theme.background;
     this.element.style.borderColor = this.#theme.gridLine;
@@ -1188,6 +1248,16 @@ class View implements CanvasTableView {
         handle.style.outline = `2px solid ${this.#focusColor()}`;
       }
     }
+  }
+
+  #resolveTheme(): Readonly<CanvasTableTheme> {
+    const palette = this.#resolvedColorScheme === "dark"
+      ? DARK_CANVAS_TABLE_THEME
+      : DEFAULT_CANVAS_TABLE_THEME;
+    const baseTheme = Object.freeze({ ...palette, ...this.#themeOverrides });
+    return this.#forcedColors
+      ? forcedColorsCanvasTableTheme(baseTheme)
+      : baseTheme;
   }
 
   #focusColor(): string {
@@ -1388,6 +1458,28 @@ export function createCanvasTableView(options: CanvasTableViewOptions): CanvasTa
     throw invalidArgument("provide exactly one of table or controller");
   }
   return new View(options);
+}
+
+function addMediaQueryListener(
+  query: MediaQueryList,
+  listener: (event: MediaQueryListEvent) => void,
+): void {
+  if (typeof query.addEventListener === "function") {
+    query.addEventListener("change", listener);
+    return;
+  }
+  query.addListener?.(listener);
+}
+
+function removeMediaQueryListener(
+  query: MediaQueryList,
+  listener: (event: MediaQueryListEvent) => void,
+): void {
+  if (typeof query.removeEventListener === "function") {
+    query.removeEventListener("change", listener);
+    return;
+  }
+  query.removeListener?.(listener);
 }
 
 function keyboardCommand(event: KeyboardEvent): NavigationCommand | null {

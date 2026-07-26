@@ -11,6 +11,7 @@ import {
 } from "./adapters.js";
 import {
   DEFAULT_MEMORY_BUDGET_BYTES,
+  MAX_ARRAY_BUFFER_BYTES,
   ColumnarTableBatch,
   deriveMemoryBudgetLimits,
   normalizeDataType,
@@ -24,6 +25,7 @@ import {
   type SpreadsheetPresentation,
   type TablePresentation,
   type TableBatch,
+  type TableCapabilities,
   type TableDescriptor,
   type TableMetadata,
   type WireTableBatch,
@@ -36,7 +38,10 @@ import {
   isRecord,
   type ProtocolEvent,
 } from "./protocol.js";
-import { officialAdapterManifestEntry } from "./official-adapter-manifest.js";
+import {
+  officialAdapterManifestEntry,
+  type OfficialSourceAccess,
+} from "./official-adapter-manifest.js";
 import {
   ByteLruCache,
   cloneWireTableBatch,
@@ -44,18 +49,37 @@ import {
   rangeCacheKeyBelongsTo,
   wireBatchByteLength,
 } from "./range-cache.js";
-import { WorkerRpcClient } from "./rpc-client.js";
+import { WorkerRpcClient, type OperationTelemetry } from "./rpc-client.js";
+import {
+  MAX_LARGE_SOURCE_BYTES,
+  isSourceMode,
+  type SourceMode,
+} from "./source.js";
+
+export type { SourceMode } from "./source.js";
 
 const MIN_MEMORY_BUDGET_BYTES = 8 * 1024 * 1024;
 const LIFECYCLE_CLOSE_TIMEOUT_MS = 2_000;
 const MAX_ORPHAN_HANDLES = 32;
 const MAX_ORPHAN_EVENTS_PER_HANDLE = 16;
 const MAX_ORPHAN_EVENTS = 256;
+/** Keep diagnostics useful without allowing an untrusted source to grow memory without bound. */
+const MAX_DIAGNOSTICS = 1_000;
+const MAX_DIAGNOSTIC_MESSAGE_LENGTH = 512;
+const MAX_PERFORMANCE_SAMPLES = 128;
 
 export interface OpenSourceOptions<Options = unknown> {
   /** One of the official descriptors registered when the engine was created. */
   readonly adapter: AdapterDescriptor<OfficialAdapterId, Options>;
   readonly adapterOptions?: Options;
+  /**
+   * Selects the bounded default source path or the local Blob path that may
+   * address files up to 2 GiB. Defaults to `auto`.
+   *
+   * Large mode never changes ArrayBuffer staging limits; callers must provide
+   * a `File`/`Blob` for sources beyond those limits.
+   */
+  readonly sourceMode?: SourceMode;
   /** Detaches an ArrayBuffer input. Defaults to false; Blob input cannot be transferred. */
   readonly transferInput?: boolean;
   /** Cancels opening and releases any Worker-side source created by the request. */
@@ -87,7 +111,48 @@ export interface SourceWarning {
   readonly kind: string;
   readonly message: string;
   readonly byteOffset?: number;
+  /** Compatible alias used by structured diagnostics. */
+  readonly sourceOffset?: number;
   readonly row?: number;
+  readonly column?: number;
+}
+
+/** A safe, structured source or runtime diagnostic. */
+export interface TabularkDiagnostic {
+  readonly code: string;
+  readonly severity: "warning" | "error";
+  readonly message: string;
+  readonly recoverable: boolean;
+  readonly sourceOffset?: number;
+  readonly tableId?: string;
+  readonly revision?: number;
+  readonly row?: number;
+  readonly column?: number;
+}
+
+/** Logical capabilities of an opened dataset. */
+export interface DatasetCapabilities {
+  readonly adapterId: OfficialAdapterId;
+  readonly sourceAccess: OfficialSourceAccess;
+  readonly progressive: boolean;
+  readonly maxSourceBytes: number;
+  readonly multiTable: boolean;
+  readonly presentation: boolean;
+  readonly typedValues: boolean;
+}
+
+/** Optional, privacy-preserving operation timing sample. */
+export interface PerformanceSample {
+  /** Logical operation stage; implementation and transport names are omitted. */
+  readonly stage: string;
+  /** Elapsed duration relative to the operation start, in milliseconds. */
+  readonly durationMs: number;
+  /** Bytes read from the source during this stage, when known. */
+  readonly bytesRead: number;
+  /** Whether the result came from a retained range cache. */
+  readonly cacheHit: boolean;
+  /** Peak reservation observed by the host, when known. */
+  readonly peakReservationBytes: number;
 }
 
 export type DatasetEvent =
@@ -105,6 +170,9 @@ export interface DatasetSession {
   readonly tables: readonly Readonly<TableDescriptor>[];
   openTable(tableId: string): Promise<TableHandle>;
   subscribe(listener: (event: DatasetEvent) => void): Unsubscribe;
+  getDiagnostics(): readonly TabularkDiagnostic[];
+  subscribeDiagnostics(listener: (diagnostic: TabularkDiagnostic) => void): Unsubscribe;
+  getCapabilities(): Readonly<DatasetCapabilities>;
   close(): Promise<void>;
 }
 
@@ -117,11 +185,15 @@ export interface TableHandle {
   ): Promise<PresentationRange | null>;
   readRange(request: RangeRequest, options?: ReadRangeOptions): Promise<TableBatch>;
   subscribe(listener: (event: TableEvent) => void): Unsubscribe;
+  getDiagnostics(): readonly TabularkDiagnostic[];
+  subscribeDiagnostics(listener: (diagnostic: TabularkDiagnostic) => void): Unsubscribe;
+  getCapabilities(): Readonly<TableCapabilities>;
   close(): Promise<void>;
 }
 
 export interface TabularkEngine {
   open<Options>(source: Blob | ArrayBuffer, options: OpenSourceOptions<Options>): Promise<DatasetSession>;
+  subscribePerformance(listener: (sample: PerformanceSample) => void): Unsubscribe;
   close(): Promise<void>;
   dispose(): Promise<void>;
 }
@@ -137,15 +209,34 @@ interface NormalizedEngineOptions {
 interface NormalizedOpenOptions {
   readonly adapter: AdapterRegistration;
   readonly options: Readonly<Record<string, unknown>>;
+  readonly sourceMode: SourceMode;
+}
+
+interface PerformanceRequestOptions {
+  readonly measure?: boolean;
+  readonly onTelemetry?: (telemetry: OperationTelemetry | undefined) => void;
+}
+
+interface DatasetCapabilitySeed {
+  readonly adapterId: OfficialAdapterId;
+  readonly sourceAccess: OfficialSourceAccess;
+  readonly progressive: boolean;
+  readonly maxSourceBytes: number;
+  readonly multiTable: boolean;
+  readonly presentation: boolean;
+  readonly typedValues: boolean;
 }
 
 class Engine implements TabularkEngine {
   readonly #rpc: WorkerRpcClient;
   readonly #rangeCache: ByteLruCache<WireTableBatch>;
+  readonly #limits: MemoryBudgetLimits;
   readonly #maxArrayBufferBytes: number;
   readonly #adapters: ReadonlyMap<OfficialAdapterId, AdapterRegistration>;
   readonly #sessions = new Map<string, DatasetSessionImpl>();
   readonly #orphanEvents = new Map<string, ProtocolEvent[]>();
+  readonly #performanceListeners = new Set<(sample: PerformanceSample) => void>();
+  readonly #performanceQueue: PerformanceSample[] = [];
   #orphanEventCount = 0;
   #closed = false;
 
@@ -155,9 +246,63 @@ class Engine implements TabularkEngine {
     adapters: readonly AdapterRegistration[],
   ) {
     this.#rpc = rpc;
+    this.#limits = limits;
     this.#rangeCache = new ByteLruCache(limits.mainThreadRangeCacheBytes);
     this.#maxArrayBufferBytes = limits.maxArrayBufferBytes;
     this.#adapters = new Map(adapters.map((adapter) => [adapter.id, adapter]));
+  }
+
+  subscribePerformance(listener: (sample: PerformanceSample) => void): Unsubscribe {
+    if (this.#closed) {
+      throw closedError("Engine");
+    }
+    if (typeof listener !== "function") {
+      throw invalidArgument("performance listener must be a function");
+    }
+    this.#performanceListeners.add(listener);
+    // Samples are delivered synchronously while an operation is active. Any
+    // bounded queue entries are drained for a subscriber added after a turn.
+    for (const sample of this.#performanceQueue.splice(0)) {
+      safelyCall(listener, sample);
+    }
+    return () => this.#performanceListeners.delete(listener);
+  }
+
+  /** Emits a privacy-preserving sample only while at least one listener exists. */
+  #emitPerformanceSample(
+    stage: string,
+    startedAt: number | undefined,
+    options: Partial<Pick<PerformanceSample, "bytesRead" | "cacheHit" | "peakReservationBytes">> = {},
+  ): void {
+    // If no operation was being measured, avoid even taking a timestamp or
+    // allocating a sample. A listener can still unsubscribe while an already
+    // measured operation settles; retain that terminal sample in the bounded
+    // queue until a future subscriber drains it.
+    if (this.#performanceListeners.size === 0 && startedAt === undefined) {
+      return;
+    }
+    const durationMs = startedAt === undefined
+      ? 0
+      : Math.max(0, finitePerformanceNow() - startedAt);
+    const sample = Object.freeze({
+      stage: sanitizePerformanceStage(stage),
+      durationMs,
+      bytesRead: nonNegativeSafeQuantity(options.bytesRead),
+      cacheHit: options.cacheHit === true,
+      peakReservationBytes: nonNegativeSafeQuantity(options.peakReservationBytes),
+    });
+    // Keep a bounded history for a listener that is temporarily reentrant or
+    // detached while a request settles. No source/path/protocol data enters it.
+    if (this.#performanceListeners.size === 0) {
+      if (this.#performanceQueue.length >= MAX_PERFORMANCE_SAMPLES) {
+        this.#performanceQueue.shift();
+      }
+      this.#performanceQueue.push(sample);
+      return;
+    }
+    for (const listener of this.#performanceListeners) {
+      safelyCall(listener, sample);
+    }
   }
 
   static async create(options: EngineOptions): Promise<Engine> {
@@ -227,76 +372,139 @@ class Engine implements TabularkEngine {
     options: OpenSourceOptions<Options>,
   ): Promise<DatasetSession> {
     this.#assertOpen();
-    const normalizedOptions = normalizeOpenOptions(options, this.#adapters, inferSourceName(source));
-    const transfer: Transferable[] = [];
-    if (source instanceof ArrayBuffer) {
-      if (source.byteLength > this.#maxArrayBufferBytes) {
-        throw new TabularkError(
-          "RESOURCE_LIMIT",
-          `ArrayBuffer sources larger than ${this.#maxArrayBufferBytes} bytes must be supplied as a Blob`,
-          {
-            details: {
-              resource: "source-staging",
-              requiredBytes: source.byteLength,
-              availableBytes: this.#maxArrayBufferBytes,
+    const startedAt = this.#performanceListeners.size > 0 ? finitePerformanceNow() : undefined;
+    let bytesRead = 0;
+    let peakReservationBytes = 0;
+    const onTelemetry = (telemetry: OperationTelemetry | undefined): void => {
+      if (!telemetry) return;
+      // `open()` spans the source request and the table-list handshake. Each
+      // private Worker telemetry envelope is per request, so add source bytes
+      // rather than taking the largest individual read (which would silently
+      // under-report a footer plus metadata scan).
+      bytesRead = addPerformanceBytes(bytesRead, telemetry.bytesRead);
+      peakReservationBytes = Math.max(peakReservationBytes, telemetry.peakReservationBytes);
+    };
+    try {
+      const normalizedOptions = normalizeOpenOptions(options, this.#adapters, inferSourceName(source));
+      // Capture the logical source length before an optional ArrayBuffer
+      // transfer. Structured-cloning with a transfer list detaches the caller's
+      // buffer, so reading `byteLength` after the Worker request would make the
+      // capability seed disagree with the source that the Worker actually saw.
+      // Keep this capture inside the validated source branches so malformed
+      // JavaScript values still produce the public INVALID_ARGUMENT error.
+      let sourceBytes: number;
+      const transfer: Transferable[] = [];
+      if (source instanceof ArrayBuffer) {
+        sourceBytes = source.byteLength;
+        if (source.byteLength > this.#maxArrayBufferBytes) {
+          throw new TabularkError(
+            "RESOURCE_LIMIT",
+            `ArrayBuffer sources larger than ${this.#maxArrayBufferBytes} bytes must be supplied as a Blob`,
+            {
+              details: {
+                resource: "source-staging",
+                requiredBytes: source.byteLength,
+                availableBytes: this.#maxArrayBufferBytes,
+              },
             },
+          );
+        }
+        if (options.transferInput === true) {
+          transfer.push(source);
+        }
+      } else if (!(source instanceof Blob)) {
+        throw invalidArgument("source must be a Blob, File, or ArrayBuffer");
+      } else {
+        sourceBytes = source.size;
+        if (options.transferInput === true) {
+          throw invalidArgument("transferInput may only be true for an ArrayBuffer source");
+        }
+        const sourceSize = sourceBytes;
+        if (
+          normalizedOptions.sourceMode === "large"
+          && (!Number.isSafeInteger(sourceSize) || sourceSize < 0 || sourceSize > MAX_LARGE_SOURCE_BYTES)
+        ) {
+          throw largeSourceLimitError(sourceSize);
+        }
+      }
+
+      let dataset: { datasetHandle: string };
+      try {
+        const opened = await this.#rpc.request<unknown>(
+          "openSource",
+          {
+            source,
+            adapterId: normalizedOptions.adapter.id,
+            options: normalizedOptions.options,
+            sourceMode: normalizedOptions.sourceMode,
+          },
+          "dataset",
+          {
+            ...(options.signal ? { signal: options.signal } : {}),
+            transfer,
+            ...(startedAt === undefined ? {} : { measure: true, onTelemetry }),
           },
         );
+        if (
+          !isRecord(opened)
+          || typeof opened.datasetHandle !== "string"
+          || opened.datasetHandle.length === 0
+        ) {
+          throw this.#terminateForProtocolFailure("Worker returned an invalid dataset handle");
+        }
+        dataset = { datasetHandle: opened.datasetHandle };
+      } catch (error) {
+        throw error;
       }
-      if (options.transferInput === true) {
-        transfer.push(source);
-      }
-    } else if (!(source instanceof Blob)) {
-      throw invalidArgument("source must be a Blob, File, or ArrayBuffer");
-    } else if (options.transferInput === true) {
-      throw invalidArgument("transferInput may only be true for an ArrayBuffer source");
-    }
 
-    const dataset = await this.#rpc.request<{ datasetHandle: string }>(
-      "openSource",
-      {
-        source,
-        adapterId: normalizedOptions.adapter.id,
-        options: normalizedOptions.options,
-      },
-      "dataset",
-      options.signal ? { transfer, signal: options.signal } : { transfer },
-    );
-    if (
-      !isRecord(dataset)
-      || typeof dataset.datasetHandle !== "string"
-      || dataset.datasetHandle.length === 0
-    ) {
-      throw this.#terminateForProtocolFailure("Worker returned an invalid dataset handle");
-    }
-
-    try {
-      const tableResult = await this.#rpc.request<unknown>(
-        "listTables",
-        { datasetHandle: dataset.datasetHandle },
-        "tables",
-        options.signal ? { signal: options.signal } : {},
-      );
-      if (options.signal?.aborted) {
-        throw cancelledError();
+      try {
+        const tableResult = await this.#rpc.request<unknown>(
+          "listTables",
+          { datasetHandle: dataset.datasetHandle },
+          "tables",
+          {
+            ...(options.signal ? { signal: options.signal } : {}),
+            ...(startedAt === undefined ? {} : { measure: true, onTelemetry }),
+          },
+        );
+        if (options.signal?.aborted) {
+          throw cancelledError();
+        }
+        const tableDescriptors = normalizeDescriptors(tableResult);
+        const session = new DatasetSessionImpl(
+          this,
+          dataset.datasetHandle,
+          tableDescriptors,
+          createDatasetCapabilitySeed(
+            normalizedOptions.adapter.id,
+            normalizedOptions.options,
+            sourceBytes,
+            tableDescriptors,
+            normalizedOptions.sourceMode,
+            this.#stagedSourceLimit(normalizedOptions.adapter.id),
+          ),
+        );
+        this.#sessions.set(dataset.datasetHandle, session);
+        this.#deliverOrphanEvents(session);
+        if (session.closed) {
+          throw session.terminalError ?? closedError("Dataset session");
+        }
+        return session;
+      } catch (error) {
+        const terminalError = this.#orphanRuntimeError(dataset.datasetHandle);
+        const session = this.#sessions.get(dataset.datasetHandle);
+        if (session) {
+          session.closeLocally();
+          this.#sessions.delete(dataset.datasetHandle);
+        }
+        await this.#discardOpenedDataset(dataset.datasetHandle);
+        throw terminalError ?? error;
       }
-      const tableDescriptors = normalizeDescriptors(tableResult);
-      const session = new DatasetSessionImpl(this, dataset.datasetHandle, tableDescriptors);
-      this.#sessions.set(dataset.datasetHandle, session);
-      this.#deliverOrphanEvents(session);
-      if (session.closed) {
-        throw session.terminalError ?? closedError("Dataset session");
-      }
-      return session;
-    } catch (error) {
-      const terminalError = this.#orphanRuntimeError(dataset.datasetHandle);
-      const session = this.#sessions.get(dataset.datasetHandle);
-      if (session) {
-        session.closeLocally();
-        this.#sessions.delete(dataset.datasetHandle);
-      }
-      await this.#discardOpenedDataset(dataset.datasetHandle);
-      throw terminalError ?? error;
+    } finally {
+      this.#emitPerformanceSample("open", startedAt, {
+        bytesRead,
+        peakReservationBytes,
+      });
     }
   }
 
@@ -304,6 +512,11 @@ class Engine implements TabularkEngine {
     if (this.#closed) {
       return;
     }
+    const startedAt = this.#performanceListeners.size > 0 ? finitePerformanceNow() : undefined;
+    let peakReservationBytes = 0;
+    const onTelemetry = (telemetry: OperationTelemetry | undefined): void => {
+      if (telemetry) peakReservationBytes = Math.max(peakReservationBytes, telemetry.peakReservationBytes);
+    };
     this.#closed = true;
     for (const session of this.#sessions.values()) {
       session.closeLocally();
@@ -311,7 +524,16 @@ class Engine implements TabularkEngine {
     this.#sessions.clear();
     this.#rangeCache.clear();
     this.#clearOrphanEvents();
-    await this.#rpc.shutdown();
+    try {
+      await this.#rpc.shutdown(
+        LIFECYCLE_CLOSE_TIMEOUT_MS,
+        startedAt === undefined ? {} : { measure: true, onTelemetry },
+      );
+    } finally {
+      // A close (including a shutdown failure) has exactly one terminal sample.
+      this.#emitPerformanceSample("close", startedAt, { peakReservationBytes });
+      this.#performanceListeners.clear();
+    }
   }
 
   dispose(): Promise<void> {
@@ -321,8 +543,15 @@ class Engine implements TabularkEngine {
   async openTable(session: DatasetSessionImpl, tableId: string): Promise<TableHandle> {
     this.#assertOpen();
     session.assertOpen();
+    const startedAt = this.#performanceListeners.size > 0 ? finitePerformanceNow() : undefined;
+    let peakReservationBytes = 0;
+    const onTelemetry = (telemetry: OperationTelemetry | undefined): void => {
+      if (telemetry) peakReservationBytes = Math.max(peakReservationBytes, telemetry.peakReservationBytes);
+    };
     if (!session.tables.some((table) => table.id === tableId)) {
-      throw invalidArgument(`Unknown table: ${tableId}`);
+      const error = invalidArgument(`Unknown table: ${tableId}`);
+      this.#emitPerformanceSample("open-table", startedAt, { peakReservationBytes });
+      throw error;
     }
     let tableHandle: string | undefined;
     try {
@@ -330,6 +559,7 @@ class Engine implements TabularkEngine {
         "openTable",
         { datasetHandle: session.handle, tableId },
         "table",
+        startedAt === undefined ? {} : { measure: true, onTelemetry },
       );
       if (
         !isRecord(table)
@@ -343,6 +573,7 @@ class Engine implements TabularkEngine {
         "getMetadata",
         { tableHandle },
         "metadata",
+        startedAt === undefined ? {} : { measure: true, onTelemetry },
       );
       const normalizedMetadata = normalizeMetadataWire(metadata);
       this.#assertOpen();
@@ -354,11 +585,13 @@ class Engine implements TabularkEngine {
         normalizedMetadata,
       );
       session.addTableHandle(handle);
+      this.#emitPerformanceSample("open-table", startedAt, { peakReservationBytes });
       return handle;
     } catch (error) {
       if (tableHandle !== undefined) {
         await this.#discardOpenedTable(tableHandle);
       }
+      this.#emitPerformanceSample("open-table", startedAt, { peakReservationBytes });
       throw error;
     }
   }
@@ -370,54 +603,88 @@ class Engine implements TabularkEngine {
   ): Promise<TableBatch> {
     this.#assertOpen();
     table.assertOpen();
-    const normalized = validateRange(request);
-    if (options.signal?.aborted) {
-      throw cancelledError();
-    }
-    const metadata = table.metadata;
-    const key = rangeCacheKey(
-      table.handle,
-      metadata.revision,
-      metadata.schema.version,
-      normalized,
-    );
-    const cached = this.#rangeCache.get(key);
-    if (cached) {
-      return new ColumnarTableBatch(cloneWireTableBatch(cached));
-    }
-    const batch = await this.#rpc.request<WireTableBatch>(
-      "readRange",
-      { tableHandle: table.handle, range: normalized },
-      "batch",
-      options.signal ? { signal: options.signal } : {},
-    );
-    this.#assertOpen();
-    table.assertOpen();
-    // Incomplete batches end at a progressive indexed-prefix boundary. They
-    // are valid results for this instant, but caching them would hide rows
-    // discovered by subsequent Arrow Stream or delimited scan progress.
-    if (batch.complete) {
-      const cachedBatch = cloneWireTableBatch(batch);
-      this.#rangeCache.set(
-        rangeCacheKey(table.handle, batch.revision, batch.schemaVersion, normalized),
-        cachedBatch,
-        wireBatchByteLength(cachedBatch),
+    const startedAt = this.#performanceListeners.size > 0 ? finitePerformanceNow() : undefined;
+    let bytesRead = 0;
+    let cacheHit = false;
+    let peakReservationBytes = 0;
+    const onTelemetry = (telemetry: OperationTelemetry | undefined): void => {
+      if (!telemetry) return;
+      // A single logical range can require several bounded source reads (for
+      // example a footer, index, and page). Report the total bytes observed by
+      // the Worker rather than only the largest individual slice.
+      bytesRead = addPerformanceBytes(bytesRead, telemetry.bytesRead);
+      peakReservationBytes = Math.max(peakReservationBytes, telemetry.peakReservationBytes);
+    };
+    try {
+      const normalized = validateRange(request);
+      if (options.signal?.aborted) {
+        throw cancelledError();
+      }
+      const metadata = table.metadata;
+      const key = rangeCacheKey(
+        table.handle,
+        metadata.revision,
+        metadata.schema.version,
+        normalized,
       );
+      const cached = this.#rangeCache.get(key);
+      if (cached) {
+        cacheHit = true;
+        return new ColumnarTableBatch(cloneWireTableBatch(cached));
+      }
+      const batch = await this.#rpc.request<WireTableBatch>(
+        "readRange",
+        { tableHandle: table.handle, range: normalized },
+        "batch",
+        {
+          ...(options.signal ? { signal: options.signal } : {}),
+          ...(startedAt === undefined ? {} : { measure: true, onTelemetry }),
+        },
+      );
+      this.#assertOpen();
+      table.assertOpen();
+      // Incomplete batches end at a progressive indexed-prefix boundary. They
+      // are valid results for this instant, but caching them would hide rows
+      // discovered by subsequent Arrow Stream or delimited scan progress.
+      if (batch.complete) {
+        const cachedBatch = cloneWireTableBatch(batch);
+        this.#rangeCache.set(
+          rangeCacheKey(table.handle, batch.revision, batch.schemaVersion, normalized),
+          cachedBatch,
+          wireBatchByteLength(cachedBatch),
+        );
+      }
+      return new ColumnarTableBatch(batch);
+    } finally {
+      this.#emitPerformanceSample("read-range", startedAt, {
+        bytesRead,
+        cacheHit,
+        peakReservationBytes,
+      });
     }
-    return new ColumnarTableBatch(batch);
   }
 
   async getPresentation(table: TableHandleImpl): Promise<TablePresentation | null> {
     this.#assertOpen();
     table.assertOpen();
-    const value = await this.#rpc.request<unknown>(
-      "getPresentation",
-      { tableHandle: table.handle },
-      "presentation",
-    );
-    this.#assertOpen();
-    table.assertOpen();
-    return normalizePresentationWire(value, table.metadata);
+    const startedAt = this.#performanceListeners.size > 0 ? finitePerformanceNow() : undefined;
+    let peakReservationBytes = 0;
+    const onTelemetry = (telemetry: OperationTelemetry | undefined): void => {
+      if (telemetry) peakReservationBytes = Math.max(peakReservationBytes, telemetry.peakReservationBytes);
+    };
+    try {
+      const value = await this.#rpc.request<unknown>(
+        "getPresentation",
+        { tableHandle: table.handle },
+        "presentation",
+        startedAt === undefined ? {} : { measure: true, onTelemetry },
+      );
+      this.#assertOpen();
+      table.assertOpen();
+      return normalizePresentationWire(value, table.metadata);
+    } finally {
+      this.#emitPerformanceSample("presentation", startedAt, { peakReservationBytes });
+    }
   }
 
   async readPresentationRange(
@@ -427,30 +694,56 @@ class Engine implements TabularkEngine {
   ): Promise<PresentationRange | null> {
     this.#assertOpen();
     table.assertOpen();
-    const normalized = validateRange(request);
-    if (options.signal?.aborted) {
-      throw cancelledError();
+    const startedAt = this.#performanceListeners.size > 0 ? finitePerformanceNow() : undefined;
+    let peakReservationBytes = 0;
+    const onTelemetry = (telemetry: OperationTelemetry | undefined): void => {
+      if (telemetry) peakReservationBytes = Math.max(peakReservationBytes, telemetry.peakReservationBytes);
+    };
+    try {
+      const normalized = validateRange(request);
+      if (options.signal?.aborted) {
+        throw cancelledError();
+      }
+      const value = await this.#rpc.request<unknown>(
+        "readPresentationRange",
+        { tableHandle: table.handle, range: normalized },
+        "presentationRange",
+        {
+          ...(options.signal ? { signal: options.signal } : {}),
+          ...(startedAt === undefined ? {} : { measure: true, onTelemetry }),
+        },
+      );
+      this.#assertOpen();
+      table.assertOpen();
+      return normalizePresentationRangeWire(value, table.metadata, normalized);
+    } finally {
+      this.#emitPerformanceSample("presentation-range", startedAt, { peakReservationBytes });
     }
-    const value = await this.#rpc.request<unknown>(
-      "readPresentationRange",
-      { tableHandle: table.handle, range: normalized },
-      "presentationRange",
-      options.signal ? { signal: options.signal } : {},
-    );
-    this.#assertOpen();
-    table.assertOpen();
-    return normalizePresentationRangeWire(value, table.metadata, normalized);
   }
 
   async closeTable(table: TableHandleImpl): Promise<void> {
     if (table.closed) {
       return;
     }
+    const startedAt = this.#performanceListeners.size > 0 ? finitePerformanceNow() : undefined;
+    let peakReservationBytes = 0;
+    const onTelemetry = (telemetry: OperationTelemetry | undefined): void => {
+      if (telemetry) peakReservationBytes = Math.max(peakReservationBytes, telemetry.peakReservationBytes);
+    };
     table.closeLocally();
     if (this.#closed) {
+      this.#emitPerformanceSample("close-table", startedAt, { peakReservationBytes });
       return;
     }
-    await this.#requestRemoteClose("closeTable", { tableHandle: table.handle });
+    try {
+      await this.#requestRemoteClose(
+        "closeTable",
+        { tableHandle: table.handle },
+        startedAt === undefined ? {} : { measure: true, onTelemetry },
+      );
+    } finally {
+      this.#emitPerformanceSample("close-table", startedAt, { peakReservationBytes });
+    }
   }
 
   clearTableCache(tableHandle: string): void {
@@ -461,16 +754,27 @@ class Engine implements TabularkEngine {
     if (session.closed) {
       return;
     }
+    const startedAt = this.#performanceListeners.size > 0 ? finitePerformanceNow() : undefined;
+    let peakReservationBytes = 0;
+    const onTelemetry = (telemetry: OperationTelemetry | undefined): void => {
+      if (telemetry) peakReservationBytes = Math.max(peakReservationBytes, telemetry.peakReservationBytes);
+    };
     session.closeLocally();
     if (this.#closed) {
       this.#sessions.delete(session.handle);
+      this.#emitPerformanceSample("close-session", startedAt, { peakReservationBytes });
       return;
     }
     try {
-      await this.#requestRemoteClose("closeSource", { datasetHandle: session.handle });
+      await this.#requestRemoteClose(
+        "closeSource",
+        { datasetHandle: session.handle },
+        startedAt === undefined ? {} : { measure: true, onTelemetry },
+      );
     } finally {
       this.#sessions.delete(session.handle);
       this.#deleteOrphanEvents(session.handle);
+      this.#emitPerformanceSample("close-session", startedAt, { peakReservationBytes });
     }
   }
 
@@ -478,6 +782,26 @@ class Engine implements TabularkEngine {
     if (this.#closed) {
       throw closedError("Engine");
     }
+  }
+
+  /** Mirrors the Worker adapter-runtime split for staged Excel capabilities. */
+  #stagedSourceLimit(adapterId: OfficialAdapterId): number {
+    if (adapterId !== "tabulark:excel") {
+      return this.#maxArrayBufferBytes;
+    }
+    const totalWeight = [...this.#adapters.values()].reduce(
+      (total, adapter) => total + officialAdapterManifestEntry(adapter.id).resources.runtimeWeight,
+      0,
+    );
+    const weight = officialAdapterManifestEntry(adapterId).resources.runtimeWeight;
+    const runtimeBudget = Math.max(
+      1,
+      Math.floor(this.#limits.adapterRuntimePoolBytes * weight / Math.max(1, totalWeight)),
+    );
+    // `maxArrayBufferBytes` is the public host bound. The Excel WASM wrapper
+    // receives its weighted runtime budget as its staging ceiling, so report
+    // the lower of the two rather than an optimistic unbounded value.
+    return Math.min(this.#maxArrayBufferBytes, runtimeBudget);
   }
 
   #handleEvent(event: ProtocolEvent): void {
@@ -563,10 +887,12 @@ class Engine implements TabularkEngine {
   async #requestRemoteClose(
     op: "closeTable" | "closeSource",
     payload: unknown,
+    options: PerformanceRequestOptions = {},
   ): Promise<void> {
     try {
       await this.#rpc.request(op, payload, "acknowledged", {
         timeoutMs: LIFECYCLE_CLOSE_TIMEOUT_MS,
+        ...options,
       });
     } catch (error) {
       if (!this.#closed) {
@@ -666,14 +992,26 @@ class DatasetSessionImpl implements DatasetSession {
   readonly handle: string;
   readonly tables: readonly Readonly<TableDescriptor>[];
   readonly #listeners = new Set<(event: DatasetEvent) => void>();
+  readonly #diagnosticListeners = new Set<(diagnostic: TabularkDiagnostic) => void>();
+  readonly #diagnostics: TabularkDiagnostic[] = [];
+  readonly #capabilitySeed: DatasetCapabilitySeed;
   readonly #tableHandles = new Set<TableHandleImpl>();
+  #observedTypedValues: boolean | undefined;
+  #observedMultiTable: boolean | undefined;
+  #observedProgressive: boolean | undefined;
   closed = false;
   terminalError: TabularkError | undefined;
 
-  constructor(engine: Engine, handle: string, tables: readonly TableDescriptor[]) {
+  constructor(
+    engine: Engine,
+    handle: string,
+    tables: readonly TableDescriptor[],
+    capabilitySeed?: DatasetCapabilitySeed,
+  ) {
     this.#engine = engine;
     this.handle = handle;
     this.tables = Object.freeze(tables.map((table) => Object.freeze({ ...table })));
+    this.#capabilitySeed = capabilitySeed ?? createFallbackDatasetCapabilitySeed(this.tables);
   }
 
   openTable(tableId: string): Promise<TableHandle> {
@@ -684,6 +1022,36 @@ class DatasetSessionImpl implements DatasetSession {
     this.assertOpen();
     this.#listeners.add(listener);
     return () => this.#listeners.delete(listener);
+  }
+
+  getDiagnostics(): readonly TabularkDiagnostic[] {
+    return Object.freeze([...this.#diagnostics]);
+  }
+
+  subscribeDiagnostics(listener: (diagnostic: TabularkDiagnostic) => void): Unsubscribe {
+    this.assertOpen();
+    if (typeof listener !== "function") {
+      throw invalidArgument("diagnostic listener must be a function");
+    }
+    this.#diagnosticListeners.add(listener);
+    return () => this.#diagnosticListeners.delete(listener);
+  }
+
+  getCapabilities(): Readonly<DatasetCapabilities> {
+    const openedTables = [...this.#tableHandles];
+    const typedValues = openedTables.length > 0
+      ? openedTables.every((table) => table.getCapabilities().typedValues)
+      : this.#observedTypedValues ?? this.#capabilitySeed.typedValues;
+    const multiTable = this.tables.length > 1
+      || openedTables.some((table) => table.getCapabilities().multiTable)
+      || this.#observedMultiTable === true
+      || this.#capabilitySeed.multiTable;
+    return Object.freeze({
+      ...this.#capabilitySeed,
+      progressive: this.#observedProgressive ?? this.#capabilitySeed.progressive,
+      typedValues,
+      multiTable,
+    });
   }
 
   close(): Promise<void> {
@@ -722,6 +1090,7 @@ class DatasetSessionImpl implements DatasetSession {
     }
     this.closed = true;
     this.terminalError = error;
+    this.#recordDiagnostic(diagnosticFromError(error));
     this.#emit({ type: "runtimeError", error });
     for (const table of [...this.#tableHandles]) {
       table.failLocally(error);
@@ -743,6 +1112,14 @@ class DatasetSessionImpl implements DatasetSession {
         break;
       case "metadata": {
         const metadata = normalizeMetadataWire(event.payload);
+        this.#observedTypedValues = this.#observedTypedValues === undefined
+          ? metadata.capabilities.typedValues
+          : this.#observedTypedValues && metadata.capabilities.typedValues;
+        if (this.#capabilitySeed.adapterId === "tabulark:arrow-ipc") {
+          this.#observedProgressive = metadata.capabilities.randomAccess === "indexed-prefix";
+        }
+        this.#observedMultiTable = this.#observedMultiTable === true
+          || metadata.capabilities.multiTable;
         this.#emit({ type: "metadata", metadata });
         if (!event.tableHandle) {
           for (const table of this.#tableHandles) {
@@ -755,10 +1132,25 @@ class DatasetSessionImpl implements DatasetSession {
       }
       case "warning": {
         const warning = normalizeWarning(event.payload);
+        const routedTable = event.tableHandle === undefined
+          ? undefined
+          : [...this.#tableHandles].find((table) => table.handle === event.tableHandle);
+        this.#recordDiagnostic(diagnosticFromWarning(
+          warning,
+          event.tableId ?? routedTable?.metadata.tableId,
+          event.revision ?? routedTable?.metadata.revision,
+        ));
         this.#emit({ type: "warning", warning });
         for (const table of this.#tableHandles) {
-          if (table.matchesWarning(warning)) {
-            table.emitWarning(warning);
+          if (table.matchesWarning(warning) && !event.tableHandle) {
+            const recordDiagnostic = event.tableId !== undefined
+              && table.metadata.tableId === event.tableId;
+            table.emitWarning(
+              warning,
+              recordDiagnostic,
+              event.tableId,
+              event.revision,
+            );
           }
         }
         break;
@@ -766,6 +1158,12 @@ class DatasetSessionImpl implements DatasetSession {
       case "runtimeError": {
         const error = errorFromWire(event.payload);
         if (event.tableHandle) {
+          const routedTable = [...this.#tableHandles].find((table) => table.handle === event.tableHandle);
+          this.#recordDiagnostic(diagnosticFromError(
+            error,
+            event.tableId ?? routedTable?.metadata.tableId,
+            event.revision ?? routedTable?.metadata.revision,
+          ));
           this.#emit({ type: "runtimeError", error });
         } else {
           this.failLocally(error);
@@ -792,6 +1190,16 @@ class DatasetSessionImpl implements DatasetSession {
       safelyCall(listener, event);
     }
   }
+
+  #recordDiagnostic(diagnostic: TabularkDiagnostic): void {
+    if (this.#diagnostics.length >= MAX_DIAGNOSTICS) {
+      this.#diagnostics.shift();
+    }
+    this.#diagnostics.push(diagnostic);
+    for (const listener of this.#diagnosticListeners) {
+      safelyCall(listener, diagnostic);
+    }
+  }
 }
 
 class TableHandleImpl implements TableHandle {
@@ -800,6 +1208,8 @@ class TableHandleImpl implements TableHandle {
   readonly handle: string;
   #metadata: Readonly<TableMetadata>;
   readonly #listeners = new Set<(event: TableEvent) => void>();
+  readonly #diagnosticListeners = new Set<(diagnostic: TabularkDiagnostic) => void>();
+  readonly #diagnostics: TabularkDiagnostic[] = [];
   closed = false;
 
   constructor(
@@ -812,6 +1222,14 @@ class TableHandleImpl implements TableHandle {
     this.#session = session;
     this.handle = handle;
     this.#metadata = metadata;
+    // Scan warnings can arrive before a caller opens a particular worksheet.
+    // Seed only diagnostics explicitly routed to this logical table; a
+    // dataset-level diagnostic must not be duplicated into every worksheet.
+    for (const diagnostic of session.getDiagnostics()) {
+      if (diagnostic.tableId === metadata.tableId) {
+        this.#diagnostics.push(diagnostic);
+      }
+    }
   }
 
   get metadata(): Readonly<TableMetadata> {
@@ -837,6 +1255,39 @@ class TableHandleImpl implements TableHandle {
     this.assertOpen();
     this.#listeners.add(listener);
     return () => this.#listeners.delete(listener);
+  }
+
+  getDiagnostics(): readonly TabularkDiagnostic[] {
+    return Object.freeze([...this.#diagnostics]);
+  }
+
+  subscribeDiagnostics(listener: (diagnostic: TabularkDiagnostic) => void): Unsubscribe {
+    this.assertOpen();
+    if (typeof listener !== "function") {
+      throw invalidArgument("diagnostic listener must be a function");
+    }
+    this.#diagnosticListeners.add(listener);
+    return () => this.#diagnosticListeners.delete(listener);
+  }
+
+  getCapabilities(): Readonly<TableCapabilities> {
+    const capabilities = this.#metadata.capabilities;
+    // Preserve logical extension flags supplied by an adapter while excluding
+    // names that would expose private transport/runtime implementation state.
+    const logicalExtensions = Object.fromEntries(
+      Object.entries(capabilities)
+        .filter(([name, value]) => !isPrivateCapabilityName(name) && isLogicalCapabilityValue(value))
+        .map(([name, value]) => [name, freezeLogicalCapabilityValue(value)]),
+    );
+    return Object.freeze({
+      ...logicalExtensions,
+      randomAccess: capabilities.randomAccess,
+      typedValues: capabilities.typedValues,
+      search: capabilities.search,
+      sort: capabilities.sort,
+      filter: capabilities.filter,
+      multiTable: capabilities.multiTable,
+    });
   }
 
   close(): Promise<void> {
@@ -866,6 +1317,7 @@ class TableHandleImpl implements TableHandle {
     this.#engine.clearTableCache(this.handle);
     this.closed = true;
     this.#session.removeTableHandle(this);
+    this.#recordDiagnostic(diagnosticFromError(error, this.metadata.tableId, this.metadata.revision));
     this.#emit({ type: "runtimeError", error });
     this.#emit({ type: "closed" });
   }
@@ -882,8 +1334,20 @@ class TableHandleImpl implements TableHandle {
     return warning.handle === this.handle || warning.handle === this.#session.handle;
   }
 
-  emitWarning(warning: SourceWarning): void {
+  emitWarning(
+    warning: SourceWarning,
+    recordDiagnostic = true,
+    tableId = this.metadata.tableId,
+    revision = this.metadata.revision,
+  ): void {
     if (!this.closed) {
+      if (recordDiagnostic) {
+        this.#recordDiagnostic(diagnosticFromWarning(
+          warning,
+          tableId,
+          revision,
+        ));
+      }
       this.#emit({ type: "warning", warning });
     }
   }
@@ -897,7 +1361,12 @@ class TableHandleImpl implements TableHandle {
         this.updateMetadata(normalizeMetadataWire(event.payload));
         break;
       case "warning":
-        this.emitWarning(normalizeWarning(event.payload));
+        this.emitWarning(
+          normalizeWarning(event.payload),
+          true,
+          event.tableId ?? this.metadata.tableId,
+          event.revision ?? this.metadata.revision,
+        );
         break;
       case "runtimeError":
         this.failLocally(errorFromWire(event.payload));
@@ -913,6 +1382,16 @@ class TableHandleImpl implements TableHandle {
   #emit(event: TableEvent): void {
     for (const listener of this.#listeners) {
       safelyCall(listener, event);
+    }
+  }
+
+  #recordDiagnostic(diagnostic: TabularkDiagnostic): void {
+    if (this.#diagnostics.length >= MAX_DIAGNOSTICS) {
+      this.#diagnostics.shift();
+    }
+    this.#diagnostics.push(diagnostic);
+    for (const listener of this.#diagnosticListeners) {
+      safelyCall(listener, diagnostic);
     }
   }
 }
@@ -970,6 +1449,10 @@ function normalizeOpenOptions<Options>(
   if (options.transferInput !== undefined && typeof options.transferInput !== "boolean") {
     throw invalidArgument("transferInput must be a boolean");
   }
+  const sourceMode = options.sourceMode === undefined ? "auto" : options.sourceMode;
+  if (!isSourceMode(sourceMode)) {
+    throw invalidArgument("sourceMode must be auto or large");
+  }
   const selected = resolveOfficialAdapter(options.adapter);
   if (!selected) {
     throw invalidArgument("adapter must be an official frozen adapter descriptor");
@@ -1012,7 +1495,30 @@ function normalizeOpenOptions<Options>(
   return {
     adapter: registered,
     options: normalized,
+    sourceMode,
   };
+}
+
+function largeSourceLimitError(requiredBytes: unknown): TabularkError {
+  // Error details cross the public JS boundary as numbers. Clamp malformed or
+  // rounded Blob sizes to a safe sentinel rather than exposing an unsafe
+  // quantity that could not be represented reliably by a range request.
+  const required = typeof requiredBytes === "number"
+    && Number.isFinite(requiredBytes)
+    && requiredBytes >= 0
+    ? Math.min(Math.floor(requiredBytes), Number.MAX_SAFE_INTEGER)
+    : Number.MAX_SAFE_INTEGER;
+  return new TabularkError(
+    "RESOURCE_LIMIT",
+    `Large source mode supports Blob inputs up to ${MAX_LARGE_SOURCE_BYTES} bytes`,
+    {
+      details: {
+        resource: "source-staging",
+        requiredBytes: required,
+        availableBytes: MAX_LARGE_SOURCE_BYTES,
+      },
+    },
+  );
 }
 
 function normalizeDelimitedOptions(
@@ -1442,15 +1948,324 @@ function normalizeProgress(
 
 function normalizeWarning(value: unknown): SourceWarning {
   const raw = isRecord(value) ? value : {};
+  // Preserve the historical warning shape (including any adapter-supplied
+  // integer offset); the structured diagnostic applies its own safe bounds.
+  const byteOffset = Number.isSafeInteger(raw.byteOffset)
+    ? raw.byteOffset as number
+    : undefined;
+  const sourceOffset = Number.isSafeInteger(raw.sourceOffset) && (raw.sourceOffset as number) >= 0
+    ? raw.sourceOffset as number
+    : undefined;
+  const row = Number.isSafeInteger(raw.row) && (raw.row as number) >= 0
+    ? raw.row as number
+    : undefined;
+  const column = Number.isSafeInteger(raw.column) && (raw.column as number) >= 0
+    ? raw.column as number
+    : undefined;
   return {
     handle: typeof raw.handle === "string" ? raw.handle : "",
     kind: typeof raw.kind === "string" ? raw.kind : "warning",
     message: typeof raw.message === "string" ? raw.message : "Source warning",
-    ...(Number.isSafeInteger(raw.byteOffset) ? { byteOffset: raw.byteOffset as number } : {}),
-    ...(Number.isSafeInteger(raw.row) && (raw.row as number) >= 0
-      ? { row: raw.row as number }
-      : {}),
+    ...(byteOffset === undefined ? {} : { byteOffset }),
+    ...(sourceOffset === undefined ? {} : { sourceOffset }),
+    ...(row === undefined ? {} : { row }),
+    ...(column === undefined ? {} : { column }),
   };
+}
+
+function diagnosticFromWarning(
+  warning: SourceWarning,
+  tableId?: string,
+  revision?: number,
+): TabularkDiagnostic {
+  const byteOffset = warning.sourceOffset ?? warning.byteOffset;
+  const sourceOffset = typeof byteOffset === "number" && Number.isSafeInteger(byteOffset) && byteOffset >= 0
+    ? byteOffset
+    : undefined;
+  const warningRow = warning.row;
+  const row = typeof warningRow === "number" && Number.isSafeInteger(warningRow) && warningRow >= 0
+    ? warningRow
+    : undefined;
+  const warningColumn = warning.column;
+  const column = typeof warningColumn === "number"
+    && Number.isSafeInteger(warningColumn)
+    && warningColumn >= 0
+    ? warningColumn
+    : undefined;
+  const diagnosticRevision = typeof revision === "number"
+    && Number.isSafeInteger(revision)
+    && revision >= 0
+    ? revision
+    : undefined;
+  const code = safeDiagnosticCode(warning.kind, "SOURCE_WARNING");
+  const safeTableId = safeDiagnosticTableId(tableId);
+  return Object.freeze({
+    code,
+    severity: "warning" as const,
+    // Keep the legacy warning event available to callers that need its full
+    // text, but expose only a stable category sentence here. Adapter warning
+    // strings can contain worksheet names or source excerpts and therefore
+    // are not safe to retain in the public diagnostic snapshot.
+    message: safeDiagnosticMessage(warning.message, diagnosticFallback(code, "warning"), code),
+    recoverable: true,
+    ...(sourceOffset === undefined ? {} : { sourceOffset }),
+    ...(safeTableId === undefined ? {} : { tableId: safeTableId }),
+    ...(diagnosticRevision === undefined ? {} : { revision: diagnosticRevision }),
+    ...(row === undefined ? {} : { row }),
+    ...(column === undefined ? {} : { column }),
+  });
+}
+
+function diagnosticFromError(
+  error: TabularkError,
+  tableId?: string,
+  revision?: number,
+): TabularkDiagnostic {
+  const details = isRecord(error.details) ? error.details : {};
+  const detailOffset = firstNonNegativeSafeInteger(details.sourceOffset)
+    ?? firstNonNegativeSafeInteger(details.byteOffset);
+  const detailRow = firstNonNegativeSafeInteger(details.row);
+  const detailColumn = firstNonNegativeSafeInteger(details.column);
+  const detailTableId = typeof details.tableId === "string" && details.tableId.length > 0
+    ? details.tableId
+    : undefined;
+  const detailRevision = firstNonNegativeSafeInteger(details.revision);
+  const diagnosticRevision = typeof revision === "number"
+    && Number.isSafeInteger(revision)
+    && revision >= 0
+    ? revision
+    : detailRevision;
+  const code = safeDiagnosticCode(error.code, "RUNTIME_FAILURE");
+  const safeTableId = safeDiagnosticTableId(tableId);
+  const safeDetailTableId = safeDiagnosticTableId(detailTableId);
+  return Object.freeze({
+    code,
+    severity: "error" as const,
+    message: safeErrorDiagnosticMessage(error, code),
+    recoverable: error.retryable,
+    ...(safeTableId !== undefined
+      ? { tableId: safeTableId }
+      : safeDetailTableId === undefined
+        ? {}
+        : { tableId: safeDetailTableId }),
+    ...(detailOffset === undefined ? {} : { sourceOffset: detailOffset }),
+    ...(diagnosticRevision === undefined ? {} : { revision: diagnosticRevision }),
+    ...(detailRow === undefined ? {} : { row: detailRow }),
+    ...(detailColumn === undefined ? {} : { column: detailColumn }),
+  });
+}
+
+function safeErrorDiagnosticMessage(error: TabularkError, code: string): string {
+  // Protocol/ABI details are intentionally kept out of the stable diagnostic
+  // surface; callers can still inspect the original DatasetEvent error.
+  return safeDiagnosticMessage(
+    error.message,
+    diagnosticFallback(code, "error"),
+    code,
+  );
+}
+
+function safeDiagnosticCode(value: unknown, fallback: string): string {
+  if (typeof value !== "string" || value.length === 0) return fallback;
+  const normalized = value.replace(/[^A-Za-z0-9_.:-]/gu, "_").slice(0, 96);
+  // Protocol/ABI names describe the private transport, not a stable source
+  // diagnostic.  Keep the original TabularkError code on the compatibility
+  // DatasetEvent, but collapse it before it can enter a public snapshot.
+  if (normalized === "PROTOCOL_INCOMPATIBLE") return "RUNTIME_FAILURE";
+  return normalized.length > 0 && SAFE_DIAGNOSTIC_CODES.has(normalized)
+    ? normalized
+    : fallback;
+}
+
+// Adapter-provided text is deliberately not an open-ended public code space:
+// a malicious container must not smuggle a path, worksheet name, or source
+// excerpt into a supposedly safe diagnostic snapshot.
+const SAFE_DIAGNOSTIC_CODES = new Set([
+  "SOURCE_WARNING",
+  "RUNTIME_FAILURE",
+  "ragged-row",
+  "quote-in-unquoted-field",
+  "unexpected-data-after-closing-quote",
+  "unterminated-quote",
+  "skipped-sheet",
+  "missing-formula-cache",
+  "RESOURCE_LIMIT",
+  "CANCELLED",
+  "HANDLE_CLOSED",
+  "RANGE_NOT_INDEXED",
+  "PARSE_FAILED",
+  "UNSUPPORTED_FEATURE",
+  "INVALID_RANGE",
+  "INVALID_ARGUMENT",
+  "UNSUPPORTED_RUNTIME",
+]);
+
+function safeDiagnosticMessage(value: unknown, fallback: string, code?: string): string {
+  // Only a small, code-keyed vocabulary is retained. This prevents a source
+  // cell, worksheet name, path, URL, or parser buffer excerpt from entering a
+  // snapshot even when an adapter sends it as its warning/error message.
+  const stable = diagnosticFallback(code, "warning");
+  return stable.length <= MAX_DIAGNOSTIC_MESSAGE_LENGTH ? stable : fallback;
+}
+
+function diagnosticFallback(code: string | undefined, severity: "warning" | "error"): string {
+  switch (code) {
+    case "ragged-row":
+      return "Rows contain inconsistent field counts";
+    case "quote-in-unquoted-field":
+      return "A quoted value appeared in an unquoted field";
+    case "unexpected-data-after-closing-quote":
+      return "Unexpected data followed a closing quote";
+    case "unterminated-quote":
+      return "A quoted field was not terminated";
+    case "skipped-sheet":
+      return "A workbook sheet was skipped";
+    case "missing-formula-cache":
+      return "A formula has no cached result";
+    case "RESOURCE_LIMIT":
+      return "A configured resource limit was reached";
+    case "CANCELLED":
+      return "The operation was cancelled";
+    case "HANDLE_CLOSED":
+      return "The handle is closed";
+    case "RANGE_NOT_INDEXED":
+      return "The requested range is not indexed yet";
+    case "PARSE_FAILED":
+      return "The source could not be parsed";
+    case "UNSUPPORTED_FEATURE":
+      return "The source uses an unsupported feature";
+    case "INVALID_RANGE":
+      return "The requested range is invalid";
+    case "INVALID_ARGUMENT":
+      return "An operation argument is invalid";
+    case "UNSUPPORTED_RUNTIME":
+      return "The current runtime is unsupported";
+    case "RUNTIME_FAILURE":
+      return "The runtime reported a failure";
+    default:
+      return severity === "warning" ? "Source warning" : "The operation failed";
+  }
+}
+
+function safeDiagnosticTableId(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0 || value.length > 128) {
+    return undefined;
+  }
+  // Table IDs are logical handles, not a channel for source names or paths.
+  // Keep the stable identifier alphabet while omitting values that look like
+  // filenames, URLs, or traversal fragments instead of returning a lossy copy
+  // of potentially sensitive source text.
+  return /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u.test(value) ? value : undefined;
+}
+
+function createDatasetCapabilitySeed(
+  adapterId: OfficialAdapterId,
+  options: Readonly<Record<string, unknown>>,
+  sourceBytes: number,
+  tables: readonly TableDescriptor[],
+  sourceMode: SourceMode = "auto",
+  stagedSourceLimit = MAX_ARRAY_BUFFER_BYTES,
+): DatasetCapabilitySeed {
+  const manifest = officialAdapterManifestEntry(adapterId);
+  const largeExcelRange = sourceMode === "large"
+    && adapterId === "tabulark:excel"
+    && (options.format === "xlsx"
+      // Worker auto-detection switches to the range-backed host only when a
+      // source is larger than the staged Excel ceiling. A successfully opened
+      // source in this branch is therefore known to be OOXML.
+      || options.format === "auto" && sourceBytes > stagedSourceLimit);
+  // `auto` is intentionally conservative: a File may resolve to an IPC file
+  // (non-progressive) or a stream envelope, and the definitive metadata event
+  // updates the snapshot once the adapter has inspected its magic bytes.
+  const progressive = adapterId === "tabulark:delimited"
+    || (adapterId === "tabulark:arrow-ipc" && options.container === "stream");
+  const sourceAccess = largeExcelRange
+    ? "range"
+    : adapterId === "tabulark:arrow-ipc" && options.container === "stream"
+      ? "streaming"
+      : manifest.resources.sourceAccess;
+  const maxSourceBytes = sourceMode === "large"
+    ? adapterId === "tabulark:excel" && !largeExcelRange
+      ? stagedSourceLimit
+      : MAX_LARGE_SOURCE_BYTES
+    : adapterId === "tabulark:excel"
+      ? stagedSourceLimit
+      : adapterId === "tabulark:arrow-ipc" ? 0xffff_ffff : Number.MAX_SAFE_INTEGER;
+  return Object.freeze({
+    adapterId,
+    sourceAccess,
+    progressive: largeExcelRange ? false : progressive,
+    maxSourceBytes,
+    multiTable: tables.length > 1 || adapterId === "tabulark:excel",
+    presentation: manifest.resources.supportsPresentation,
+    typedValues: adapterId === "tabulark:arrow-ipc" || adapterId === "tabulark:parquet",
+  });
+}
+
+function createFallbackDatasetCapabilitySeed(
+  tables: readonly TableDescriptor[],
+): DatasetCapabilitySeed {
+  return Object.freeze({
+    adapterId: "tabulark:delimited",
+    sourceAccess: "streaming",
+    progressive: true,
+    maxSourceBytes: Number.MAX_SAFE_INTEGER,
+    multiTable: tables.length > 1,
+    presentation: false,
+    typedValues: false,
+  });
+}
+
+function finitePerformanceNow(): number {
+  const now = typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+  return Number.isFinite(now) ? now : 0;
+}
+
+function nonNegativeFinite(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function nonNegativeSafeQuantity(value: unknown): number {
+  return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : 0;
+}
+
+function addPerformanceBytes(current: number, next: number): number {
+  const value = nonNegativeFinite(current) + nonNegativeFinite(next);
+  return Number.isSafeInteger(value) ? value : Number.MAX_SAFE_INTEGER;
+}
+
+function firstNonNegativeSafeInteger(value: unknown): number | undefined {
+  return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : undefined;
+}
+
+function sanitizePerformanceStage(value: string): string {
+  const normalized = value.replace(/[^A-Za-z0-9_.:-]/gu, "_").slice(0, 64);
+  return normalized.length > 0 ? normalized : "operation";
+}
+
+function isPrivateCapabilityName(name: string): boolean {
+  // Metadata is adapter-controlled input. Preserve small logical extension
+  // flags (for example `customCapability`) but keep transport/runtime state,
+  // source paths, and allocation details out of the stable capability view.
+  return /(?:protocol|abi|layout|worker|wire|buffer|transport|runtime|module|wasm|memory|source|path|url|resource|reservation|offset|handle|request|response)/iu.test(name);
+}
+
+function isLogicalCapabilityValue(value: unknown): boolean {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  return Array.isArray(value)
+    && value.length <= 64
+    && value.every((entry) => entry === null
+      || typeof entry === "boolean"
+      || typeof entry === "string"
+      || (typeof entry === "number" && Number.isFinite(entry)));
+}
+
+function freezeLogicalCapabilityValue<T>(value: T): T {
+  if (!Array.isArray(value)) return value;
+  return Object.freeze([...value]) as T;
 }
 
 function inferSourceName(source: unknown): string | undefined {

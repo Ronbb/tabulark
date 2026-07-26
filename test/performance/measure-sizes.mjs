@@ -35,6 +35,7 @@ const parquetRuntimePaths = [
 ];
 const excelRuntimePaths = [
   entrypointBundle(excelArtifact),
+  "dist/worker/large-excel-adapter.js",
   ...wasmRuntimePaths(excelArtifact),
 ];
 

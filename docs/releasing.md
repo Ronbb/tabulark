@@ -1,17 +1,22 @@
 # Delivery and release policy
 
-M4 completed as a source and Pages milestone. It did **not** publish 0.1.0.
-The 0.1.0 tag remains the only formal release entry point, and it must not be
-created until this checklist is complete.
+The 0.1.0 release is complete. Its tag target, protected runs, registry
+provenance, and checksums are frozen in
+[`release-0.1.0-evidence.md`](release-0.1.0-evidence.md). `v0.1.0` is
+immutable: do not move it, force-update it, or use it for a patch release.
+
+The 0.1.1 line is limited to compatible additions. M6's 2 GiB local-Blob
+support is a separately gated 0.2.0-level change and must not be represented by
+an early 0.2.0 tag.
 
 ## Pre-tag checklist
 
-From a clean checkout at `origin/main`, run the full format, type, Rust,
+For a new release, from a clean checkout at `origin/main`, run the full format, type, Rust,
 package-consumer, Chromium, fuzz-seed, and size matrix documented in
 [`testing.md`](testing.md). Then run:
 
 ```sh
-node scripts/release-preflight.mjs v0.1.0 \
+node scripts/release-preflight.mjs v0.1.1 \
   --confirm-npm-trusted-publisher \
   --confirm-crates-trusted-publisher
 ```
@@ -81,7 +86,8 @@ it byte-for-byte with the checksum-verified release bundle; a mismatch fails
 the workflow instead of silently skipping publication. If code needs to change
 after either registry publishes, create a new patch release such as `0.1.1`;
 deprecate and/or yank `0.1.0` according to severity rather than moving or
-reusing its tag.
+reusing its tag. The already-published 0.1.0 artifacts are never rebuilt under
+the old version.
 
 If both registries already match the verified bundle but GitHub Release
 finalization or the downstream consumer jobs fail, do not move the tag. Run
@@ -92,8 +98,8 @@ the GitHub Release using only the five expected top-level files, and reruns the
 Node 20/22/24 and Cargo registry consumers. The successful recovery run is the
 finalization evidence; it never republishes either registry package.
 
-## M4 evidence
+## Evidence history
 
 The previous milestone's CI, Pages deployment, and deployed-URL smoke evidence
-is recorded in [`m4-completion.md`](m4-completion.md). That record does not
-substitute for the 0.1.0 format-specific release gates.
+is recorded in [`m4-completion.md`](m4-completion.md). The completed 0.1.0
+artifact evidence is in [`release-0.1.0-evidence.md`](release-0.1.0-evidence.md).
