@@ -1,11 +1,11 @@
-# Testing, release validation, and M6 gates
+# Testing and 0.2.0 release validation
 
-> **M4 evidence is frozen.** Commit `1d79837` passed CI, GitHub Pages
-> deployment, and the deployed-URL smoke test; the exact record remains in
-> [`m4-completion.md`](m4-completion.md). The 0.1.0 release is complete; exact
-> tag, registry, Pages, recovery, and checksum evidence is in
-> [`release-0.1.0-evidence.md`](release-0.1.0-evidence.md). The current tree
-> contains the compatible 0.1.1 line and separately gated M6 work.
+> **Historical evidence is frozen.** Commit `1d79837` and its M4 record remain
+> in [`m4-completion.md`](m4-completion.md); the immutable `v0.1.0` tag and its
+> registry, Pages, recovery, and checksum evidence remain in
+> [`release-0.1.0-evidence.md`](release-0.1.0-evidence.md). Do not rewrite
+> either record for 0.2.0. Version 0.1.1 was never tagged or published; its
+> compatible work is included in the finalized 0.2.0 release candidate.
 
 ## Stable release scope
 
@@ -46,7 +46,7 @@ npm test
 npm run package:check
 npm run pages:check
 
-# Chromium-only browser and delivery gates
+# Three-browser functional gate plus Chromium-only performance/size gates
 npm run test:browser
 npm run benchmark:smoke
 npm run benchmark:arrow
@@ -66,7 +66,7 @@ All four wrappers expose the same private `WasmRuntime` operation surface.
 Their conformance tests cover open/continue/read, invalid steps, cancellation,
 idempotent close and shutdown, failure cleanup, reservation release, and
 isolation between sources and tables. Browser conformance also loads the four
-real WASM artifacts and locks Worker protocol v3, official adapter API v2, and
+real WASM artifacts and locks Worker protocol v4, official adapter ABI v3, and
 private batch layout v1.
 
 Delimited retains the versioned CSV/TSV corpus and multi-chunk matrix,
@@ -107,18 +107,16 @@ Rust 1.85. The packed crates.io artifact is separately checked with normal
 edges and all features to confirm its experimental production graph does not
 reintroduce upstream Zstd after Cargo strips the workspace patch.
 
-Excel tests cover signature-based BIFF8/XLSX selection, workbook-order tables,
-hidden-sheet metadata, cached formula results, null cells, Unicode, dates,
-merged regions, frozen panes, sparse row/column layout, static styles, and
-budgeted staging/open/read cleanup. They lock both 1900/1904 date epochs and
-reject sparse-but-enormous declared dimensions. XLSM, XLSB, ODS, pre-BIFF8,
-encrypted CFB, unsafe ZIP paths, and XML DTD/entity inputs are rejected
-structurally; resource exhaustion reports `RESOURCE_LIMIT` before the
-prohibited allocation. Post-parse worksheet accounting includes Calamine's
-per-cell value/formula string heap capacities as well as dense vector slots.
-XLSX source registration also verifies a capacity-derived conservative retained
-estimate for its parsed presentation collections; BIFF8 keeps its record-count
-preflight.
+Excel tests cover incremental ZIP64 and CFB indexing, signature-based
+BIFF8/XLSX selection, workbook-order tables, hidden-sheet metadata, cached
+formula results, null cells, Unicode, dates, merged regions, frozen panes,
+sparse layout, styles, and bounded open/read cleanup. They lock both 1900/1904
+date epochs and reject sparse-but-enormous declared dimensions. XLSM, XLSB,
+ODS, pre-BIFF8, encrypted CFB, unsafe ZIP paths, and XML DTD/entity inputs are
+rejected structurally; resource exhaustion reports `RESOURCE_LIMIT` before the
+prohibited allocation. Large range-backed opens compact only required workbook
+content before using the same bounded Calamine table and presentation contract
+as small compatibility opens.
 
 ## Fixture provenance
 
@@ -156,10 +154,11 @@ or fail, and every path must remain bounded and reusable.
 
 ## Protocol and stable JavaScript contracts
 
-Protocol-v1 fixtures remain immutable early evidence, and protocol-v2 fixtures
-remain immutable M4 evidence. New v3 golden fixtures lock the four official
-adapter descriptors, table-scoped metadata/progress/revision envelopes, and
-spreadsheet presentation requests and responses. Adapter API v2 and batch
+Protocol-v1 fixtures remain immutable early evidence, protocol-v2 fixtures
+remain immutable M4 evidence, and protocol-v3 fixtures remain immutable
+presentation-era evidence. Protocol-v4 golden fixtures lock resumable
+pending/progress/complete operations, monotonic revisions, bounded multi-range
+actions, cooperative yields, and batch transfer. Adapter ABI v3 and batch
 layout v1 are private implementation seams; they are intentionally absent from
 the stable package exports.
 
@@ -178,24 +177,24 @@ Node tests and snapshots cover:
   adapter fails.
 - Multi-table metadata and lifecycle plus `getPresentation()` and range-aligned
   `readPresentationRange()` normalization.
-- The checked-in `stable-declarations-v0.1.json` snapshot covers every file in
-  the transitive declaration graph of the four stable entries. During 0.1.x,
-  changes require explicit compatibility review; incompatible changes wait
-  for 0.2.0.
+- The frozen `stable-declarations-v0.1.json` snapshot preserves the 0.1 API.
+  `stable-declarations-v0.2.json` covers every file in the transitive
+  declaration graph of the four finalized 0.2 stable entries.
 
 The packed-consumer test creates a real npm tarball, installs it into a clean
 temporary project, imports every entry point, and typechecks documented adapter
 options and presentation types. CI repeats that consumer on Node 20, 22, and
 24.
 
-## Chromium browser gate
+## Three-browser release gate
 
-Chromium is the sole browser compatibility gate for 0.1.0. Firefox and WebKit
-are not implied by a passing release. CI records the exact Playwright/Chromium
-version alongside its release evidence; the frozen M4 run used Playwright
-1.61.1 and Chromium 149.0.7827.55.
+Chromium, Firefox, and WebKit are separate, release-blocking desktop projects.
+CI and the release workflow install the pinned Playwright browsers and record
+all three exact versions. Release evidence always runs with retries disabled;
+a local diagnostic retry is not release evidence.
 
-Playwright exercises the real module Worker and all four real WASM artifacts:
+All three projects exercise the real module Worker and all four real WASM
+artifacts:
 
 - CSV/TSV and Arrow retain strict/lenient, native/display, CJK, source
   replacement, cancellation, retry, transfer, range, and recovery coverage.
@@ -205,15 +204,19 @@ Playwright exercises the real module Worker and all four real WASM artifacts:
 - Spreadsheet presentation is asserted through worksheet visibility, frozen
   rows/columns, sparse dimensions/hidden state, styles, merge behavior, Canvas
   hit regions, bounded ARIA output, keyboard navigation, and exact copy.
-- Canvas virtualization, scrolling, resize, terminal errors, CJK paint and
-  measurement, axe WCAG 2.1 A/AA scans, forced colors, reduced motion, mobile
-  layouts, visible focus, and 44px touch controls remain release gates.
-- `large-excel.spec.mjs` exercises the private range-backed OOXML path with a
-  real XLSX fixture and verifies that the Excel WASM artifact is not loaded.
+- Canvas virtualization, scrolling, resize, terminal errors, CJK measurement,
+  axe WCAG 2.1 A/AA scans, forced colors, reduced motion, visible focus,
+  keyboard/pointer interaction, and touch targets remain release gates.
+- Local Blob ranges, non-adjacent reads, cancellation/retry, repeated close,
+  resource release, themes, ARIA, and Pages smoke are covered in Firefox and
+  WebKit as well as Chromium.
+- Chromium uses the real Clipboard API. Firefox and WebKit use the explicit
+  clipboard-injection seam while asserting the same TSV result.
 
-Strict visual snapshots run on Ubuntu 24.04 at one device pixel per CSS pixel.
-They stabilize Canvas geometry rather than claiming cross-platform glyph
-rasterization.
+Only Chromium owns strict pixel snapshots, performance comparisons, and exact
+2 GiB containers. Its Ubuntu 24.04 snapshots run at one device pixel per CSS
+pixel and stabilize Canvas geometry rather than claiming cross-platform glyph
+rasterization. Firefox and WebKit never generate replacement golden images.
 
 ## Lazy-loading and Pages assertions
 
@@ -246,6 +249,14 @@ range read, and forced-GC peak memory; the memory ceiling is 64 MiB for each
 adapter family. The report records exact table counts and memory samples from
 idle through close, and the gate fails when any ceiling is exceeded.
 
+The release-blocking relative gate compares the candidate with the frozen P0
+SHA on the same Chromium runner. Baseline and candidate alternate after one
+warm-up for five paired samples. If any comparison fails, the confirmation
+pass uses two warm-ups and nine pairs. The median Worker/WASM startup, first
+usable paint, non-adjacent range read, cache hit, and lifecycle close time may
+be at most 10% slower than the baseline; the existing absolute timing and
+memory ceilings are not relaxed.
+
 `benchmark:size` measures raw and Brotli-quality-11 bytes in separate groups:
 
 - Core: root entry, generic Worker, Delimited glue, and Delimited WASM.
@@ -254,11 +265,18 @@ idle through close, and the gate fails when any ceiling is exceeded.
 - Excel: `/excel`, Excel glue, and Excel WASM.
 - npm packed/unpacked totals and the complete Pages raw/Brotli totals.
 
-The existing core and Arrow caps are not widened by M5. Parquet, Excel, and
-aggregate delivery each have independent limits derived from a clean measured
-artifact plus 15%, rounded upward to 64 KiB. The checked-in baseline records
-the exact measured files and comparisons; hosted-runner timing is recorded but
-is not a hard threshold.
+The existing per-family, npm, and Pages caps remain in force. In addition, the
+frozen P0 report requires all shipped `.js` measured with Brotli Q11 to be at
+least 10% smaller than P0, requires `dist/worker.js` not to exceed its P0
+Brotli size, and requires the removed `dist/worker/large-excel-adapter.js`
+artifact to stay absent. None of these limits may be raised to make a release
+candidate pass.
+
+`wasm-resource-evidence.spec.mjs` runs each of the four real official runtimes
+through 100 identical open/openTable/read/cancel/close lifecycles in every
+release browser project. Runtime-owned bytes must be zero after every cycle,
+cancellation and close must be idempotent, and the WebAssembly memory
+high-water page count observed at cycle 10 must not grow through cycle 100.
 
 ## Release evidence and completion rule
 
@@ -266,28 +284,30 @@ The pre-tag CI matrix includes the dependency advisory/license policy. Its one
 narrow exception is the maintenance-only `paste` advisory pulled by the
 required Parquet 59.1.0 pin; vulnerability and unsoundness advisories remain
 unignored, and the exception must be removed when that pin can move. The tag
-workflow re-runs Rust stable/MSRV, fuzz seeds, four wrapper builds, Node consumer,
-Chromium, performance, size, and package checks. It records the exact Chromium
-version, npm tarball, tarball SHA-256, and SPDX SBOM.
+workflow re-runs Rust stable/MSRV, fuzz seeds, four wrapper builds, Node
+consumer, all three browser projects, Chromium performance, size, and package
+checks. It records all browser versions, the npm tarball, tarball SHA-256, and
+SPDX SBOM.
 After protected-environment approval it publishes crates.io first, publishes
 that same verified npm tarball with provenance, creates the GitHub Release, and
 smoke-tests the registry package on Node 20/22/24, and compiles/runs a clean
 Cargo consumer against the exact crates.io version.
 
-Those delivery steps completed for 0.1.0; see the frozen evidence record before
-using its artifacts. A local green run is useful evidence, but it neither
-replaces protected release approvals nor authorizes moving an existing tag.
-Patch releases must use a new immutable tag. M6's real 2 GiB gate is recorded
-separately and is not satisfied by the small Pages smoke.
+The 0.2.0 preflight and tag workflow accept only successful `CI`, `GitHub
+Pages`, and `M6 Large Files` runs for the exact same candidate SHA. A local
+green run, a retry-only pass, or a small Pages fixture cannot substitute for
+that evidence. Publishing remains behind protected approval and OIDC trusted
+publishers. Version 0.1.1 must not be tagged or published, and `v0.1.0` must
+never move.
 
-## M6 large-file gate
+## M6 exact large-file gate
 
-The binary source ceiling is exactly `2 * 1024^3 = 2,147,483,648` bytes. CI
-creates and removes sparse, valid containers in sequence; no giant fixture is
-committed. Every format must exercise a first viewport and a non-adjacent or
-greater-than-`2^31` range where the container permits it. The gate records the
-fixed Chromium version, first-view latency, bytes read, peak reservation, and
-failure trace.
+The binary source ceiling is exactly `2^31 = 2,147,483,648` bytes. The
+Chromium-only `M6 Large Files` workflow builds a native generator separately,
+then creates, tests, and removes five real containers in sequence: CSV, Arrow
+File, Parquet, XLSX, and XLS. Each file has an apparent size of exactly
+`2^31`, and the browser reads a bounded final window ending at byte
+`2^31 - 1`. No generated fixture or Cargo `target/` tree is uploaded.
 
 The host must pass the original `File`/`Blob` to `engine.open()` in
 `sourceMode: "large"`. It may call `Blob.slice()` only for bounded reads; a
@@ -295,19 +315,23 @@ whole-source `arrayBuffer()`, `FileReader`, upload, or source-sized budget
 reservation fails review. Over-limit inputs are rejected before adapter load
 with `RESOURCE_LIMIT` details `{ resource, requiredBytes, availableBytes }`.
 
+Before each container the job requires at least 4 GiB free and records both
+apparent and allocated size. The workflow timeout is 240 minutes; each
+container has a 45-minute timeout, one Chromium worker, and zero retries. A
+space shortage, timeout, or first-run failure is a release failure, not
+permission to shrink the fixture.
+
 The independent M6 budget is:
 
 | Resource | Gate |
 | --- | --- |
 | Source size | at most 2,147,483,648 bytes |
 | Engine retained working set | at most configured 256 MiB |
-| Core/Arrow existing budgets | unchanged |
+| Existing format and delivery budgets | unchanged |
 | Index/cache/decoded batches | bounded and released exactly once on cancel, failure, and close |
 
-The planned Excel ZIP64/CFB large-offset fixtures additionally cover compressed
-and stored entries, cached formulas, merges, hidden sheets, styles, unsafe
-paths, entity expansion, entry counts, and declared expansion ceilings. The
-current 0.1.1 tree has not yet passed those generated-container gates (the
-OOXML prototype test is not a 2 GiB or CFB acceptance gate); until
-all four real format gates pass, M6 remains unreleased and no 0.2.0 tag is
-created.
+Synthetic Rust/ABI tests separately cover `2^31 + 1`,
+`Number.MAX_SAFE_INTEGER`, checked `offset + length`, and WASM `usize`
+conversion without allocating giant buffers. The successful five-container
+workflow is release evidence only for its own SHA and is mandatory alongside
+CI and Pages before creating `v0.2.0`.

@@ -1,9 +1,10 @@
 # MVP and milestone status
 
-> **Current status: 0.1.0 released; 0.1.1 stabilization and M6 are active.**
-> The immutable `v0.1.0` artifact and registry evidence is recorded in
-> [`release-0.1.0-evidence.md`](release-0.1.0-evidence.md). M6 is a separately
-> gated 2 GiB local-Blob effort and does not move or reuse that tag.
+> **Current status: 0.2.0.** The immutable `v0.1.0` artifact and registry
+> evidence remains recorded in
+> [`release-0.1.0-evidence.md`](release-0.1.0-evidence.md); that tag is never
+> moved or reused. The unpublished patch work and M6 large-file foundation are
+> finalized together in 0.2.0.
 
 ## Product boundary
 
@@ -13,7 +14,7 @@ through an explicitly selected official adapter in a Worker, exposes bounded
 dataset/table/range APIs, and renders a keyboard-accessible Canvas viewport
 with a bounded semantic grid.
 
-The 0.1.0 release contains exactly four official adapter IDs:
+The 0.2.0 release contains exactly four official adapter IDs:
 
 - `tabulark:delimited` for CSV/TSV.
 - `tabulark:arrow-ipc` for Arrow IPC File/Stream.
@@ -143,24 +144,41 @@ and separate Parquet/Excel size groups. Chromium is the sole 0.1.0 browser
 gate. The assembled and deployed Pages tests open CSV, TSV, Arrow, Parquet,
 XLS, and XLSX while proving that only the selected adapter artifact loads.
 
-### 0.1.1 compatible additions
+### Unpublished patch work folded into 0.2.0
 
-The patch line adds bounded structured diagnostics and independent diagnostic
+The untagged patch baseline added bounded structured diagnostics and independent diagnostic
 subscriptions, logical dataset/table capability snapshots, opt-in privacy-safe
 performance samples, and a Canvas `colorScheme` option. Existing event unions,
-logical batch fields, and adapter selection remain compatible.
+logical batch fields, and adapter selection remained compatible; no 0.1.1 tag
+or package was published.
 
-## M6: 2 GiB local-file foundation
+## M6: finalized 2 GiB local-file foundation
 
 M6 defines 2 GiB as exactly `2,147,483,648` bytes. `sourceMode: "large"` is an
 opt-in host policy for local `File`/`Blob` sources; it never raises the bounded
 `ArrayBuffer` staging limit or reserves memory proportional to source size.
 Reads remain range/stream based, offsets are checked as safe 64-bit values, and
 an over-limit source is rejected before adapter startup with structured
-`RESOURCE_LIMIT` details. The 0.1.1 tree contains bounded range plumbing for
-CSV, Arrow, and Parquet plus a private range-backed OOXML (`format: "xlsx"`)
-prototype; BIFF8 CFB support and the four-format generated-container gates
-remain active M6 work. No 0.2.0 tag is created until those gates pass.
+`RESOURCE_LIMIT` details. Rust/WASM owns Arrow/Parquet range planning and
+ZIP64/CFB Excel indexing; Excel compacts only required content for the bounded
+Calamine compatibility parser. The private TypeScript XLSX parser is removed.
+
+The Chromium release workflow generates CSV, Arrow File, Parquet, XLSX, and
+XLS containers of exactly `2^31` bytes, reads the final bounded window ending
+at `2^31 - 1`, opens each container, and deletes it. Synthetic Rust/ABI tests
+cover `2^31 + 1`, unsafe JavaScript integers, checked-add overflow, and WASM
+`usize` conversion. Chromium, Firefox, and WebKit are all functional release
+gates; Chromium additionally owns pixels, performance, real clipboard, and
+exact-size evidence.
+
+## 0.2.0 runtime boundary
+
+Worker protocol v4 and adapter ABI v3 make open, table-open, read, and
+presentation operations resumable and revision checked. The main thread owns
+the sole immutable decoded-batch cache and singleflight; Rust runtimes own
+format state, native caches, and classified resource ledgers. Repeated
+100-cycle lifecycle evidence must return runtime-owned bytes to zero and hold
+the WebAssembly-memory high-water mark after its warm-up point.
 
 ## Release boundary
 
@@ -168,13 +186,14 @@ M5 was not complete merely because implementation or local tests were green.
 The same commit must pass CI, Pages assembly/deployment, the actual deployed-URL
 smoke, format/lifecycle/budget/fuzz/size gates, clean consumers, registry
 availability and ownership checks, and trusted-publisher confirmation. That
-process completed for 0.1.0; future patch releases use a new immutable tag.
+process completed historically for 0.1.0. The 0.2.0 preflight additionally
+requires CI, Pages, and M6 Large Files evidence for the same candidate SHA;
+future patch releases use a new immutable tag.
 See [`testing.md`](testing.md) and [`releasing.md`](releasing.md).
 
-## Out of scope for 0.1.0
+## Out of scope for 0.2.0
 
 - Third-party adapter distribution or a stable public adapter ABI.
-- Firefox/WebKit compatibility gates.
 - Remote sources, persistent caching, and application-controlled streaming.
 - SQLite, framework bindings, and Arrow JavaScript/FFI/C Data interfaces.
 - XLSM, XLSB, ODS, pre-BIFF8 XLS, encrypted workbooks, and formula execution.

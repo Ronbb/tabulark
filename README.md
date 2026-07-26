@@ -1,10 +1,11 @@
 # Tabulark
 
-> **Status: 0.1.0 released; 0.1.1 stabilization and M6 are in progress.**
-> The immutable `v0.1.0` tag and its registry/Pages evidence are recorded in
-> [the release evidence](docs/release-0.1.0-evidence.md). The 0.1.1 line adds
-> compatible diagnostics, capability queries, performance observation, and
-> synchronized Canvas themes. M6 is separately gated 2 GiB local-Blob work.
+> **Status: 0.2.0.** The immutable `v0.1.0` tag and its registry/Pages
+> evidence remain recorded in
+> [the release evidence](docs/release-0.1.0-evidence.md); that tag is never
+> moved or reused. Version 0.2 adds range-backed 2 GiB sources, structured
+> diagnostics and capabilities, performance observation, and synchronized
+> Canvas themes without changing the documented 0.1.0 calling patterns.
 
 Tabulark is a WebAssembly-first browser primitive for previewing local tabular
 data without uploading it. A module Worker owns parsing, bounded byte access,
@@ -15,11 +16,11 @@ cells while a bounded semantic grid supplies keyboard and screen-reader access.
 
 ## Supported local formats
 
-The 0.1.0 source tree contains four immutable official adapters. Each adapter
+The 0.2.0 source tree contains four official adapters. Each adapter
 is a separate, lazily loaded WebAssembly artifact; creating an engine loads no
 WASM and opening one format does not fetch unused artifacts.
 
-| Format | Official ID | Stable entry point | 0.1 contract |
+| Format | Official ID | Stable entry point | 0.2 contract |
 | --- | --- | --- | --- |
 | CSV/TSV | `tabulark:delimited` | `tabulark` | Explicit delimiter, header, and strict/lenient modes |
 | Arrow IPC | `tabulark:arrow-ipc` | `tabulark/arrow` | File/Stream; none, LZ4, and Zstd IPC compression |
@@ -28,13 +29,13 @@ WASM and opening one format does not fetch unused artifacts.
 
 Remote sources, arbitrary adapter/module URLs, public third-party adapters,
 persistent caches, formula calculation, editing, and document-level Excel
-round-tripping are outside 0.1.
+round-tripping are outside 0.2.
 
 ## Install and build
 
-The npm package has no production JavaScript dependencies. It targets modern
-Chromium and requires Node 20 or newer to build from source. Rust 1.85 is the
-minimum supported Rust version.
+The npm package has no production JavaScript dependencies. Its desktop release
+gate covers Chromium, Firefox, and WebKit, and it requires Node 20 or newer to
+build from source. Rust 1.85 is the minimum supported Rust version.
 
 ```sh
 npm ci
@@ -98,16 +99,18 @@ when intentionally detaching an `ArrayBuffer`; using it with a `Blob` or
 `File` returns `INVALID_ARGUMENT`.
 
 `sourceMode: "auto"` keeps the conservative source policy. The opt-in
-`sourceMode: "large"` path accepts a local `File`/`Blob` no larger than
-`2,147,483,648` bytes (2 GiB); it does not raise the existing `ArrayBuffer`
-staging limit or allocate a work set proportional to the file. A larger source
-fails before an open request is sent to the Worker, with `RESOURCE_LIMIT` details containing
-`resource`, `requiredBytes`, and `availableBytes`.
+`sourceMode: "large"` path accepts only a local `File`/`Blob` no larger than
+exactly `2,147,483,648` bytes (`2^31`, 2 GiB); it does not raise the existing
+`ArrayBuffer` staging limit or allocate a work set proportional to the file. A
+larger source fails before an open request is sent to the Worker, with
+`RESOURCE_LIMIT` details containing `resource`, `requiredBytes`, and
+`availableBytes`.
 
-The range-backed large-mode Excel path currently covers OOXML `format: "xlsx"`.
-BIFF8 `format: "xls"` remains on the bounded compatibility staging path until
-the separate CFB large-offset gate passes; use the capability snapshot rather
-than assuming every Excel container is eligible for 2 GiB range access.
+The exact-boundary release gate covers five real containers: CSV, Arrow File,
+Parquet, XLSX, and XLS. Each fixture is exactly `2^31` bytes and the test reads
+the final bounded window ending at byte `2^31 - 1`. Overflow and offsets above
+the product limit are exercised separately without allocating oversized
+browser fixtures.
 
 ### Tables, logical batches, and presentation
 
@@ -193,14 +196,30 @@ XLS support is deliberately limited to BIFF8. Earlier BIFF, XLSM, XLSB, ODS,
 and encrypted workbooks return `UNSUPPORTED_FEATURE`. XLS and XLSX share the
 same bounded static-presentation subset.
 
-## Memory and lifecycle
+For large XLSX, Rust indexes ZIP/ZIP64 metadata and fetches the workbook,
+relationships, shared resources, and selected worksheet ranges. For large XLS,
+Rust indexes CFB/DIFAT/FAT/miniFAT/directory data and fetches the referenced
+Workbook/Book stream ranges. In both cases it compacts only the needed content
+into a bounded workbook for the existing Calamine compatibility parser. This
+does not imply a custom XML/BIFF checkpoint engine or worksheet tile store.
 
-One engine-wide reservation ledger accounts for adapter runtimes, source
-staging, compressed/decompressed pages, opened worksheets, batches, and caches.
-`RESOURCE_LIMIT` errors identify the resource category and the required and
-available amounts. Excel stages one bounded workbook; Parquet performs bounded
-range reads. ZIP/CFB entry counts, decompressed bytes, worksheet dimensions,
-cells, styles, layout entries, and merged regions are capped before allocation.
+## Memory, cache, and lifecycle
+
+The main thread owns the only decoded-batch cache. It stores immutable backing
+objects keyed by dataset, logical table, revision, schema version, and
+normalized range; each API call receives a fresh logical facade. Concurrent
+identical misses are singleflight operations. Cancelling one caller does not
+cancel work shared by others, while cancelling every waiter sends one Worker
+cancel. A table handle may close without discarding its logical-table backing;
+dataset close or a revision/schema change evicts it.
+
+The Worker coordinates the engine-wide quota across adapters. Inside each
+Rust/WASM runtime, a checked ledger distinguishes persistent state, active
+operations, ingress/output, reclaimable native cache, and caller-owned
+telemetry. Admission clears soft native cache and retries once before returning
+`RESOURCE_LIMIT`, whose details identify required and available capacity.
+ZIP/CFB entries, decompression, worksheet dimensions, cells, styles, layout,
+merged regions, Parquet pages, and decoded batches remain bounded.
 
 Handles are nested and cleanup cascades downward:
 
@@ -233,7 +252,7 @@ cargo test --workspace --all-features --locked
 # Stable exports/declarations, clean package consumers, and Pages assembly
 npm run check
 
-# Real module Worker/WASM, Canvas, ARIA, keyboard, copy, forced-colors, visuals
+# Real module Worker/WASM, Canvas, ARIA, keyboard, copy, and forced-colors
 npm run test:browser
 
 # Independent core, Arrow, Parquet, Excel, npm, and Pages delivery budgets
@@ -243,16 +262,20 @@ npm run benchmark:size
 npm run benchmark:formats
 ```
 
-Chromium remains the formal browser gate. CI records its exact version for each
-release line; the 0.1.0 value is preserved in the release evidence record.
-The Pages post-deploy smoke opens CSV, Arrow IPC, Parquet, XLS, and XLSX and
-asserts that only used adapter artifacts were requested.
+Chromium, Firefox, and WebKit are all release-blocking desktop functional gates.
+Chromium additionally owns exact pixel snapshots, performance comparison, real
+Clipboard API coverage, and the exact-2-GiB workflow. Firefox and WebKit cover
+the four adapters, lifecycle, Blob ranges, themes, ARIA, input behavior, copy
+through a deterministic clipboard seam, and Pages smoke. The Pages post-deploy
+smoke opens CSV, Arrow IPC, Parquet, XLS, and XLSX and asserts that only used
+adapter artifacts were requested.
 
 ## Stability and release
 
-The root, `/arrow`, `/parquet`, and `/excel` entry points are stable for 0.1.x:
-compatible additions are allowed, but removals and breaking changes wait for
-0.2.0. Rust APIs, the Worker protocol, adapter ABI, wire DTOs, and
+The root, `/arrow`, `/parquet`, and `/excel` entry points are stable for 0.2.x.
+Version 0.2 preserves the documented 0.1.0 calls and adds diagnostics,
+capability queries, performance observation, `SourceMode`, and Canvas themes.
+Rust APIs, Worker protocol v4, adapter ABI v3, wire DTOs, batch layout v1, and
 `/experimental` remain experimental/private.
 
 The `v0.1.0` tag is immutable and must never be moved or reused. npm and
@@ -270,7 +293,7 @@ crates/tabulark-*-wasm/      four independently built WASM entry crates
 js/                          stable API, private Worker host, batches, and view
 examples/csv-preview/        static six-format Playground
 test/fixtures/               pinned format fixtures and provenance
-test/browser/                Chromium, accessibility, visual, and Pages smoke
+test/browser/                three-browser behavior, Chromium visual/performance, and Pages smoke
 test/performance/            performance and per-artifact delivery budgets
 docs/                        architecture, testing, stability, and release policy
 ```

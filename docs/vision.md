@@ -1,9 +1,9 @@
 # Vision
 
-> Tabulark's four-format 0.1.0 implementation is released. The immutable tag,
-> registry provenance, and artifact checksums are recorded in
-> [release-0.1.0-evidence.md](release-0.1.0-evidence.md); 0.1.1 compatibility
-> additions and the separately gated M6 work continue on new commits.
+> Tabulark 0.2.0 finalizes the four-format, three-browser, exact-2-GiB
+> foundation. The historical `v0.1.0` tag, registry provenance, and artifact
+> checksums remain immutable in
+> [release-0.1.0-evidence.md](release-0.1.0-evidence.md).
 
 Tabulark is a browser-native table preview engine: a small, composable layer
 between local tabular bytes and an application's table UI. It should make the
@@ -18,7 +18,7 @@ virtualization.
 
 A local `File`, `Blob`, or `ArrayBuffer` remains local. Tabulark does not need a
 server to preview it. Future network-backed sources must be explicit
-capabilities with explicit application authority; they are not part of 0.1.0.
+capabilities with explicit application authority; they are not part of 0.2.0.
 
 ### One table contract, four source families
 
@@ -27,7 +27,7 @@ Parquet, or Excel. Official adapters normalize datasets, tables, schemas,
 capabilities, ranges, logical batches, errors, presentation, and lifecycle
 while keeping format-specific options and parsing behind their boundary.
 
-The 0.1.0 release validates that shape with four independently loadable
+The 0.2.0 release validates that shape with four independently loadable
 Rust/WASM adapters:
 
 - CSV/TSV through `tabulark:delimited`.
@@ -44,12 +44,12 @@ are not shortcuts around that work.
 
 Public consumers work with Engine, Dataset, Table, logical schema/value/batch,
 structured errors, and the high-level Canvas view. Transport buffers,
-descriptors, Worker protocol v3, official adapter API v2, and the batch wire
-layout remain private so their representation can evolve without breaking
+descriptors, Worker protocol v4, official adapter API v3, and batch layout v1
+remain private so their representation can evolve without breaking
 applications.
 
 The four stable JavaScript entries permit compatible additions throughout
-0.1.x. Low-level painter, controller, layout, and selection primitives live in
+0.2.x. Low-level painter, controller, layout, and selection primitives live in
 `tabulark/experimental` and deliberately do not carry that promise.
 
 ### Preserve semantics and render predictably
@@ -60,7 +60,7 @@ separate deterministic display representation. Dictionary/run-end encoding,
 nested values, decimals, temporal values, binary data, and extension-backed
 storage retain their meaning at the stable logical boundary.
 
-Excel 0.1 intentionally chooses a narrower display-string value contract while
+Excel 0.2 intentionally chooses a narrower display-string value contract while
 preserving workbook structure needed for preview. Formulas use cached values;
 Tabulark does not evaluate them.
 
@@ -87,17 +87,20 @@ A large optional format cannot hide a regression in the core path.
 ### Keep work bounded, cancellable, and recoverable
 
 Parsing, framing, ZIP/CFB traversal, decompression, metadata, worksheet state,
-and decoded batches can all become denial-of-service surfaces. One global
-ledger accounts for every significant simultaneous allocation. Operations are
-cancellable; engine/dataset/table close cascades and is idempotent; every
-reservation is released on success, failure, cancellation, or close. A budget
-error identifies the constrained resource and required/available capacity.
+and decoded batches can all become denial-of-service surfaces. The Worker
+coordinates cross-adapter quota while each Rust runtime accounts for
+persistent, active-operation, ingress/output, and reclaimable native-cache
+state. Operations are cancellable; engine/dataset/table close cascades and is
+idempotent; every reservation is released on success, failure, cancellation,
+or close. A budget error identifies the constrained resource and
+required/available capacity. The main thread owns the sole immutable decoded
+backing cache, with singleflight and independent caller cancellation.
 
 Format readers should also avoid unnecessary work: Parquet fetches only the
-footer, metadata, selected row groups, and projected column chunks. The
-compatibility Excel path declares and validates bounded staging before it
-allocates; M6 extends that discipline to resumable ZIP/CFB range reads once the
-separate parser gate is complete.
+footer, metadata, selected row groups, and projected column chunks. Excel uses
+Rust range-backed ZIP64/CFB indexing and compacts only needed workbook content
+for the bounded Calamine compatibility parser. This is not yet a complete
+custom XML/BIFF checkpoint engine or worksheet tile store.
 
 ### Accessibility is rendering architecture
 
@@ -107,8 +110,10 @@ copy, merged hit regions, and resizing belong to the view contract. Forced
 colors, reduced motion, touch targets, and small-screen layouts are release
 gates rather than optional polish.
 
-Chromium is the formal browser gate for the released line. Firefox and WebKit support
-will be claimed only after their own reproducible validation exists.
+Chromium, Firefox, and WebKit are formal functional gates for 0.2.0. Chromium
+additionally owns exact pixels, performance, real Clipboard API, and the five
+exact-2-GiB container gates; the other engines exercise copy through a
+deterministic clipboard seam.
 
 ### Evidence precedes release labels
 
@@ -119,18 +124,17 @@ measurements, clean packed consumers, an assembled package and Pages site, and
 a real deployed-URL smoke attributable to the same revision.
 
 The M4 record is frozen at `1d79837`; the completed 0.1.0 artifact record is
-separate and immutable. A patch release must use a new tag and the protected
-OIDC delivery process.
+separate and immutable. The 0.2.0 preflight requires CI, Pages, and M6 Large
+Files evidence for the same SHA. A patch release must use a new tag and the
+protected OIDC delivery process.
 
-## Direction after 0.1.1 and M6
+## Direction after 0.2.0
 
-Once the stable boundary has real-world feedback, compatible 0.1.x additions
+Once the stable boundary has real-world feedback, compatible 0.2.x additions
 can improve supported logical types, presentation fidelity, diagnostics, and
-performance without exposing the private transport. M6's large-file foundation
-is the next separately budgeted capability. Larger capabilities remain separate
-design decisions:
+performance without exposing the private transport. Larger capabilities remain
+separate design decisions:
 
-- Firefox and WebKit validation.
 - Explicit remote range and streaming sources.
 - Persistent, opt-in caching keyed by source fingerprint and adapter version.
 - SQLite and other independently budgeted local formats.

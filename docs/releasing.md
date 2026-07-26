@@ -1,22 +1,21 @@
-# Delivery and release policy
+# 0.2.0 delivery and release policy
 
-The 0.1.0 release is complete. Its tag target, protected runs, registry
-provenance, and checksums are frozen in
+The 0.2.0 release candidate is finalized. Version 0.1.1 was never tagged or
+published; do not create a `v0.1.1` tag. The completed 0.1.0 tag target,
+protected runs, registry provenance, and checksums remain frozen in
 [`release-0.1.0-evidence.md`](release-0.1.0-evidence.md). `v0.1.0` is
-immutable: do not move it, force-update it, or use it for a patch release.
-
-The 0.1.1 line is limited to compatible additions. M6's 2 GiB local-Blob
-support is a separately gated 0.2.0-level change and must not be represented by
-an early 0.2.0 tag.
+immutable: never move, force-update, or rebuild it.
 
 ## Pre-tag checklist
 
-For a new release, from a clean checkout at `origin/main`, run the full format, type, Rust,
-package-consumer, Chromium, fuzz-seed, and size matrix documented in
-[`testing.md`](testing.md). Then run:
+For 0.2.0, start from a clean checkout whose `HEAD` equals `origin/main`. Run
+the full format, type, Rust, packed-consumer, fuzz-seed, three-browser,
+Chromium performance/size, and exact-large-file matrix documented in
+[`testing.md`](testing.md). Confirm that `CI`, `GitHub Pages`, and `M6 Large
+Files` all completed successfully for that same `HEAD`, then run:
 
 ```sh
-node scripts/release-preflight.mjs v0.1.1 \
+node scripts/release-preflight.mjs v0.2.0 \
   --confirm-npm-trusted-publisher \
   --confirm-crates-trusted-publisher
 ```
@@ -32,11 +31,21 @@ The preflight blocks tagging unless all of these conditions hold:
   owners are still present.
 - The operator explicitly confirms the npm and crates.io OIDC trusted-publisher
   configuration. This cannot be inferred safely through a public registry API.
-- CI and GitHub Pages are both successful for the exact commit, and the
-  deployed Pages URL is reachable.
+- `CI`, `GitHub Pages`, and `M6 Large Files` are all successful for the exact
+  same commit, and the deployed Pages URL is reachable.
+- The three-browser and exact-large-file evidence used zero retries. A test
+  that passed only after retry is diagnostic information, not release
+  evidence.
 
 The tag-triggered workflow independently repeats the `origin/main` and exact
-CI/Pages-run checks. A tag cannot bypass a skipped local preflight.
+same-SHA CI/Pages/M6 checks. A tag cannot bypass a skipped local preflight.
+Only after the preflight succeeds should the immutable release tag be created
+and pushed:
+
+```sh
+git tag -a v0.2.0 -m "tabulark 0.2.0"
+git push origin v0.2.0
+```
 
 The confirmation flags are deliberate: before tagging, independently verify
 that npm's trusted publisher is restricted to this repository/workflow and that
@@ -68,9 +77,12 @@ contents. Publishing is then serialized:
    runs that consumer.
 
 Repository administrators must configure both named Environments with required
-reviewers before enabling release tags. The workflow intentionally fails if the
-environment has not supplied `TABULARK_NPM_TRUSTED_PUBLISHER_CONFIRMED=1` or
-`TABULARK_CRATES_TRUSTED_PUBLISHER_CONFIRMED=1`.
+reviewers before enabling release tags. The workflow intentionally fails if
+the environment has not supplied
+`TABULARK_NPM_TRUSTED_PUBLISHER_CONFIRMED=1` or
+`TABULARK_CRATES_TRUSTED_PUBLISHER_CONFIRMED=1`. Registry publication uses
+GitHub OIDC trusted publishers; local credentials, long-lived npm tokens, and
+long-lived crates.io tokens are not release paths.
 
 The npm Environment is deliberately an approval-only gate. The downstream
 publisher job has no Environment so its OIDC identity continues to match the
@@ -81,13 +93,12 @@ login or long-lived npm token participates in publication.
 
 Registry publication is not atomically reversible. A tag may be rerun without
 code changes when a workflow delivery step fails. Before a rerun accepts an
-existing version, it downloads the registry `.crate` or npm tarball and compares
-it byte-for-byte with the checksum-verified release bundle; a mismatch fails
-the workflow instead of silently skipping publication. If code needs to change
-after either registry publishes, create a new patch release such as `0.1.1`;
-deprecate and/or yank `0.1.0` according to severity rather than moving or
-reusing its tag. The already-published 0.1.0 artifacts are never rebuilt under
-the old version.
+existing version, it downloads the registry `.crate` or npm tarball and
+compares it byte-for-byte with the checksum-verified release bundle; a
+mismatch fails the workflow instead of silently skipping publication. If code
+needs to change after either registry publishes 0.2.0, create a new immutable
+patch release such as `v0.2.1`; never create the skipped `v0.1.1`, and never
+move or reuse `v0.1.0` or `v0.2.0`.
 
 If both registries already match the verified bundle but GitHub Release
 finalization or the downstream consumer jobs fail, do not move the tag. Run

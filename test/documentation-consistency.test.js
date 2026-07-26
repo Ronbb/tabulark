@@ -11,12 +11,13 @@ const documents = [
   "docs/vision.md",
 ];
 
-test("release-facing documentation describes the published 0.1.0 state consistently", async () => {
+test("release-facing documentation describes the finalized 0.2.0 candidate consistently", async () => {
   const sources = await Promise.all(documents.map(async (path) => [
     path,
     await readFile(new URL(`../${path}`, import.meta.url), "utf8"),
   ]));
   for (const [path, source] of sources) {
+    assert.match(source, /0\.2\.0/u, `${path} does not identify the current release`);
     assert.doesNotMatch(
       source,
       /(?:current|the)\s+(?:tree|release)\s+is[^\n]*(?:candidate|unpublished)/iu,
@@ -26,6 +27,11 @@ test("release-facing documentation describes the published 0.1.0 state consisten
       source,
       /No release tag has been created|0\.1\.0 has not been published/iu,
       `${path} contains an obsolete release-status claim`,
+    );
+    assert.doesNotMatch(
+      source,
+      /(?:current status|current tree|this document describes)[^\n]*0\.1\.1/iu,
+      `${path} still describes 0.1.1 as current`,
     );
   }
   const evidence = await readFile(
@@ -38,11 +44,12 @@ test("release-facing documentation describes the published 0.1.0 state consisten
   assert.match(evidence, /never republishes/u);
 });
 
-test("the 0.1.1 version fields and changelog heading stay synchronized", async () => {
+test("the 0.2.0 version fields and changelog heading stay synchronized", async () => {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const cargo = await readFile(new URL("../Cargo.toml", import.meta.url), "utf8");
   const changelog = await readFile(new URL("../CHANGELOG.md", import.meta.url), "utf8");
-  assert.equal(packageJson.version, "0.1.1");
-  assert.match(cargo, /^version\s*=\s*"0\.1\.1"$/mu);
-  assert.match(changelog, /^## 0\.1\.1$/mu);
+  assert.equal(packageJson.version, "0.2.0");
+  assert.match(cargo, /^version\s*=\s*"0\.2\.0"$/mu);
+  assert.match(changelog, /^## 0\.2\.0$/mu);
+  assert.doesNotMatch(changelog, /^## 0\.1\.1$/mu);
 });

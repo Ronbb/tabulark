@@ -974,7 +974,7 @@
             <path d="M12 19.5h8" fill="none" stroke="currentColor" stroke-width="2" />
           </svg>
           <strong>Tabulark</strong>
-          <span class="badge">M4 EXPERIMENTAL</span>
+          <span class="badge">0.2.0</span>
         </a>
         <nav class="header-nav" aria-label="Primary navigation">
           <a href="#why">Why Tabulark</a>
@@ -1227,11 +1227,12 @@
 
       <section id="architecture" class="section" aria-labelledby="architecture-title">
         <div class="section-heading">
-          <p class="eyebrow">Prototype boundary</p>
+          <p class="eyebrow">0.2 release boundary</p>
           <h2 id="architecture-title">What is working today.</h2>
           <p>
-            The 0.1.0 release train uses one closed official-adapter boundary;
-            the playground detects CSV/TSV, Arrow IPC, Parquet, XLS, and XLSX locally while the engine keeps its adapter boundary explicit.
+            Tabulark 0.2.0 uses one closed official-adapter boundary; the playground detects CSV/TSV,
+            Arrow IPC, Parquet, XLS, and XLSX locally while the engine keeps adapter selection explicit.
+            Local File/Blob sources can opt into bounded range access through exactly 2 GiB.
           </p>
         </div>
         <ul class="capability-list">
@@ -1249,11 +1250,11 @@
           </li>
           <li>
             <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 5.5h16v13H4zM4 10h16M9 5.5v13M15 5.5v13" fill="none" stroke="currentColor" stroke-width="1.7" /></svg>
-            <span><strong>Excel XLS / XLSX adapter</strong><br />Worksheet tables, cached formula values, and static spreadsheet presentation metadata.</span>
+            <span><strong>Excel XLS / XLSX adapter</strong><br />Rust range-backed ZIP64/CFB indexing, worksheet tables, cached formula values, and static presentation metadata.</span>
           </li>
           <li>
             <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m5 12 4 4 10-10" fill="none" stroke="currentColor" stroke-width="2" /></svg>
-            <span><strong>Explicit lifecycle and cancellation</strong><br />Sources, datasets, tables, range reads, retries, and terminal Worker recovery.</span>
+            <span><strong>Three-browser lifecycle gates</strong><br />Chromium, Firefox, and WebKit cover sources, tables, range reads, cancellation, retries, and terminal recovery.</span>
           </li>
           <li>
             <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m5 12 4 4 10-10" fill="none" stroke="currentColor" stroke-width="2" /></svg>
