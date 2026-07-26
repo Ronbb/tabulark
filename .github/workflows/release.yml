@@ -111,7 +111,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           npm_status="$(curl --silent --output /dev/null --write-out '%{http_code}' "https://registry.npmjs.org/tabulark/${VERSION}")"
-          crate_status="$(curl --silent --output /dev/null --write-out '%{http_code}' "https://crates.io/api/v1/crates/tabulark/${VERSION}")"
+          crate_status="$(curl --silent --user-agent tabulark-release-workflow --output /dev/null --write-out '%{http_code}' "https://crates.io/api/v1/crates/tabulark/${VERSION}")"
           case "$npm_status" in 200|404) ;; *) echo "Unexpected npm response: HTTP $npm_status" >&2; exit 1;; esac
           case "$crate_status" in 200|404) ;; *) echo "Unexpected crates.io response: HTTP $crate_status" >&2; exit 1;; esac
 
@@ -301,7 +301,7 @@ jobs:
         env:
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          status="$(curl --silent --output /dev/null --write-out '%{http_code}' "https://crates.io/api/v1/crates/tabulark/${VERSION}")"
+          status="$(curl --silent --user-agent tabulark-release-workflow --output /dev/null --write-out '%{http_code}' "https://crates.io/api/v1/crates/tabulark/${VERSION}")"
           case "$status" in
             200) echo "publish=false" >> "$GITHUB_OUTPUT" ;;
             404) echo "publish=true" >> "$GITHUB_OUTPUT" ;;
@@ -326,7 +326,8 @@ jobs:
         run: |
           expected="target/release/tabulark-${VERSION}.crate"
           test -f "$expected"
-          curl --fail --location --retry 12 --retry-all-errors --retry-delay 5 \
+          curl --fail --location --user-agent tabulark-release-workflow \
+            --retry 12 --retry-all-errors --retry-delay 5 \
             --output "$RUNNER_TEMP/tabulark-${VERSION}.crate" \
             "https://crates.io/api/v1/crates/tabulark/${VERSION}/download"
           cmp --silent "$expected" "$RUNNER_TEMP/tabulark-${VERSION}.crate" || {

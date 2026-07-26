@@ -25,6 +25,11 @@ test("release tags cannot bypass main, prerequisite runs, or protected environme
   assert.match(workflow, /registry-crate-smoke:/u);
   assert.match(workflow, /cargo add "tabulark@=\$\{VERSION\}" --features parquet,wasm/u);
   assert.match(workflow, /cargo check --locked/u);
+  assert.equal(
+    (workflow.match(/--user-agent tabulark-release-workflow/gu) ?? []).length,
+    3,
+    "every direct crates.io request must send the release workflow user agent",
+  );
 
   const approvalJob = workflow.slice(
     workflow.indexOf("  approve-npm:"),
