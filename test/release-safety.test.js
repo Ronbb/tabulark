@@ -47,6 +47,40 @@ test("release tags cannot bypass main, prerequisite runs, or protected environme
   assert.match(approvalJob, /TABULARK_NPM_TRUSTED_PUBLISHER_CONFIRMED/u);
   assert.doesNotMatch(publishJob, /^\s+environment:/mu);
   assert.match(publishJob, /id-token: write/u);
+  assert.doesNotMatch(workflow, /^\s+path:\s+target\/release\/\s*$/mu);
+  assert.doesNotMatch(workflow, /gh release (?:create|upload)[^\n]*target\/release\/\*/u);
+  assert.match(workflow, /consumer="\$temp_root\/consumer"/u);
+});
+
+test("release recovery finalizes immutable artifacts without republishing", async () => {
+  const workflow = await readFile(
+    new URL("../.github/workflows/release-recovery.yml", import.meta.url),
+    "utf8",
+  );
+
+  for (const required of [
+    "workflow_dispatch:",
+    "source_run_id:",
+    "run-id: ${{ inputs.source_run_id }}",
+    'source_sha="$(gh api',
+    'version="${BASH_REMATCH[1]}"',
+    'test "$source_sha" = "$tag_sha"',
+    'test "$verify_conclusion" = "success"',
+    "sha256sum --check SHA256SUMS",
+    'cmp --silent "target/release/tabulark-${VERSION}.tgz"',
+    'cmp --silent "target/release/tabulark-${VERSION}.crate"',
+    "node: [20, 22, 24]",
+    'cargo add "tabulark@=${VERSION}" --features parquet,wasm',
+  ]) {
+    assert.ok(workflow.includes(required), `recovery workflow must retain ${required}`);
+  }
+  assert.doesNotMatch(workflow, /(?:npm|cargo) publish/u);
+  assert.doesNotMatch(workflow, /gh release (?:create|upload)[^\n]*target\/release\/\*/u);
+  assert.ok(
+    workflow.indexOf('version="${BASH_REMATCH[1]}"') <
+      workflow.indexOf('[[ ! "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]'),
+    "the tag capture must be saved before validating the source run ID",
+  );
 });
 
 test("pre-tag checks require a finalized clean candidate and external release facts", async () => {

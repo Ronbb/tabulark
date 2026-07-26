@@ -1,0 +1,168 @@
+name: Release Recovery
+
+run-name: Recover ${{ inputs.tag }} from run ${{ inputs.source_run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing immutable release tag
+        required: true
+        type: string
+      source_run_id:
+        description: Release run containing the verified bundle
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  finalize-release:
+    name: Finalize immutable GitHub Release
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Validate immutable tag and source run
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "Invalid release tag: $TAG" >&2
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          if [[ ! "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "Invalid source run ID: $SOURCE_RUN_ID" >&2
+            exit 1
+          fi
+          tag_sha="$(git rev-parse "${TAG}^{commit}")"
+          test "$tag_sha" = "$(git rev-parse HEAD)"
+          source_name="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" --jq .name)"
+          source_sha="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" --jq .head_sha)"
+          verify_conclusion="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/jobs?per_page=100" --jq '.jobs[] | select(.name == "Verify and assemble release") | .conclusion')"
+          test "$source_name" = "Release"
+          test "$source_sha" = "$tag_sha"
+          test "$verify_conclusion" = "success"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download verified release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: release-bundle-${{ inputs.tag }}
+          path: target/release
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.source_run_id }}
+
+      - name: Verify bundle and registry artifacts
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          assets=(
+            target/release/SHA256SUMS
+            target/release/chromium-version.txt
+            "target/release/tabulark-${VERSION}.crate"
+            "target/release/tabulark-${VERSION}.spdx.json"
+            "target/release/tabulark-${VERSION}.tgz"
+          )
+          for asset in "${assets[@]}"; do test -f "$asset"; done
+          (cd target/release && sha256sum --check SHA256SUMS)
+          curl --fail --location --retry 12 --retry-all-errors --retry-delay 5 \
+            --output "$RUNNER_TEMP/tabulark-${VERSION}.tgz" \
+            "https://registry.npmjs.org/tabulark/-/tabulark-${VERSION}.tgz"
+          curl --fail --location --user-agent tabulark-release-recovery \
+            --retry 12 --retry-all-errors --retry-delay 5 \
+            --output "$RUNNER_TEMP/tabulark-${VERSION}.crate" \
+            "https://crates.io/api/v1/crates/tabulark/${VERSION}/download"
+          cmp --silent "target/release/tabulark-${VERSION}.tgz" "$RUNNER_TEMP/tabulark-${VERSION}.tgz"
+          cmp --silent "target/release/tabulark-${VERSION}.crate" "$RUNNER_TEMP/tabulark-${VERSION}.crate"
+
+      - name: Create or repair GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          assets=(
+            target/release/SHA256SUMS
+            target/release/chromium-version.txt
+            "target/release/tabulark-${VERSION}.crate"
+            "target/release/tabulark-${VERSION}.spdx.json"
+            "target/release/tabulark-${VERSION}.tgz"
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" \
+              --verify-tag \
+              --title "Tabulark ${VERSION}" \
+              --generate-notes
+          fi
+
+  registry-smoke:
+    name: Registry consumer smoke (Node ${{ matrix.node }})
+    needs: finalize-release
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Smoke-test the published npm package
+        env:
+          TABULARK_REGISTRY_VERSION: ${{ needs.finalize-release.outputs.version }}
+        run: node scripts/registry-smoke.mjs
+
+  registry-crate-smoke:
+    name: Registry Cargo consumer smoke
+    needs: finalize-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Compile and run a clean crates.io consumer
+        shell: bash
+        env:
+          VERSION: ${{ needs.finalize-release.outputs.version }}
+        run: |
+          temp_root="$(mktemp -d)"
+          consumer="$temp_root/consumer"
+          cargo new --bin --vcs none "$consumer"
+          cd "$consumer"
+          cargo add "tabulark@=${VERSION}" --features parquet,wasm
+          cat > src/main.rs <<'RS'
+          use tabulark::TableShape;
+
+          fn main() {
+              let shape = TableShape::new(3, 4);
+              assert_eq!(shape.checked_cell_count(), Some(12));
+          }
+          RS
+          cargo check --locked
+          cargo run --locked --quiet

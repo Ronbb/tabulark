@@ -252,7 +252,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-bundle-${{ github.ref_name }}
-          path: target/release/
+          path: |
+            target/release/SHA256SUMS
+            target/release/chromium-version.txt
+            target/release/*.crate
+            target/release/*.spdx.json
+            target/release/*.tgz
           if-no-files-found: error
           retention-days: 30
 
@@ -450,11 +455,20 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
         run: |
+          assets=(
+            target/release/SHA256SUMS
+            target/release/chromium-version.txt
+            "target/release/tabulark-${VERSION}.crate"
+            "target/release/tabulark-${VERSION}.spdx.json"
+            "target/release/tabulark-${VERSION}.tgz"
+          )
+          for asset in "${assets[@]}"; do test -f "$asset"; done
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" target/release/* --clobber
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" target/release/* \
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
               --verify-tag \
               --title "Tabulark ${{ needs.verify.outputs.version }}" \
               --generate-notes
@@ -495,7 +509,8 @@ jobs:
         env:
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          consumer="$(mktemp -d)"
+          temp_root="$(mktemp -d)"
+          consumer="$temp_root/consumer"
           cargo new --bin --vcs none "$consumer"
           cd "$consumer"
           cargo add "tabulark@=${VERSION}" --features parquet,wasm

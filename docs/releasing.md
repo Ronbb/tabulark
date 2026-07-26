@@ -83,6 +83,15 @@ after either registry publishes, create a new patch release such as `0.1.1`;
 deprecate and/or yank `0.1.0` according to severity rather than moving or
 reusing its tag.
 
+If both registries already match the verified bundle but GitHub Release
+finalization or the downstream consumer jobs fail, do not move the tag. Run
+the `Release Recovery` workflow with the immutable tag and the original
+Release run ID. The recovery workflow verifies that the source run SHA equals
+the tag, checks the bundle and both registry artifacts byte-for-byte, repairs
+the GitHub Release using only the five expected top-level files, and reruns the
+Node 20/22/24 and Cargo registry consumers. The successful recovery run is the
+finalization evidence; it never republishes either registry package.
+
 ## M4 evidence
 
 The previous milestone's CI, Pages deployment, and deployed-URL smoke evidence
