@@ -1,4 +1,8 @@
-import type { RangeRequest, WireTableBatch } from "./model.js";
+import type {
+  RangeRequest,
+  WireTableBatch,
+  WireTableBatchColumn,
+} from "./model.js";
 
 interface CacheEntry<T> {
   readonly value: T;
@@ -84,6 +88,8 @@ export class AsyncPermitQueue {
 /** A byte-bounded least-recently-used cache. */
 export class ByteLruCache<T> {
   readonly #maxBytes: number;
+  readonly #maxEntries: number;
+  readonly #minimumEntryBytes: number;
   readonly #entries = new Map<string, CacheEntry<T>>();
   readonly #onRemove: ((key: string, value: T, byteLength: number) => void) | undefined;
   #byteLength = 0;
@@ -91,18 +97,34 @@ export class ByteLruCache<T> {
   constructor(
     maxBytes: number,
     options: Readonly<{
+      maxEntries?: number;
+      minimumEntryBytes?: number;
       onRemove?: (key: string, value: T, byteLength: number) => void;
     }> = {},
   ) {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
       throw new RangeError("maxBytes must be a non-negative safe integer");
     }
+    const maxEntries = options.maxEntries ?? Number.MAX_SAFE_INTEGER;
+    if (!Number.isSafeInteger(maxEntries) || maxEntries < 0) {
+      throw new RangeError("maxEntries must be a non-negative safe integer");
+    }
+    const minimumEntryBytes = options.minimumEntryBytes ?? 0;
+    if (!Number.isSafeInteger(minimumEntryBytes) || minimumEntryBytes < 0) {
+      throw new RangeError("minimumEntryBytes must be a non-negative safe integer");
+    }
     this.#maxBytes = maxBytes;
+    this.#maxEntries = maxEntries;
+    this.#minimumEntryBytes = minimumEntryBytes;
     this.#onRemove = options.onRemove;
   }
 
   get maxBytes(): number {
     return this.#maxBytes;
+  }
+
+  get maxEntries(): number {
+    return this.#maxEntries;
   }
 
   get(key: string): T | undefined {
@@ -119,7 +141,8 @@ export class ByteLruCache<T> {
     if (!Number.isSafeInteger(byteLength) || byteLength < 0) {
       throw new RangeError("byteLength must be a non-negative safe integer");
     }
-    if (byteLength > this.#maxBytes) {
+    const chargedBytes = Math.max(byteLength, this.#minimumEntryBytes);
+    if (chargedBytes > this.#maxBytes || this.#maxEntries === 0) {
       return;
     }
 
@@ -128,7 +151,10 @@ export class ByteLruCache<T> {
       this.#remove(key, existing);
     }
 
-    while (this.#byteLength + byteLength > this.#maxBytes) {
+    while (
+      this.#entries.size >= this.#maxEntries
+      || this.#byteLength + chargedBytes > this.#maxBytes
+    ) {
       const oldestKey = this.#entries.keys().next().value as string | undefined;
       if (oldestKey === undefined) {
         break;
@@ -137,8 +163,8 @@ export class ByteLruCache<T> {
       this.#remove(oldestKey, oldest);
     }
 
-    this.#entries.set(key, { value, byteLength });
-    this.#byteLength += byteLength;
+    this.#entries.set(key, { value, byteLength: chargedBytes });
+    this.#byteLength += chargedBytes;
   }
 
   deleteWhere(predicate: (key: string, value: T) => boolean): void {
@@ -166,13 +192,15 @@ export class ByteLruCache<T> {
 }
 
 export function rangeCacheKey(
-  owner: string,
+  datasetHandle: string,
+  tableId: string,
   revision: number,
   schemaVersion: number,
   range: RangeRequest,
 ): string {
   return JSON.stringify([
-    owner,
+    datasetHandle,
+    tableId,
     revision,
     schemaVersion,
     range.rowStart,
@@ -182,31 +210,91 @@ export function rangeCacheKey(
   ]);
 }
 
-export function rangeCacheKeyBelongsTo(key: string, owner: string): boolean {
-  return key.startsWith(`[${JSON.stringify(owner)},`);
+export function rangeCacheKeyBelongsToDataset(key: string, datasetHandle: string): boolean {
+  return key.startsWith(`[${JSON.stringify(datasetHandle)},`);
 }
 
-export function cloneWireTableBatch(batch: WireTableBatch): WireTableBatch {
-  return {
+export function rangeCacheKeyBelongsToTable(
+  key: string,
+  datasetHandle: string,
+  tableId: string,
+): boolean {
+  return key.startsWith(
+    `[${JSON.stringify(datasetHandle)},${JSON.stringify(tableId)},`,
+  );
+}
+
+export function rangeCacheKeyMatchesVersion(
+  key: string,
+  revision: number,
+  schemaVersion: number,
+): boolean {
+  try {
+    const fields = JSON.parse(key) as unknown;
+    return Array.isArray(fields)
+      && fields.length === 8
+      && fields[2] === revision
+      && fields[3] === schemaVersion;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Main-thread-owned immutable backing for a logical batch.
+ *
+ * The ArrayBuffers arrive as independently transferable Worker output and are
+ * intentionally not cloned here. They remain unreachable through the public
+ * batch facade; binary getters perform their own defensive copy.
+ */
+export type BatchBacking = Omit<WireTableBatch, "buffers" | "columns" | "range"> & Readonly<{
+  range: Readonly<WireTableBatch["range"]>;
+  buffers: readonly ArrayBuffer[];
+  columns: readonly WireTableBatchColumn[];
+}>;
+
+export function createBatchBacking(batch: WireTableBatch): BatchBacking {
+  const buffers = batch.buffers.map((buffer, index) => {
+    if (!(buffer instanceof ArrayBuffer)) {
+      throw new TypeError(`Transferred batch buffer ${index} must own an ArrayBuffer backing`);
+    }
+    return buffer;
+  });
+  const columns = batch.columns.map((column) => freezeBatchDescriptor(column));
+  return Object.freeze({
     layoutVersion: batch.layoutVersion,
     tableId: batch.tableId,
     revision: batch.revision,
     schemaVersion: batch.schemaVersion,
-    range: { ...batch.range },
-    // Clone each pool entry exactly once. Descriptor buffer indexes remain
-    // valid and native/display aliases stay deduplicated.
-    buffers: batch.buffers.map((buffer) => Uint8Array.from(asUint8Array(buffer)).buffer),
-    columns: batch.columns,
+    range: Object.freeze({ ...batch.range }),
+    buffers: Object.freeze(buffers),
+    columns: Object.freeze(columns),
     complete: batch.complete,
-  };
+  });
 }
 
 export function wireBatchByteLength(batch: WireTableBatch): number {
   return batch.buffers.reduce((total, buffer) => total + buffer.byteLength, 0);
 }
 
-function asUint8Array(value: ArrayBuffer | ArrayBufferView): Uint8Array {
-  return value instanceof ArrayBuffer
-    ? new Uint8Array(value)
-    : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+function freezeBatchDescriptor<T extends object>(value: T): T {
+  const seen = new WeakSet<object>();
+  const freeze = (entry: unknown): void => {
+    if (typeof entry !== "object" || entry === null || seen.has(entry)) {
+      return;
+    }
+    // Buffer contents are owned by the backing and deliberately remain
+    // readable by the logical facade. Freezing a non-empty typed array also
+    // throws in current engines, so only descriptor objects are traversed.
+    if (entry instanceof ArrayBuffer || ArrayBuffer.isView(entry)) {
+      return;
+    }
+    seen.add(entry);
+    for (const child of Object.values(entry)) {
+      freeze(child);
+    }
+    Object.freeze(entry);
+  };
+  freeze(value);
+  return value;
 }

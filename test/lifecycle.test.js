@@ -498,7 +498,7 @@ class LifecycleWorker {
     if (request.op === this.malformedResponseOp) {
       queueMicrotask(() => this.#emit("message", {
         data: {
-          protocolVersion: 3,
+          protocolVersion: 4,
           requestId: request.requestId,
           status: "success",
         },
@@ -514,7 +514,7 @@ class LifecycleWorker {
     if (request.op === "listTables" && this.malformedEventBeforeListTables) {
       queueMicrotask(() => this.#emit("message", {
         data: {
-          protocolVersion: 3,
+          protocolVersion: 4,
           event: "warning",
           payload: {
             handle: request.payload.datasetHandle,
@@ -529,7 +529,7 @@ class LifecycleWorker {
       queueMicrotask(() => {
         this.#emit("message", {
           data: {
-            protocolVersion: 3,
+            protocolVersion: 4,
             event: "runtimeError",
             datasetHandle: request.payload.datasetHandle,
             payload: {
@@ -541,7 +541,7 @@ class LifecycleWorker {
         });
         this.#emit("message", {
           data: {
-            protocolVersion: 3,
+            protocolVersion: 4,
             event: "closed",
             datasetHandle: request.payload.datasetHandle,
             payload: { handle: request.payload.datasetHandle, kind: "source" },
@@ -549,7 +549,7 @@ class LifecycleWorker {
         });
         this.#emit("message", {
           data: {
-            protocolVersion: 3,
+            protocolVersion: 4,
             requestId: request.requestId,
             status: "failure",
             error: {
@@ -569,7 +569,7 @@ class LifecycleWorker {
     if (request.op === "closeSource") {
       queueMicrotask(() => this.#emit("message", {
         data: {
-          protocolVersion: 3,
+          protocolVersion: 4,
           event: "closed",
           datasetHandle: request.payload.datasetHandle,
           payload: { handle: request.payload.datasetHandle, kind: "dataset" },
@@ -599,7 +599,7 @@ class LifecycleWorker {
     this.closedSources.push(datasetHandle);
     this.#emit("message", {
       data: {
-        protocolVersion: 3,
+        protocolVersion: 4,
         event: "runtimeError",
         datasetHandle,
         payload: {
@@ -611,7 +611,7 @@ class LifecycleWorker {
     });
     this.#emit("message", {
       data: {
-        protocolVersion: 3,
+        protocolVersion: 4,
         event: "closed",
         datasetHandle,
         tableHandle,
@@ -621,7 +621,7 @@ class LifecycleWorker {
     });
     this.#emit("message", {
       data: {
-        protocolVersion: 3,
+        protocolVersion: 4,
         event: "closed",
         datasetHandle,
         tableId: "table-0",
@@ -647,8 +647,8 @@ function responseFor(request, worker) {
     case "hello":
       kind = "hello";
       data = {
-        protocolVersion: 3,
-        adapterApiVersion: 2,
+        protocolVersion: 4,
+        adapterApiVersion: 3,
         batchLayoutVersion: 1,
         adapters: request.payload.adapters.map((adapter) => adapter.id),
         transferableBatches: true,
@@ -683,7 +683,7 @@ function responseFor(request, worker) {
       return undefined;
   }
   return {
-    protocolVersion: 3,
+    protocolVersion: 4,
     requestId: request.requestId,
     status: "success",
     result: data === undefined ? { kind } : { kind, data },

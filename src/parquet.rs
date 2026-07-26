@@ -5,7 +5,7 @@
 //! parquet-rs to request only the footer, metadata, selected row groups, and
 //! projected top-level columns needed for one operation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Debug, Formatter};
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
@@ -275,13 +275,108 @@ impl SparseChunkReader {
             .with_detail("expectedLength", action.length)
             .with_detail("actualLength", bytes.len()));
         }
-        self.segments
-            .lock()
-            .map_err(|_| runtime_lock_error())?
-            .push(Segment {
-                offset: action.offset,
-                bytes: Bytes::from(bytes),
-            });
+        let mut segments = self.segments.lock().map_err(|_| runtime_lock_error())?;
+        let incoming_end = action.end()?;
+        let mut first = segments.partition_point(|segment| segment.offset < action.offset);
+        if first > 0 {
+            let previous = &segments[first - 1];
+            let previous_length = u64::try_from(previous.bytes.len()).map_err(|_| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "Parquet cached source segment length overflows u64",
+                )
+            })?;
+            let previous_end = previous
+                .offset
+                .checked_add(previous_length)
+                .ok_or_else(|| {
+                    TabularkError::new(
+                        ErrorCode::ResourceLimit,
+                        "Parquet cached source segment range overflows u64",
+                    )
+                })?;
+            if previous_end >= action.offset {
+                first -= 1;
+            }
+        }
+
+        let mut merged_start = action.offset;
+        let mut merged_end = incoming_end;
+        let mut last = first;
+        while let Some(segment) = segments.get(last) {
+            if segment.offset > merged_end {
+                break;
+            }
+            let segment_length = u64::try_from(segment.bytes.len()).map_err(|_| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "Parquet cached source segment length overflows u64",
+                )
+            })?;
+            let segment_end = segment.offset.checked_add(segment_length).ok_or_else(|| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "Parquet cached source segment range overflows u64",
+                )
+            })?;
+            merged_start = merged_start.min(segment.offset);
+            merged_end = merged_end.max(segment_end);
+            last += 1;
+        }
+
+        if first == last {
+            segments.insert(
+                first,
+                Segment {
+                    offset: action.offset,
+                    bytes: Bytes::from(bytes),
+                },
+            );
+            return Ok(());
+        }
+
+        let merged_length = usize::try_from(merged_end - merged_start).map_err(|_| {
+            TabularkError::new(
+                ErrorCode::ResourceLimit,
+                "Parquet merged source segment length overflows usize",
+            )
+        })?;
+        let mut merged = vec![0_u8; merged_length];
+        for segment in &segments[first..last] {
+            let start = usize::try_from(segment.offset - merged_start).map_err(|_| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "Parquet cached source segment offset overflows usize",
+                )
+            })?;
+            let end = start.checked_add(segment.bytes.len()).ok_or_else(|| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "Parquet cached source segment slice overflows usize",
+                )
+            })?;
+            merged[start..end].copy_from_slice(&segment.bytes);
+        }
+        let incoming_start = usize::try_from(action.offset - merged_start).map_err(|_| {
+            TabularkError::new(
+                ErrorCode::ResourceLimit,
+                "Parquet ingress source segment offset overflows usize",
+            )
+        })?;
+        let incoming_end = incoming_start.checked_add(bytes.len()).ok_or_else(|| {
+            TabularkError::new(
+                ErrorCode::ResourceLimit,
+                "Parquet ingress source segment slice overflows usize",
+            )
+        })?;
+        merged[incoming_start..incoming_end].copy_from_slice(&bytes);
+        segments.splice(
+            first..last,
+            [Segment {
+                offset: merged_start,
+                bytes: Bytes::from(merged),
+            }],
+        );
         Ok(())
     }
 
@@ -316,21 +411,60 @@ impl SparseChunkReader {
             .segments
             .lock()
             .map_err(|_| ParquetError::General("Parquet sparse source lock is poisoned".into()))?;
-        for segment in segments.iter().rev() {
-            let segment_length = u64::try_from(segment.bytes.len()).map_err(|_| {
-                ParquetError::General("cached source segment length overflows u64".into())
+        let candidate = segments.partition_point(|segment| segment.offset <= offset);
+        let Some(segment) = candidate
+            .checked_sub(1)
+            .and_then(|index| segments.get(index))
+        else {
+            return Ok(None);
+        };
+        let segment_length = u64::try_from(segment.bytes.len()).map_err(|_| {
+            ParquetError::General("cached source segment length overflows u64".into())
+        })?;
+        let segment_end = segment.offset.checked_add(segment_length).ok_or_else(|| {
+            ParquetError::General("cached source segment range overflows u64".into())
+        })?;
+        if end <= segment_end {
+            let start = usize::try_from(offset - segment.offset).map_err(|_| {
+                ParquetError::General("cached source slice offset overflows usize".into())
             })?;
-            let segment_end = segment.offset.checked_add(segment_length).ok_or_else(|| {
-                ParquetError::General("cached source segment range overflows u64".into())
-            })?;
-            if offset >= segment.offset && end <= segment_end {
-                let start = usize::try_from(offset - segment.offset).map_err(|_| {
-                    ParquetError::General("cached source slice offset overflows usize".into())
-                })?;
-                return Ok(Some(segment.bytes.slice(start..start + length)));
-            }
+            return Ok(Some(segment.bytes.slice(start..start + length)));
         }
         Ok(None)
+    }
+
+    fn locate_suffix(&self, offset: u64, max_length: usize) -> ParquetResult<Option<Bytes>> {
+        if offset > self.source_length {
+            return Err(ParquetError::EOF(format!(
+                "source offset {offset} exceeds file length {}",
+                self.source_length
+            )));
+        }
+        let segments = self
+            .segments
+            .lock()
+            .map_err(|_| ParquetError::General("Parquet sparse source lock is poisoned".into()))?;
+        let candidate = segments.partition_point(|segment| segment.offset <= offset);
+        let Some(segment) = candidate
+            .checked_sub(1)
+            .and_then(|index| segments.get(index))
+        else {
+            return Ok(None);
+        };
+        let segment_length = u64::try_from(segment.bytes.len()).map_err(|_| {
+            ParquetError::General("cached source segment length overflows u64".into())
+        })?;
+        let segment_end = segment.offset.checked_add(segment_length).ok_or_else(|| {
+            ParquetError::General("cached source segment range overflows u64".into())
+        })?;
+        if offset >= segment_end {
+            return Ok(None);
+        }
+        let start = usize::try_from(offset - segment.offset).map_err(|_| {
+            ParquetError::General("cached source slice offset overflows usize".into())
+        })?;
+        let end = start.saturating_add(max_length).min(segment.bytes.len());
+        Ok(Some(segment.bytes.slice(start..end)))
     }
 
     fn request(&self, offset: u64, length: usize) -> ParquetResult<Bytes> {
@@ -395,7 +529,7 @@ impl ChunkReader for SparseChunkReader {
             remaining.min(u64::try_from(self.read_prefetch_bytes).unwrap_or(u64::MAX)),
         )
         .map_err(|_| ParquetError::General("Parquet read prefetch is too large".into()))?;
-        match self.locate(start, length)? {
+        match self.locate_suffix(start, length)? {
             Some(bytes) => Ok(Cursor::new(bytes)),
             None => self.request(start, length).map(Cursor::new),
         }
@@ -717,8 +851,8 @@ impl OpenedParquetSource {
             })
     }
 
-    /// Starts a projected range read that requests missing column chunks on
-    /// demand from the Worker-owned source.
+    /// Starts a projected range read that preplans, sorts, and coalesces the
+    /// intersecting row-group/column-chunk ranges from the footer index.
     pub fn begin_read(&self, request: RangeRequest) -> Result<ParquetReadStart> {
         let plan = plan_range(
             request,
@@ -745,13 +879,31 @@ impl OpenedParquetSource {
                 Vec::new(),
             )?));
         }
+        let source_columns = projected_source_columns(&plan)?;
+        let projection = ProjectionMask::roots(
+            self.reader_metadata.parquet_schema(),
+            source_columns.iter().copied(),
+        );
+        let projected = plan_projected_ranges(
+            &self.reader_metadata,
+            &self.reader,
+            &plan,
+            &projection,
+            &self.limits,
+        )?;
         let mut operation = ParquetReadOperation {
             options: self.options.clone(),
             limits: self.limits.clone(),
             reader_metadata: self.reader_metadata.clone(),
             reader: self.reader.fork()?,
             plan,
+            source_columns,
+            projection,
+            row_groups: projected.row_groups,
+            row_offset: projected.row_offset,
+            planned_ranges: projected.ranges.into(),
             expected: None,
+            decode_attempts: 0,
         };
         match operation.advance()? {
             Some(batch) => Ok(ParquetReadStart::Complete(batch)),
@@ -777,7 +929,13 @@ pub struct ParquetReadOperation {
     reader_metadata: ArrowReaderMetadata,
     reader: SparseChunkReader,
     plan: RangePlan,
+    source_columns: Vec<usize>,
+    projection: ProjectionMask,
+    row_groups: Vec<usize>,
+    row_offset: usize,
+    planned_ranges: VecDeque<ParquetReadBytesAction>,
     expected: Option<ParquetReadBytesAction>,
+    decode_attempts: usize,
 }
 
 impl ParquetReadOperation {
@@ -787,52 +945,134 @@ impl ParquetReadOperation {
         self.expected
     }
 
-    /// Supplies one requested source range and retries the bounded decode.
+    /// Returns a bounded prefix of the preplanned compressed-page ranges.
+    pub fn next_actions(
+        &self,
+        max_ranges: usize,
+        max_bytes: u64,
+    ) -> Result<Vec<ParquetReadBytesAction>> {
+        if max_ranges == 0 || max_bytes == 0 {
+            return Err(TabularkError::new(
+                ErrorCode::InvalidArgument,
+                "Parquet read action batch limits must be greater than zero",
+            ));
+        }
+        let Some(first) = self.expected else {
+            return Ok(Vec::new());
+        };
+        let mut actions =
+            Vec::with_capacity(max_ranges.min(self.planned_ranges.len().saturating_add(1)));
+        let mut total = 0_u64;
+        for action in std::iter::once(&first)
+            .chain(self.planned_ranges.iter())
+            .take(max_ranges)
+        {
+            let next_total = total.checked_add(action.length).ok_or_else(|| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "Parquet read action batch byte total overflows",
+                )
+            })?;
+            if next_total > max_bytes {
+                break;
+            }
+            total = next_total;
+            actions.push(*action);
+        }
+        if actions.is_empty() {
+            return Err(resource_limit("compressed-pages", first.length, max_bytes));
+        }
+        Ok(actions)
+    }
+
+    /// Supplies one preplanned source range. Decoding starts only after every
+    /// projected column-chunk range has arrived.
     pub fn feed_owned(
         &mut self,
         offset: u64,
         bytes: Vec<u8>,
         eof: bool,
     ) -> Result<Option<TypedTableBatch>> {
-        let expected = self.expected.take().ok_or_else(|| {
+        self.feed_many_owned(vec![(offset, bytes, eof)])
+    }
+
+    /// Supplies one complete batch of preplanned compressed-page ranges.
+    /// Every result is validated before any range is inserted.
+    pub fn feed_many_owned(
+        &mut self,
+        results: Vec<(u64, Vec<u8>, bool)>,
+    ) -> Result<Option<TypedTableBatch>> {
+        if results.is_empty() {
+            return Err(TabularkError::new(
+                ErrorCode::InvalidArgument,
+                "Parquet read operation result set must not be empty",
+            ));
+        }
+        let expected = self.next_actions(results.len(), u64::MAX)?;
+        if expected.len() != results.len() {
+            return Err(TabularkError::new(
+                ErrorCode::InvalidArgument,
+                "Parquet read result set has an unexpected range count",
+            )
+            .with_detail("expectedResults", expected.len())
+            .with_detail("actualResults", results.len()));
+        }
+        for (action, (offset, bytes, eof)) in expected.iter().copied().zip(&results) {
+            validate_feed(
+                action,
+                *offset,
+                bytes.len(),
+                *eof,
+                self.reader.source_length,
+            )?;
+        }
+        self.expected.take().ok_or_else(|| {
             TabularkError::new(
                 ErrorCode::InvalidArgument,
                 "Parquet read operation is not waiting for source bytes",
             )
         })?;
-        validate_feed(
-            expected,
-            offset,
-            bytes.len(),
-            eof,
-            self.reader.source_length,
-        )?;
-        self.reader.insert(expected, bytes)?;
+        for (index, (action, (_, bytes, _))) in expected.into_iter().zip(results).enumerate() {
+            if index > 0 {
+                let planned = self.planned_ranges.pop_front().ok_or_else(|| {
+                    TabularkError::new(
+                        ErrorCode::RuntimeFailure,
+                        "Parquet preplanned range queue is inconsistent",
+                    )
+                })?;
+                if planned != action {
+                    return Err(TabularkError::new(
+                        ErrorCode::RuntimeFailure,
+                        "Parquet preplanned range order changed",
+                    ));
+                }
+            }
+            self.reader.insert(action, bytes)?;
+        }
         self.advance()
     }
 
     fn advance(&mut self) -> Result<Option<TypedTableBatch>> {
+        if let Some(action) = self.planned_ranges.pop_front() {
+            self.expected = Some(action);
+            return Ok(None);
+        }
+        self.decode_attempts = self.decode_attempts.checked_add(1).ok_or_else(|| {
+            TabularkError::new(
+                ErrorCode::ResourceLimit,
+                "Parquet decode-attempt accounting overflows",
+            )
+        })?;
         self.reader.clear_missing()?;
-        let row_start =
-            usize::try_from(self.plan.returned_range.row_start()).map_err(|_| invalid_range())?;
         let row_count =
             usize::try_from(self.plan.returned_range.row_count()).map_err(|_| invalid_range())?;
-        let column_start = usize::try_from(self.plan.returned_range.column_start())
-            .map_err(|_| invalid_range())?;
-        let column_count = usize::try_from(self.plan.returned_range.column_count())
-            .map_err(|_| invalid_range())?;
-        let source_columns = (column_start..column_start + column_count).collect::<Vec<_>>();
-        let projection = ProjectionMask::roots(
-            self.reader_metadata.parquet_schema(),
-            source_columns.iter().copied(),
-        );
-        self.reserve_projected_row_groups(&projection)?;
         let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
             self.reader.clone(),
             self.reader_metadata.clone(),
         )
-        .with_projection(projection)
-        .with_offset(row_start)
+        .with_projection(self.projection.clone())
+        .with_row_groups(self.row_groups.clone())
+        .with_offset(self.row_offset)
         .with_limit(row_count)
         .with_batch_size(self.limits.max_batch_rows.min(row_count.max(1)));
         let reader = match builder.build() {
@@ -866,7 +1106,7 @@ impl ParquetReadOperation {
         let batch = encode_projected_record_batches(
             self.reader_metadata.schema(),
             &batches,
-            &source_columns,
+            &self.source_columns,
             self.plan.returned_range,
             self.plan.complete,
             &self.limits.arrow,
@@ -874,98 +1114,15 @@ impl ParquetReadOperation {
         Ok(Some(batch))
     }
 
-    fn reserve_projected_row_groups(&self, projection: &ProjectionMask) -> Result<()> {
-        let request_start = self.plan.returned_range.row_start();
-        let request_end = request_start
-            .checked_add(self.plan.returned_range.row_count())
-            .ok_or_else(invalid_range)?;
-        let mut row_offset = 0_u64;
-        let mut compressed_bytes = 0_u64;
-        let mut uncompressed_bytes = 0_u64;
-        for row_group in self.reader_metadata.metadata().row_groups() {
-            let rows = u64::try_from(row_group.num_rows()).map_err(|_| {
-                TabularkError::new(
-                    ErrorCode::ParseFailed,
-                    "Parquet row group contains a negative row count",
-                )
-            })?;
-            let row_end = row_offset.checked_add(rows).ok_or_else(|| {
-                TabularkError::new(
-                    ErrorCode::ResourceLimit,
-                    "Parquet row-group offsets overflow",
-                )
-            })?;
-            let intersects = row_offset < request_end && row_end > request_start;
-            if intersects {
-                for (leaf_index, column) in row_group.columns().iter().enumerate() {
-                    if !projection.leaf_included(leaf_index) {
-                        continue;
-                    }
-                    let compressed = u64::try_from(column.compressed_size()).map_err(|_| {
-                        TabularkError::new(
-                            ErrorCode::ParseFailed,
-                            "Parquet column chunk has a negative compressed size",
-                        )
-                    })?;
-                    let uncompressed = u64::try_from(column.uncompressed_size()).map_err(|_| {
-                        TabularkError::new(
-                            ErrorCode::ParseFailed,
-                            "Parquet column chunk has a negative uncompressed size",
-                        )
-                    })?;
-                    compressed_bytes =
-                        compressed_bytes.checked_add(compressed).ok_or_else(|| {
-                            TabularkError::new(
-                                ErrorCode::ResourceLimit,
-                                "Parquet compressed-page reservation overflows",
-                            )
-                        })?;
-                    uncompressed_bytes =
-                        uncompressed_bytes
-                            .checked_add(uncompressed)
-                            .ok_or_else(|| {
-                                TabularkError::new(
-                                    ErrorCode::ResourceLimit,
-                                    "Parquet decompressed-page reservation overflows",
-                                )
-                            })?;
-                }
-            }
-            row_offset = row_end;
-            if row_offset >= request_end {
-                break;
-            }
-        }
-        let compressed_limit = u64::try_from(self.limits.max_operation_bytes).unwrap_or(u64::MAX);
-        if compressed_bytes > compressed_limit {
-            return Err(resource_limit(
-                "compressed-pages",
-                compressed_bytes,
-                compressed_limit,
-            ));
-        }
-        let decoded_limit = u64::try_from(self.limits.arrow.max_decoded_bytes).unwrap_or(u64::MAX);
-        if uncompressed_bytes > decoded_limit {
-            return Err(resource_limit(
-                "decompressed-pages",
-                uncompressed_bytes,
-                decoded_limit,
-            ));
-        }
-        Ok(())
-    }
-
     fn resolve_missing_or_error(&mut self, error: ParquetError) -> Result<()> {
         if let Some(action) = self.reader.take_missing()? {
-            ensure_action_budget(
-                &self.reader,
-                action,
-                self.limits.max_operation_bytes,
-                "compressed-pages",
-            )?;
-            self.reader.set_missing(action)?;
-            self.expected = Some(action);
-            Ok(())
+            Err(TabularkError::new(
+                ErrorCode::RuntimeFailure,
+                "Parquet preplanned column ranges did not cover a decoder request",
+            )
+            .with_detail("offset", action.offset)
+            .with_detail("length", action.length)
+            .with_detail("reason", error.to_string()))
         } else {
             Err(parquet_error(
                 &format!("read Parquet range from {}", self.options.source_name),
@@ -973,6 +1130,163 @@ impl ParquetReadOperation {
             ))
         }
     }
+}
+
+fn projected_source_columns(plan: &RangePlan) -> Result<Vec<usize>> {
+    let column_start =
+        usize::try_from(plan.returned_range.column_start()).map_err(|_| invalid_range())?;
+    let column_count =
+        usize::try_from(plan.returned_range.column_count()).map_err(|_| invalid_range())?;
+    let column_end = column_start
+        .checked_add(column_count)
+        .ok_or_else(invalid_range)?;
+    Ok((column_start..column_end).collect())
+}
+
+/// Plans the complete compressed ingress set before parquet-rs constructs a
+/// reader. Column chunks are the physical containers for dictionary and data
+/// pages; coalescing their byte ranges prevents repeated reader construction
+/// while keeping unrelated row groups and columns outside the operation.
+struct ProjectedReadPlan {
+    ranges: Vec<ParquetReadBytesAction>,
+    row_groups: Vec<usize>,
+    row_offset: usize,
+}
+
+fn plan_projected_ranges(
+    reader_metadata: &ArrowReaderMetadata,
+    reader: &SparseChunkReader,
+    plan: &RangePlan,
+    projection: &ProjectionMask,
+    limits: &ParquetLimits,
+) -> Result<ProjectedReadPlan> {
+    let request_start = plan.returned_range.row_start();
+    let request_end = request_start
+        .checked_add(plan.returned_range.row_count())
+        .ok_or_else(invalid_range)?;
+    let mut row_offset = 0_u64;
+    let mut uncompressed_bytes = 0_u64;
+    let mut ranges = Vec::new();
+    let mut row_groups = Vec::new();
+    let mut selected_row_offset = 0_usize;
+    for (row_group_index, row_group) in reader_metadata.metadata().row_groups().iter().enumerate() {
+        let rows = u64::try_from(row_group.num_rows()).map_err(|_| {
+            TabularkError::new(
+                ErrorCode::ParseFailed,
+                "Parquet row group contains a negative row count",
+            )
+        })?;
+        let row_end = row_offset.checked_add(rows).ok_or_else(|| {
+            TabularkError::new(
+                ErrorCode::ResourceLimit,
+                "Parquet row-group offsets overflow",
+            )
+        })?;
+        if row_offset < request_end && row_end > request_start {
+            if row_groups.is_empty() {
+                selected_row_offset =
+                    usize::try_from(request_start - row_offset).map_err(|_| invalid_range())?;
+            }
+            row_groups.push(row_group_index);
+            for (leaf_index, column) in row_group.columns().iter().enumerate() {
+                if !projection.leaf_included(leaf_index) {
+                    continue;
+                }
+                let uncompressed = u64::try_from(column.uncompressed_size()).map_err(|_| {
+                    TabularkError::new(
+                        ErrorCode::ParseFailed,
+                        "Parquet column chunk has a negative uncompressed size",
+                    )
+                })?;
+                uncompressed_bytes =
+                    uncompressed_bytes
+                        .checked_add(uncompressed)
+                        .ok_or_else(|| {
+                            TabularkError::new(
+                                ErrorCode::ResourceLimit,
+                                "Parquet decompressed-page reservation overflows",
+                            )
+                        })?;
+                let (offset, length) = column.byte_range();
+                let action = ParquetReadBytesAction { offset, length };
+                if action.end()? > reader.source_length {
+                    return Err(TabularkError::new(
+                        ErrorCode::ParseFailed,
+                        "Parquet column-chunk range exceeds the encoded source",
+                    )
+                    .with_detail("offset", offset)
+                    .with_detail("length", length)
+                    .with_detail("sourceLength", reader.source_length));
+                }
+                if length > 0 {
+                    ranges.push(action);
+                }
+            }
+        }
+        row_offset = row_end;
+        if row_offset >= request_end {
+            break;
+        }
+    }
+
+    let decoded_limit = u64::try_from(limits.arrow.max_decoded_bytes).unwrap_or(u64::MAX);
+    if uncompressed_bytes > decoded_limit {
+        return Err(resource_limit(
+            "decompressed-pages",
+            uncompressed_bytes,
+            decoded_limit,
+        ));
+    }
+
+    let ranges = coalesce_source_ranges(ranges)?;
+    let compressed_bytes = ranges.iter().try_fold(0_u64, |total, action| {
+        total.checked_add(action.length).ok_or_else(|| {
+            TabularkError::new(
+                ErrorCode::ResourceLimit,
+                "Parquet compressed-page reservation overflows",
+            )
+        })
+    })?;
+    let compressed_limit = u64::try_from(limits.max_operation_bytes).unwrap_or(u64::MAX);
+    if compressed_bytes > compressed_limit {
+        return Err(resource_limit(
+            "compressed-pages",
+            compressed_bytes,
+            compressed_limit,
+        ));
+    }
+    Ok(ProjectedReadPlan {
+        ranges,
+        row_groups,
+        row_offset: selected_row_offset,
+    })
+}
+
+fn coalesce_source_ranges(
+    mut ranges: Vec<ParquetReadBytesAction>,
+) -> Result<Vec<ParquetReadBytesAction>> {
+    ranges.sort_unstable_by_key(|action| action.offset);
+    let mut merged: Vec<ParquetReadBytesAction> = Vec::with_capacity(ranges.len());
+    for action in ranges {
+        let action_end = action.end()?;
+        let Some(previous) = merged.last_mut() else {
+            merged.push(action);
+            continue;
+        };
+        let previous_end = previous.end()?;
+        if action.offset <= previous_end {
+            let merged_end = previous_end.max(action_end);
+            previous.length = merged_end.checked_sub(previous.offset).ok_or_else(|| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "Parquet merged source range underflows",
+                )
+            })?;
+        } else {
+            merged.push(action);
+        }
+    }
+    Ok(merged)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1380,7 +1694,8 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        OpenedParquetSource, ParquetLimits, ParquetOpenOperation, ParquetOptions, ParquetReadStart,
+        OpenedParquetSource, ParquetLimits, ParquetOpenOperation, ParquetOptions,
+        ParquetReadBytesAction, ParquetReadStart, SparseChunkReader, coalesce_source_ranges,
         parquet_error,
     };
     use crate::error::ErrorCode;
@@ -1404,6 +1719,140 @@ mod tests {
             ParquetError::General("zstd content checksum mismatch".into()),
         );
         assert_eq!(malformed.code(), ErrorCode::ParseFailed);
+    }
+
+    fn cache_segment(reader: &SparseChunkReader, offset: u64, bytes: &[u8]) {
+        reader
+            .insert(
+                ParquetReadBytesAction {
+                    offset,
+                    length: u64::try_from(bytes.len()).expect("segment length"),
+                },
+                bytes.to_vec(),
+            )
+            .expect("cache source segment");
+    }
+
+    #[test]
+    fn sparse_reader_sorts_and_coalesces_adjacent_and_overlapping_segments() {
+        let reader = SparseChunkReader::new(32, 8);
+        cache_segment(&reader, 8, &[8, 9]);
+        cache_segment(&reader, 0, &[0, 1]);
+
+        {
+            let segments = reader.segments.lock().expect("segments");
+            assert_eq!(
+                segments
+                    .iter()
+                    .map(|segment| segment.offset)
+                    .collect::<Vec<_>>(),
+                vec![0, 8]
+            );
+        }
+
+        cache_segment(&reader, 2, &[2, 3, 4]);
+        cache_segment(&reader, 4, &[4, 5, 6, 7, 8]);
+
+        let segments = reader.segments.lock().expect("segments");
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].offset, 0);
+        assert_eq!(segments[0].bytes.as_ref(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        drop(segments);
+        assert_eq!(reader.retained_bytes().expect("retained bytes"), 10);
+        assert_eq!(
+            reader
+                .locate(1, 8)
+                .expect("locate merged range")
+                .expect("merged range is cached")
+                .as_ref(),
+            &[1, 2, 3, 4, 5, 6, 7, 8]
+        );
+    }
+
+    #[test]
+    fn sparse_reader_binary_lookup_handles_gaps_and_latest_overlap() {
+        let reader = SparseChunkReader::new(40, 8);
+        cache_segment(&reader, 20, &[20, 21, 22, 23]);
+        cache_segment(&reader, 4, &[4, 5, 6, 7]);
+        cache_segment(&reader, 12, &[12, 13, 14, 15]);
+
+        assert_eq!(
+            reader
+                .segments
+                .lock()
+                .expect("segments")
+                .iter()
+                .map(|segment| segment.offset)
+                .collect::<Vec<_>>(),
+            vec![4, 12, 20]
+        );
+        assert!(
+            reader
+                .locate(11, 1)
+                .expect("lookup before segment")
+                .is_none()
+        );
+        assert!(
+            reader
+                .locate(16, 1)
+                .expect("lookup after segment")
+                .is_none()
+        );
+        assert_eq!(
+            reader
+                .locate(20, 4)
+                .expect("lookup final segment")
+                .expect("final segment is cached")
+                .as_ref(),
+            &[20, 21, 22, 23]
+        );
+
+        cache_segment(&reader, 13, &[113, 114]);
+        assert_eq!(reader.retained_bytes().expect("retained bytes"), 12);
+        assert_eq!(
+            reader
+                .locate(12, 4)
+                .expect("lookup overwritten segment")
+                .expect("overwritten segment is cached")
+                .as_ref(),
+            &[12, 113, 114, 15]
+        );
+    }
+
+    #[test]
+    fn projected_source_ranges_sort_and_coalesce_without_filling_gaps() {
+        let merged = coalesce_source_ranges(vec![
+            ParquetReadBytesAction {
+                offset: 20,
+                length: 5,
+            },
+            ParquetReadBytesAction {
+                offset: 4,
+                length: 6,
+            },
+            ParquetReadBytesAction {
+                offset: 0,
+                length: 4,
+            },
+            ParquetReadBytesAction {
+                offset: 8,
+                length: 6,
+            },
+        ])
+        .expect("coalesced ranges");
+        assert_eq!(
+            merged,
+            vec![
+                ParquetReadBytesAction {
+                    offset: 0,
+                    length: 14,
+                },
+                ParquetReadBytesAction {
+                    offset: 20,
+                    length: 5,
+                },
+            ]
+        );
     }
 
     fn fixture(compression: Compression) -> Vec<u8> {
@@ -1575,21 +2024,40 @@ mod tests {
             ParquetReadStart::Pending(operation) => operation,
             ParquetReadStart::Complete(_) => panic!("data range should need column bytes"),
         };
+        let mut planned_actions = Vec::new();
+        let mut operation_steps = 0_usize;
         let batch = loop {
-            let action = operation.next_action().expect("read action");
-            let start = usize::try_from(action.offset).expect("offset");
-            let length = usize::try_from(action.length).expect("length");
-            let result = operation
-                .feed_owned(
-                    action.offset,
-                    bytes[start..start + length].to_vec(),
-                    start + length == bytes.len(),
-                )
-                .expect("advance read");
+            let actions = operation.next_actions(32, u64::MAX).expect("read actions");
+            operation_steps += 1;
+            planned_actions.extend(actions.iter().copied());
+            let ingress = actions
+                .into_iter()
+                .map(|action| {
+                    let start = usize::try_from(action.offset).expect("offset");
+                    let length = usize::try_from(action.length).expect("length");
+                    (
+                        action.offset,
+                        bytes[start..start + length].to_vec(),
+                        start + length == bytes.len(),
+                    )
+                })
+                .collect();
+            let result = operation.feed_many_owned(ingress).expect("advance read");
             if let Some(batch) = result {
                 break batch;
             }
         };
+        assert_eq!(
+            operation.decode_attempts, 1,
+            "all planned column chunks must arrive before the sole decoder construction: {planned_actions:?}"
+        );
+        assert_eq!(operation_steps, 1, "planned ranges must share one ABI step");
+        assert!(planned_actions.len() > 1);
+        assert!(
+            planned_actions.windows(2).all(|actions| {
+                actions[0].end().expect("planned action end") < actions[1].offset
+            })
+        );
         assert_eq!(batch.range(), request);
         assert_eq!(batch.columns().len(), 1);
         assert_eq!(batch.columns()[0].column_id(), "c1");
@@ -1601,6 +2069,20 @@ mod tests {
             batch.columns()[0].native().layout(),
             ArrayLayout::VariableWidth { .. }
         ));
+    }
+
+    #[test]
+    fn zero_row_projection_completes_without_page_ingress() {
+        let bytes = fixture(Compression::SNAPPY);
+        let limits = ParquetLimits::from_memory_budget(32 * 1024 * 1024).expect("limits");
+        let (source, _) = open(&bytes, limits);
+        let request = RangeRequest::new(6, 0, 0, 2).expect("zero-row range");
+        let batch = match source.begin_read(request).expect("zero-row read") {
+            ParquetReadStart::Complete(batch) => batch,
+            ParquetReadStart::Pending(_) => panic!("zero rows must not request column pages"),
+        };
+        assert_eq!(batch.range(), request);
+        assert_eq!(batch.columns().len(), 2);
     }
 
     #[test]

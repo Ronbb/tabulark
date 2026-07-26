@@ -1,0 +1,13 @@
+[package]
+name = "tabulark-large-fixture-generator"
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+# Keep the release generator independent from the browser runtime workspace so
+# the large-file job can upload one native binary without Cargo target output.
+[workspace]
+
+[lints.rust]
+unsafe_code = "forbid"

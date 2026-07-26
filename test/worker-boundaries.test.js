@@ -44,6 +44,30 @@ test("Worker hello validates registrations atomically and permits a corrected re
   }
 });
 
+test("Worker reserves large mode for local Blob or File sources", async () => {
+  const worker = await workerHarness("large-source-kind");
+  try {
+    const hello = worker.send("hello", {
+      adapters: [{ id: "tabulark:delimited" }],
+      memoryBudgetBytes: 8 * 1024 * 1024,
+    });
+    assert.equal((await worker.responseFor(hello)).status, "success");
+
+    const opened = worker.send("openSource", {
+      source: new ArrayBuffer(8),
+      sourceMode: "large",
+      adapterId: "tabulark:delimited",
+      options: { delimiter: ",", header: "first-row", mode: "strict" },
+    });
+    const response = await worker.responseFor(opened);
+    assert.equal(response.status, "failure");
+    assert.equal(response.error.code, "INVALID_ARGUMENT");
+  } finally {
+    await worker.shutdown();
+    worker.restore();
+  }
+});
+
 test("Worker rejects a source range whose safe offset plus length would overflow the source", async () => {
   const worker = await workerHarness("source-range-overflow");
   testAdapter("tabulark:delimited", overflowingRangeModuleUrl());
@@ -65,6 +89,99 @@ test("Worker rejects a source range whose safe offset plus length would overflow
     assert.equal(response.error.details.resource, "source-staging");
     assert.equal(response.error.details.offset, Number.MAX_SAFE_INTEGER);
     assert.equal(response.error.details.sourceLength, 8);
+  } finally {
+    await worker.shutdown();
+    worker.restore();
+  }
+});
+
+test("ABI-v3 submits non-adjacent range results together and preserves action identity", async () => {
+  const worker = await workerHarness("abi-v3-multi-range", ["__tabularkAbiResults"]);
+  Object.defineProperty(globalThis, "__tabularkAbiResults", {
+    configurable: true,
+    writable: true,
+    value: [],
+  });
+  testAdapter("tabulark:delimited", abiV3ModuleUrl("multi"));
+  try {
+    const hello = worker.send("hello", {
+      adapters: [{ id: "tabulark:delimited" }],
+      memoryBudgetBytes: 8 * 1024 * 1024,
+    });
+    assert.equal((await worker.responseFor(hello)).status, "success");
+    const opened = worker.send("openSource", {
+      source: new Blob(["abcdefghij"]),
+      adapterId: "tabulark:delimited",
+      options: { delimiter: ",", header: "first-row", mode: "strict" },
+    });
+    assert.equal((await worker.responseFor(opened)).status, "success");
+    assert.deepEqual(globalThis.__tabularkAbiResults, [{
+      revision: 1,
+      results: [
+        { actionIndex: 7, offset: 0, bytes: [97], eof: false },
+        { actionIndex: 3, offset: 9, bytes: [106], eof: true },
+      ],
+    }]);
+  } finally {
+    await worker.shutdown();
+    worker.restore();
+  }
+});
+
+test("ABI-v3 rejects duplicate action indexes and stale continuation revisions", async () => {
+  for (const mode of ["duplicate", "stale"]) {
+    const worker = await workerHarness(`abi-v3-${mode}`);
+    testAdapter("tabulark:delimited", abiV3ModuleUrl(mode));
+    try {
+      const hello = worker.send("hello", {
+        adapters: [{ id: "tabulark:delimited" }],
+        memoryBudgetBytes: 8 * 1024 * 1024,
+      });
+      assert.equal((await worker.responseFor(hello)).status, "success");
+      const opened = worker.send("openSource", {
+        source: new Blob(["ab"]),
+        adapterId: "tabulark:delimited",
+        options: { delimiter: ",", header: "first-row", mode: "strict" },
+      });
+      const response = await worker.responseFor(opened);
+      assert.equal(response.status, "failure", mode);
+      assert.equal(response.error.code, "PROTOCOL_INCOMPATIBLE", mode);
+    } finally {
+      await worker.shutdown();
+      worker.restore();
+    }
+  }
+});
+
+test("ABI-v3 no-I/O yields remain cancellable and cancel their operation once", async () => {
+  const worker = await workerHarness("abi-v3-yield", [
+    "__tabularkAbiYieldCount",
+    "__tabularkAbiCancelCount",
+  ]);
+  Object.defineProperties(globalThis, {
+    __tabularkAbiYieldCount: { configurable: true, writable: true, value: 0 },
+    __tabularkAbiCancelCount: { configurable: true, writable: true, value: 0 },
+  });
+  testAdapter("tabulark:delimited", abiV3ModuleUrl("yield"));
+  try {
+    const hello = worker.send("hello", {
+      adapters: [{ id: "tabulark:delimited" }],
+      memoryBudgetBytes: 8 * 1024 * 1024,
+    });
+    assert.equal((await worker.responseFor(hello)).status, "success");
+    const opening = worker.send("openSource", {
+      source: new Blob(["ab"]),
+      adapterId: "tabulark:delimited",
+      options: { delimiter: ",", header: "first-row", mode: "strict" },
+    });
+    for (let attempt = 0; attempt < 200 && globalThis.__tabularkAbiYieldCount === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    assert.ok(globalThis.__tabularkAbiYieldCount > 0);
+    const cancelling = worker.send("cancel", { targetRequestId: opening });
+    assert.equal((await worker.responseFor(cancelling)).status, "success");
+    assert.equal((await worker.responseFor(opening)).error.code, "CANCELLED");
+    assert.equal(globalThis.__tabularkAbiCancelCount, 1);
   } finally {
     await worker.shutdown();
     worker.restore();
@@ -233,6 +350,59 @@ test("Worker rejects structural delimiters and normalizes untrusted metadata", a
   }
 });
 
+test("Worker forwards ABI-v3 warnings from every table value operation", async () => {
+  const worker = await workerHarness("table-operation-warnings");
+  testAdapter("tabulark:delimited", warningOperationModuleUrl());
+  try {
+    const hello = worker.send("hello", {
+      adapters: [{ id: "tabulark:delimited" }],
+      memoryBudgetBytes: 8 * 1024 * 1024,
+    });
+    assert.equal((await worker.responseFor(hello)).status, "success");
+
+    const opened = worker.send("openSource", {
+      source: new Blob(["value\n1\n"]),
+      adapterId: "tabulark:delimited",
+      options: { delimiter: ",", header: "first-row", mode: "strict" },
+    });
+    const datasetHandle = (await worker.responseFor(opened)).result.data.datasetHandle;
+    const openingTable = worker.send("openTable", { datasetHandle, tableId: "table-0" });
+    const tableHandle = (await worker.responseFor(openingTable)).result.data.tableHandle;
+
+    for (const [op, payload] of [
+      ["getMetadata", { tableHandle }],
+      ["getPresentation", { tableHandle }],
+      ["readPresentationRange", {
+        tableHandle,
+        range: { rowStart: 0, rowCount: 1, columnStart: 0, columnCount: 1 },
+      }],
+    ]) {
+      const requestId = worker.send(op, payload);
+      assert.equal((await worker.responseFor(requestId)).status, "success");
+    }
+
+    const warnings = worker.messages().filter(({ event }) => event === "warning");
+    assert.deepEqual(
+      warnings.map(({ payload }) => payload.kind),
+      ["open-table-warning", "metadata-warning", "presentation-warning", "presentation-range-warning"],
+    );
+    for (const warning of warnings) {
+      assert.equal(warning.datasetHandle, datasetHandle);
+      assert.equal(warning.tableHandle, tableHandle);
+      assert.equal(warning.tableId, "table-0");
+      assert.equal(warning.revision, 0);
+      assert.equal(warning.payload.handle, tableHandle);
+      assert.equal(warning.payload.tableId, "table-0");
+      assert.equal(warning.payload.resource, "operation-output");
+      assert.equal(warning.payload.requiredBytes, 2);
+      assert.equal(warning.payload.availableBytes, 1);
+    }
+  } finally {
+    await worker.shutdown();
+    worker.restore();
+  }
+});
+
 test("Worker closes an adapter table that finishes opening after its dataset is closed", async () => {
   const worker = await workerHarness("async-open-close", ["__tabularkAsyncLifecycle"]);
   const lifecycle = deferredLifecycle();
@@ -328,7 +498,7 @@ test("Worker cancels pending metadata and presentation calls when a table closes
   }
 });
 
-test("Worker reclaims operation handles returned after beginOpen and beginRead cancellation", async () => {
+test("Worker reclaims late operation handles after open, read, and table-operation cancellation", async () => {
   const worker = await workerHarness("late-begin-handles", ["__tabularkLateOperations"]);
   const lifecycle = lateOperationLifecycle();
   Object.defineProperty(globalThis, "__tabularkLateOperations", {
@@ -354,10 +524,10 @@ test("Worker reclaims operation handles returned after beginOpen and beginRead c
     assert.equal((await worker.responseFor(cancelOpen)).status, "success");
     assert.equal((await worker.responseFor(opening)).error.code, "CANCELLED");
     lifecycle.beginOpen.resolve({
-      kind: "open-progress",
-      operationHandle: 77,
+      kind: "progress", operationKind: "open", operationHandle: 77, operationRevision: 1,
+      actions: [{ kind: "read-bytes", actionIndex: 0, offset: 0, length: 1 }],
+      cooperativeYield: false,
       sourceHandle: 66,
-      action: { kind: "read-bytes", offset: 0, length: 1 },
       tables: [{ id: "table-0", name: "Late operation table" }],
       metadata: lifecycle.metadataValue,
       progress: { bytesScanned: 0, rowsDiscovered: 0, done: false },
@@ -384,12 +554,26 @@ test("Worker reclaims operation handles returned after beginOpen and beginRead c
     assert.equal((await worker.responseFor(cancelRead)).status, "success");
     assert.equal((await worker.responseFor(reading)).error.code, "CANCELLED");
     lifecycle.beginRead.resolve({
-      kind: "read-bytes",
-      operationHandle: 88,
-      action: { kind: "read-bytes", offset: 0, length: 1 },
+      kind: "pending", operationHandle: 88, operationRevision: 1,
+      actions: [{ kind: "read-bytes", actionIndex: 0, offset: 0, length: 1 }],
+      cooperativeYield: false,
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.deepEqual(lifecycle.cancelledOperations, [77, 88]);
+
+    lifecycle.delayMetadata = true;
+    const metadata = worker.send("getMetadata", { tableHandle });
+    await lifecycle.waitFor("beginMetadata");
+    const closingTable = worker.send("closeTable", { tableHandle });
+    assert.equal((await worker.responseFor(closingTable)).status, "success");
+    assert.equal((await worker.responseFor(metadata)).error.code, "CANCELLED");
+    lifecycle.beginMetadata.resolve({
+      kind: "pending", operationHandle: 99, operationRevision: 1,
+      actions: [{ kind: "read-bytes", actionIndex: 0, offset: 0, length: 1 }],
+      cooperativeYield: false,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(lifecycle.cancelledOperations, [77, 88, 99]);
   } finally {
     await worker.shutdown();
     worker.restore();
@@ -469,7 +653,7 @@ async function workerHarness(name, extraGlobals = []) {
   let nextRequest = 1;
   const send = (op, payload) => {
     const requestId = `r${nextRequest++}`;
-    const request = { protocolVersion: 3, requestId, op, payload };
+    const request = { protocolVersion: 4, requestId, op, payload };
     for (const listener of listeners) listener({ data: request });
     return requestId;
   };
@@ -484,6 +668,7 @@ async function workerHarness(name, extraGlobals = []) {
   return {
     send,
     responseFor,
+    messages: () => [...messages],
     async shutdown() {
       const requestId = send("shutdown", {});
       const response = await responseFor(requestId);
@@ -523,6 +708,11 @@ function invalidAbiModuleUrl() {
 
 function boundaryModuleUrl() {
   const source = `
+    let nextOperation = 1;
+    const complete = (operationKind, field, value) => ({
+      kind: "complete", operationKind, operationHandle: nextOperation++, operationRevision: 1,
+      actions: [], cooperativeYield: false, [field]: value,
+    });
     const metadata = () => ({
       tableId: "table-0",
       name: "Boundary table",
@@ -553,24 +743,82 @@ function boundaryModuleUrl() {
     });
     export default async function init() {}
     export class WasmRuntime {
-      protocolVersion() { return 3; }
-      adapterApiVersion() { return 2; }
+      protocolVersion() { return 4; }
+      adapterApiVersion() { return 3; }
       batchLayoutVersion() { return 1; }
       adapterId() { return "tabulark:delimited"; }
       beginOpen() {
         globalThis.__tabularkBoundaryBeginOpens += 1;
         return {
-          kind: "open-complete",
+          kind: "complete", operationKind: "open", operationHandle: nextOperation++, operationRevision: 1,
+          actions: [], cooperativeYield: false,
           sourceHandle: 1,
           tables: [{ id: "table-0", name: "Boundary table" }],
           metadata: metadata(),
         };
       }
       continueOperation() {}
-      openTable() { return { tableHandle: 2, metadata: metadata() }; }
-      metadata() { return metadata(); }
-      presentation() { return null; }
-      readPresentationRange() { return null; }
+      beginOpenTable() { return complete("open-table", "table", { tableHandle: 2, metadata: metadata() }); }
+      beginMetadata() { return complete("metadata", "metadata", metadata()); }
+      beginPresentation() { return complete("presentation", "presentation", null); }
+      beginPresentationRange() { return complete("presentation-range", "presentation", null); }
+      beginRead() {}
+      cancelOperation() {}
+      closeTable() {}
+      closeSource() {}
+      shutdown() {}
+      free() {}
+    }
+  `;
+  return `data:text/javascript,${encodeURIComponent(source)}`;
+}
+
+function warningOperationModuleUrl() {
+  const source = `
+    let nextOperation = 1;
+    const metadata = () => ({
+      tableId: "table-0", name: "Warning table", revision: 0,
+      extent: { rows: { kind: "exact", value: 1 }, columns: { kind: "exact", value: 1 } },
+      schema: {
+        version: 0,
+        columns: [{ id: "c0", name: "value", index: 0, dataType: { type: "utf8" }, nullable: true }],
+      },
+      capabilities: {
+        randomAccess: "full", typedValues: false, search: false, sort: false,
+        filter: false, multiTable: false,
+      },
+    });
+    const warning = (kind) => ({
+      kind, message: kind, resource: "operation-output", requiredBytes: 2, availableBytes: 1,
+    });
+    const complete = (operationKind, field, value, kind) => ({
+      kind: "complete", operationKind, operationHandle: nextOperation++, operationRevision: 1,
+      actions: [], cooperativeYield: false, [field]: value, warnings: [warning(kind)],
+    });
+    export default async function init() {}
+    export class WasmRuntime {
+      protocolVersion() { return 4; }
+      adapterApiVersion() { return 3; }
+      batchLayoutVersion() { return 1; }
+      adapterId() { return "tabulark:delimited"; }
+      beginOpen() {
+        return {
+          kind: "complete", operationKind: "open", operationHandle: nextOperation++, operationRevision: 1,
+          actions: [], cooperativeYield: false, sourceHandle: 1,
+          tables: [{ id: "table-0", name: "Warning table" }], metadata: metadata(),
+        };
+      }
+      continueOperation() {}
+      beginOpenTable() {
+        return complete(
+          "open-table", "table", { tableHandle: 2, metadata: metadata() }, "open-table-warning",
+        );
+      }
+      beginMetadata() { return complete("metadata", "metadata", metadata(), "metadata-warning"); }
+      beginPresentation() { return complete("presentation", "presentation", null, "presentation-warning"); }
+      beginPresentationRange() {
+        return complete("presentation-range", "presentation", null, "presentation-range-warning");
+      }
       beginRead() {}
       cancelOperation() {}
       closeTable() {}
@@ -586,24 +834,99 @@ function overflowingRangeModuleUrl() {
   const source = `
     export default async function init() {}
     export class WasmRuntime {
-      protocolVersion() { return 3; }
-      adapterApiVersion() { return 2; }
+      protocolVersion() { return 4; }
+      adapterApiVersion() { return 3; }
       batchLayoutVersion() { return 1; }
       adapterId() { return "tabulark:delimited"; }
       beginOpen() {
         return {
-          kind: "read-bytes",
-          operationHandle: 1,
-          action: { kind: "read-bytes", offset: Number.MAX_SAFE_INTEGER, length: 1 },
+          kind: "pending", operationHandle: 1, operationRevision: 1,
+          actions: [{ kind: "read-bytes", actionIndex: 0, offset: Number.MAX_SAFE_INTEGER, length: 1 }],
+          cooperativeYield: false,
         };
       }
       continueOperation() {}
-      openTable() {}
-      metadata() {}
-      presentation() { return null; }
-      readPresentationRange() { return null; }
+      beginOpenTable() {}
+      beginMetadata() {}
+      beginPresentation() {}
+      beginPresentationRange() {}
       beginRead() {}
       cancelOperation() {}
+      closeTable() {}
+      closeSource() {}
+      shutdown() {}
+    }
+  `;
+  return `data:text/javascript,${encodeURIComponent(source)}`;
+}
+
+function abiV3ModuleUrl(mode) {
+  const source = `
+    const mode = ${JSON.stringify(mode)};
+    const metadata = () => ({
+      tableId: "table-0", name: "ABI v3", revision: 0,
+      extent: { rows: { kind: "exact", value: 0 }, columns: { kind: "exact", value: 0 } },
+      schema: { version: 0, columns: [] }, capabilities: {},
+    });
+    const completeOpen = (revision) => ({
+      kind: "complete", operationKind: "open", operationHandle: 1,
+      operationRevision: revision, actions: [], cooperativeYield: false,
+      sourceHandle: 1, tables: [{ id: "table-0", name: "ABI v3" }], metadata: metadata(),
+    });
+    const complete = (operationKind, field, value) => ({
+      kind: "complete", operationKind, operationHandle: 100, operationRevision: 1,
+      actions: [], cooperativeYield: false, [field]: value,
+    });
+    export default async function init() {}
+    export class WasmRuntime {
+      protocolVersion() { return 4; }
+      adapterApiVersion() { return 3; }
+      batchLayoutVersion() { return 1; }
+      adapterId() { return "tabulark:delimited"; }
+      beginOpen() {
+        if (mode === "yield") return {
+          kind: "pending", operationHandle: 1, operationRevision: 1,
+          actions: [], cooperativeYield: true,
+        };
+        if (mode === "duplicate") return {
+          kind: "pending", operationHandle: 1, operationRevision: 1,
+          actions: [
+            { kind: "read-bytes", actionIndex: 0, offset: 0, length: 1 },
+            { kind: "read-bytes", actionIndex: 0, offset: 1, length: 1 },
+          ], cooperativeYield: false,
+        };
+        return {
+          kind: "pending", operationHandle: 1, operationRevision: 1,
+          actions: mode === "multi"
+            ? [
+                { kind: "read-bytes", actionIndex: 7, offset: 0, length: 1 },
+                { kind: "read-bytes", actionIndex: 3, offset: 9, length: 1 },
+              ]
+            : [{ kind: "read-bytes", actionIndex: 0, offset: 0, length: 1 }],
+          cooperativeYield: false,
+        };
+      }
+      continueOperation(_handle, revision, results) {
+        if (mode === "yield") {
+          globalThis.__tabularkAbiYieldCount += 1;
+          return { kind: "pending", operationHandle: 1, operationRevision: revision + 1, actions: [], cooperativeYield: true };
+        }
+        if (mode === "multi") {
+          globalThis.__tabularkAbiResults.push({
+            revision,
+            results: results.map(({ actionIndex, offset, bytes, eof }) => ({
+              actionIndex, offset, bytes: [...bytes], eof,
+            })),
+          });
+        }
+        return completeOpen(mode === "stale" ? revision : revision + 1);
+      }
+      beginOpenTable() { return complete("open-table", "table", { tableHandle: 1, metadata: metadata() }); }
+      beginMetadata() { return complete("metadata", "metadata", metadata()); }
+      beginPresentation() { return complete("presentation", "presentation", null); }
+      beginPresentationRange() { return complete("presentation-range", "presentation", null); }
+      beginRead() { return complete("read", "batch", {}); }
+      cancelOperation() { if (mode === "yield") globalThis.__tabularkAbiCancelCount += 1; }
       closeTable() {}
       closeSource() {}
       shutdown() {}
@@ -615,36 +938,42 @@ function overflowingRangeModuleUrl() {
 function asyncLifecycleModuleUrl() {
   const source = `
     const lifecycle = () => globalThis.__tabularkAsyncLifecycle;
+    let nextOperation = 1;
+    const complete = (operationKind, field, value) => ({
+      kind: "complete", operationKind, operationHandle: nextOperation++, operationRevision: 1,
+      actions: [], cooperativeYield: false, [field]: value,
+    });
     export default async function init() {}
     export class WasmRuntime {
-      protocolVersion() { return 3; }
-      adapterApiVersion() { return 2; }
+      protocolVersion() { return 4; }
+      adapterApiVersion() { return 3; }
       batchLayoutVersion() { return 1; }
       adapterId() { return "tabulark:delimited"; }
       beginOpen() {
         return {
-          kind: "open-complete",
+          kind: "complete", operationKind: "open", operationHandle: nextOperation++, operationRevision: 1,
+          actions: [], cooperativeYield: false,
           sourceHandle: 1,
           tables: [{ id: "table-0", name: "Async table" }],
           metadata: lifecycle().metadataValue,
         };
       }
       continueOperation() {}
-      openTable() {
+      beginOpenTable() {
         lifecycle().started.add("openTable");
-        return lifecycle().openTable.promise;
+        return lifecycle().openTable.promise.then((value) => complete("open-table", "table", value));
       }
-      metadata() {
+      beginMetadata() {
         lifecycle().started.add("metadata");
-        return lifecycle().metadata.promise;
+        return lifecycle().metadata.promise.then((value) => complete("metadata", "metadata", value));
       }
-      presentation() {
+      beginPresentation() {
         lifecycle().started.add("presentation");
-        return lifecycle().presentation.promise;
+        return lifecycle().presentation.promise.then((value) => complete("presentation", "presentation", value));
       }
-      readPresentationRange() {
+      beginPresentationRange() {
         lifecycle().started.add("presentationRange");
-        return lifecycle().presentationRange.promise;
+        return lifecycle().presentationRange.promise.then((value) => complete("presentation-range", "presentation", value));
       }
       beginRead() {}
       cancelOperation() {}
@@ -660,27 +989,39 @@ function asyncLifecycleModuleUrl() {
 function lateOperationModuleUrl() {
   const source = `
     const lifecycle = () => globalThis.__tabularkLateOperations;
+    let nextOperation = 1;
+    const complete = (operationKind, field, value) => ({
+      kind: "complete", operationKind, operationHandle: nextOperation++, operationRevision: 1,
+      actions: [], cooperativeYield: false, [field]: value,
+    });
     export default async function init() {}
     export class WasmRuntime {
-      protocolVersion() { return 3; }
-      adapterApiVersion() { return 2; }
+      protocolVersion() { return 4; }
+      adapterApiVersion() { return 3; }
       batchLayoutVersion() { return 1; }
       adapterId() { return "tabulark:delimited"; }
       beginOpen() {
         lifecycle().started.add("beginOpen");
         if (lifecycle().delayOpen) return lifecycle().beginOpen.promise;
         return {
-          kind: "open-complete",
+          kind: "complete", operationKind: "open", operationHandle: nextOperation++, operationRevision: 1,
+          actions: [], cooperativeYield: false,
           sourceHandle: 1,
           tables: [{ id: "table-0", name: "Late operation table" }],
           metadata: lifecycle().metadataValue,
         };
       }
       continueOperation() {}
-      openTable() { return { tableHandle: 2, metadata: lifecycle().metadataValue }; }
-      metadata() { return lifecycle().metadataValue; }
-      presentation() { return null; }
-      readPresentationRange() { return null; }
+      beginOpenTable() { return complete("open-table", "table", { tableHandle: 2, metadata: lifecycle().metadataValue }); }
+      beginMetadata() {
+        if (lifecycle().delayMetadata) {
+          lifecycle().started.add("beginMetadata");
+          return lifecycle().beginMetadata.promise;
+        }
+        return complete("metadata", "metadata", lifecycle().metadataValue);
+      }
+      beginPresentation() { return complete("presentation", "presentation", null); }
+      beginPresentationRange() { return complete("presentation-range", "presentation", null); }
       beginRead() {
         lifecycle().started.add("beginRead");
         return lifecycle().beginRead.promise;
@@ -704,16 +1045,16 @@ function lateAdapterLoadModuleUrl() {
     }
     export class WasmRuntime {
       constructor() { lifecycle().constructed += 1; }
-      protocolVersion() { return 3; }
-      adapterApiVersion() { return 2; }
+      protocolVersion() { return 4; }
+      adapterApiVersion() { return 3; }
       batchLayoutVersion() { return 1; }
       adapterId() { return "tabulark:delimited"; }
       beginOpen() {}
       continueOperation() {}
-      openTable() {}
-      metadata() {}
-      presentation() { return null; }
-      readPresentationRange() { return null; }
+      beginOpenTable() {}
+      beginMetadata() {}
+      beginPresentation() {}
+      beginPresentationRange() {}
       beginRead() {}
       cancelOperation() {}
       closeTable() {}
@@ -778,6 +1119,7 @@ function lateOperationLifecycle() {
   const started = new Set();
   return {
     delayOpen: true,
+    delayMetadata: false,
     started,
     cancelledOperations: [],
     closedSources: [],
@@ -803,6 +1145,7 @@ function lateOperationLifecycle() {
     },
     beginOpen: deferred(),
     beginRead: deferred(),
+    beginMetadata: deferred(),
     async waitFor(name) {
       for (let attempt = 0; attempt < 200; attempt += 1) {
         if (started.has(name)) return;

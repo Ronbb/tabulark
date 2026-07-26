@@ -229,6 +229,42 @@ pub struct ArrowIpcSource {
     limits: ArrowIpcLimits,
 }
 
+/// Newly decoded IPC Stream batches plus cumulative index metadata.
+///
+/// A delta starts at the batch count already published to a runtime source.
+/// Record-batch clones retain Arrow buffers, so publishing a delta does not
+/// copy decoded values or revisit earlier batches.
+#[derive(Debug)]
+pub struct ArrowStreamDelta {
+    arrow_schema: ArrowSchemaRef,
+    options: ArrowIpcOptions,
+    batch_start: usize,
+    batches: Vec<RecordBatch>,
+    cumulative_rows: usize,
+    cumulative_decoded_bytes: usize,
+    exact: bool,
+}
+
+impl ArrowStreamDelta {
+    /// Returns the first logical record-batch index carried by this delta.
+    #[must_use]
+    pub const fn batch_start(&self) -> usize {
+        self.batch_start
+    }
+
+    /// Returns the number of newly published record batches.
+    #[must_use]
+    pub fn batch_count(&self) -> usize {
+        self.batches.len()
+    }
+
+    /// Returns whether this delta closes the Stream at EOF.
+    #[must_use]
+    pub const fn is_exact(&self) -> bool {
+        self.exact
+    }
+}
+
 impl ArrowIpcSource {
     /// Opens and validates one complete IPC File or Stream byte sequence.
     pub fn open(bytes: &[u8], options: ArrowIpcOptions) -> Result<Self> {
@@ -332,6 +368,142 @@ impl ArrowIpcSource {
             decoded_bytes,
             limits: options.limits,
         })
+    }
+
+    fn from_stream_delta(delta: ArrowStreamDelta) -> Result<Self> {
+        if delta.batch_start != 0 {
+            return Err(TabularkError::new(
+                ErrorCode::InvalidArgument,
+                "initial Arrow IPC Stream delta must start at batch zero",
+            )
+            .with_detail("batchStart", delta.batch_start));
+        }
+        let expected_rows = delta.cumulative_rows;
+        let expected_decoded_bytes = delta.cumulative_decoded_bytes;
+        let source = Self::from_batches_with_extent(
+            ResolvedArrowIpcContainer::Stream,
+            delta.arrow_schema,
+            delta.batches,
+            delta.options,
+            delta.exact,
+        )?;
+        let actual_rows = *source.row_offsets.last().unwrap_or(&0);
+        if actual_rows != expected_rows || source.decoded_bytes != expected_decoded_bytes {
+            return Err(TabularkError::new(
+                ErrorCode::RuntimeFailure,
+                "Arrow IPC Stream delta cumulative metadata is inconsistent",
+            )
+            .with_detail("expectedRows", expected_rows)
+            .with_detail("actualRows", actual_rows)
+            .with_detail("expectedDecodedBytes", expected_decoded_bytes)
+            .with_detail("actualDecodedBytes", source.decoded_bytes));
+        }
+        Ok(source)
+    }
+
+    fn append_stream_delta(&mut self, delta: ArrowStreamDelta) -> Result<usize> {
+        if self.container != ResolvedArrowIpcContainer::Stream {
+            return Err(TabularkError::new(
+                ErrorCode::InvalidArgument,
+                "only an Arrow IPC Stream source accepts batch deltas",
+            ));
+        }
+        if delta.batch_start != self.batches.len() {
+            return Err(TabularkError::new(
+                ErrorCode::InvalidArgument,
+                "Arrow IPC Stream delta is missing, duplicate, or stale",
+            )
+            .with_detail("expectedBatchStart", self.batches.len())
+            .with_detail("actualBatchStart", delta.batch_start));
+        }
+        if delta.arrow_schema != self.arrow_schema || delta.options.limits != self.limits {
+            return Err(TabularkError::new(
+                ErrorCode::InvalidArgument,
+                "Arrow IPC Stream delta schema or limits changed",
+            ));
+        }
+
+        let previous_rows = *self.row_offsets.last().unwrap_or(&0);
+        let mut rows = previous_rows;
+        let mut decoded_bytes = self.decoded_bytes;
+        let mut appended_offsets = Vec::with_capacity(delta.batches.len());
+        for batch in &delta.batches {
+            if batch.schema_ref() != &self.arrow_schema {
+                return Err(TabularkError::new(
+                    ErrorCode::ParseFailed,
+                    "Arrow IPC record batch schema changed within one Stream delta",
+                ));
+            }
+            rows = rows.checked_add(batch.num_rows()).ok_or_else(|| {
+                TabularkError::new(ErrorCode::ResourceLimit, "Arrow IPC row count overflows")
+            })?;
+            decoded_bytes = decoded_bytes
+                .checked_add(batch.get_array_memory_size())
+                .ok_or_else(|| {
+                    TabularkError::new(
+                        ErrorCode::ResourceLimit,
+                        "Arrow IPC decoded memory estimate overflows",
+                    )
+                })?;
+            appended_offsets.push(rows);
+        }
+        if rows != delta.cumulative_rows || decoded_bytes != delta.cumulative_decoded_bytes {
+            return Err(TabularkError::new(
+                ErrorCode::RuntimeFailure,
+                "Arrow IPC Stream delta cumulative metadata is inconsistent",
+            )
+            .with_detail("expectedRows", delta.cumulative_rows)
+            .with_detail("actualRows", rows)
+            .with_detail("expectedDecodedBytes", delta.cumulative_decoded_bytes)
+            .with_detail("actualDecodedBytes", decoded_bytes));
+        }
+        if decoded_bytes > self.limits.max_decoded_bytes {
+            return Err(TabularkError::new(
+                ErrorCode::ResourceLimit,
+                "Arrow IPC decoded arrays exceed the configured byte limit",
+            )
+            .with_detail("decodedBytes", decoded_bytes)
+            .with_detail("maxDecodedBytes", self.limits.max_decoded_bytes));
+        }
+        let public_rows = u64::try_from(rows).map_err(|_| {
+            TabularkError::new(
+                ErrorCode::ResourceLimit,
+                "Arrow IPC row count exceeds the public range",
+            )
+        })?;
+        let metadata = if delta.exact {
+            exact_metadata(&self.arrow_schema, public_rows, delta.options.table_name)?
+        } else {
+            progressive_metadata(&self.arrow_schema, public_rows, delta.options.table_name)?
+        };
+        self.batches.try_reserve(delta.batches.len()).map_err(|_| {
+            TabularkError::new(
+                ErrorCode::ResourceLimit,
+                "Arrow IPC Stream batch index allocation failed",
+            )
+        })?;
+        self.row_offsets
+            .try_reserve(appended_offsets.len())
+            .map_err(|_| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "Arrow IPC Stream row index allocation failed",
+                )
+            })?;
+        let appended_decoded_bytes =
+            decoded_bytes
+                .checked_sub(self.decoded_bytes)
+                .ok_or_else(|| {
+                    TabularkError::new(
+                        ErrorCode::RuntimeFailure,
+                        "Arrow IPC Stream decoded-byte accounting underflows",
+                    )
+                })?;
+        self.batches.extend(delta.batches);
+        self.row_offsets.extend(appended_offsets);
+        self.decoded_bytes = decoded_bytes;
+        self.metadata = metadata;
+        Ok(appended_decoded_bytes)
     }
 
     /// Returns the selected File or Stream container.
@@ -528,12 +700,14 @@ pub enum ArrowReadStart {
     File(Box<ArrowFileReadOperation>),
 }
 
-/// Incremental open operation used by adapter ABI v1.
+/// Incremental open operation used by adapter ABI v3.
 #[derive(Debug)]
 pub struct ArrowIpcOpenOperation {
     source_length: usize,
     options: ArrowIpcOptions,
     state: OpenState,
+    published_stream_batches: usize,
+    stream_metadata_published: bool,
 }
 
 #[derive(Debug)]
@@ -551,7 +725,9 @@ struct StreamIndexState {
     decoder: StreamDecoder,
     wire: StreamWireValidator,
     batches: Vec<RecordBatch>,
+    row_offsets: Vec<usize>,
     next_offset: usize,
+    rows: usize,
     decoded_bytes: usize,
     schema_validated: bool,
 }
@@ -562,7 +738,9 @@ impl StreamIndexState {
             decoder: StreamDecoder::new(),
             wire: StreamWireValidator::new(),
             batches: Vec::new(),
+            row_offsets: vec![0],
             next_offset: 0,
+            rows: 0,
             decoded_bytes: 0,
             schema_validated: false,
         }
@@ -1070,8 +1248,38 @@ struct FileIndexState {
     version: MetadataVersion,
     dictionaries: Vec<FileBlockSpec>,
     records: Vec<IndexedRecordBlock>,
+    next_dictionary: usize,
     next_record: usize,
     rows: usize,
+}
+
+impl FileIndexState {
+    fn next_metadata_block(&self) -> Option<&FileBlockSpec> {
+        self.dictionaries.get(self.next_dictionary).or_else(|| {
+            self.records
+                .get(self.next_record)
+                .map(|record| &record.block)
+        })
+    }
+
+    fn metadata_block_at(&self, relative_index: usize) -> Option<&FileBlockSpec> {
+        let remaining_dictionaries = self.dictionaries.len().saturating_sub(self.next_dictionary);
+        if relative_index < remaining_dictionaries {
+            return self
+                .dictionaries
+                .get(self.next_dictionary.checked_add(relative_index)?);
+        }
+        self.records
+            .get(
+                self.next_record
+                    .checked_add(relative_index - remaining_dictionaries)?,
+            )
+            .map(|record| &record.block)
+    }
+
+    fn metadata_complete(&self) -> bool {
+        self.next_dictionary == self.dictionaries.len() && self.next_record == self.records.len()
+    }
 }
 
 impl ArrowIpcOpenOperation {
@@ -1103,6 +1311,8 @@ impl ArrowIpcOpenOperation {
             source_length,
             options,
             state,
+            published_stream_batches: 0,
+            stream_metadata_published: false,
         })
     }
 
@@ -1131,14 +1341,10 @@ impl ArrowIpcOpenOperation {
                 self.source_length,
             )?,
             OpenState::FileIndex(state) => {
-                let Some(record) = state.records.get(state.next_record) else {
+                let Some(block) = state.next_metadata_block() else {
                     return Ok(None);
                 };
-                ReadBytesAction::new(
-                    record.block.offset,
-                    record.block.metadata_length,
-                    self.source_length,
-                )?
+                ReadBytesAction::new(block.offset, block.metadata_length, self.source_length)?
             }
             OpenState::Stream(state) => {
                 let remaining = self.source_length.saturating_sub(state.next_offset);
@@ -1153,6 +1359,62 @@ impl ArrowIpcOpenOperation {
         Ok(Some(action))
     }
 
+    /// Returns a bounded batch of independent File dictionary/record metadata ranges.
+    /// Other open states retain their single sequential action.
+    pub fn next_actions(&self, max_ranges: usize, max_bytes: u64) -> Result<Vec<ReadBytesAction>> {
+        if max_ranges == 0 || max_bytes == 0 {
+            return Err(TabularkError::new(
+                ErrorCode::InvalidArgument,
+                "Arrow open action batch limits must be greater than zero",
+            ));
+        }
+        let OpenState::FileIndex(state) = &self.state else {
+            let Some(action) = self.next_action()? else {
+                return Ok(Vec::new());
+            };
+            if action.length > max_bytes {
+                return Err(TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "Arrow open action exceeds the operation byte budget",
+                )
+                .with_detail("requestedBytes", action.length)
+                .with_detail("operationBudgetBytes", max_bytes));
+            }
+            return Ok(vec![action]);
+        };
+
+        let mut actions = Vec::with_capacity(
+            max_ranges.min(state.dictionaries.len().saturating_add(state.records.len())),
+        );
+        let mut total = 0_u64;
+        for relative_index in 0..max_ranges {
+            let Some(block) = state.metadata_block_at(relative_index) else {
+                break;
+            };
+            let action =
+                ReadBytesAction::new(block.offset, block.metadata_length, self.source_length)?;
+            let next_total = total.checked_add(action.length).ok_or_else(|| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "Arrow open action batch byte total overflows",
+                )
+            })?;
+            if next_total > max_bytes {
+                break;
+            }
+            total = next_total;
+            actions.push(action);
+        }
+        if actions.is_empty() && !state.metadata_complete() {
+            return Err(TabularkError::new(
+                ErrorCode::ResourceLimit,
+                "Arrow File block metadata exceeds the operation byte budget",
+            )
+            .with_detail("operationBudgetBytes", max_bytes));
+        }
+        Ok(actions)
+    }
+
     /// Returns progressive Stream metadata after the schema has been read.
     pub fn metadata(&self) -> Result<Option<TableMetadata>> {
         let OpenState::Stream(state) = &self.state else {
@@ -1161,14 +1423,8 @@ impl ArrowIpcOpenOperation {
         let Some(schema) = state.decoder.schema() else {
             return Ok(None);
         };
-        let rows = state.batches.iter().try_fold(0_u64, |total, batch| {
-            total
-                .checked_add(u64::try_from(batch.num_rows()).map_err(|_| {
-                    TabularkError::new(ErrorCode::ResourceLimit, "Arrow row count overflows")
-                })?)
-                .ok_or_else(|| {
-                    TabularkError::new(ErrorCode::ResourceLimit, "Arrow row count overflows")
-                })
+        let rows = u64::try_from(state.rows).map_err(|_| {
+            TabularkError::new(ErrorCode::ResourceLimit, "Arrow row count overflows")
         })?;
         Ok(Some(progressive_metadata(
             &schema,
@@ -1197,6 +1453,78 @@ impl ArrowIpcOpenOperation {
             false,
         )?;
         Ok(Some(OpenedArrowIpcSource::Stream(source)))
+    }
+
+    /// Takes only Stream batches decoded since the previous publication.
+    ///
+    /// The first delta may contain zero batches so the schema and a stable
+    /// source handle can be published before the first record batch. Later
+    /// empty deltas are suppressed until EOF.
+    pub fn take_stream_delta(&mut self) -> Result<Option<ArrowStreamDelta>> {
+        let OpenState::Stream(state) = &self.state else {
+            return Ok(None);
+        };
+        let Some(schema) = state.decoder.schema() else {
+            return Ok(None);
+        };
+        if self.stream_metadata_published && self.published_stream_batches == state.batches.len() {
+            return Ok(None);
+        }
+        let batch_start = self.published_stream_batches;
+        let batches = state.batches[batch_start..].to_vec();
+        self.published_stream_batches = state.batches.len();
+        self.stream_metadata_published = true;
+        Ok(Some(ArrowStreamDelta {
+            arrow_schema: schema,
+            options: self.options.clone(),
+            batch_start,
+            batches,
+            cumulative_rows: state.rows,
+            cumulative_decoded_bytes: state.decoded_bytes,
+            exact: false,
+        }))
+    }
+
+    /// Converts a completed Stream source into its unpublished EOF delta.
+    ///
+    /// Previously published batches are dropped from the completed source
+    /// without cloning; the returned delta updates cumulative metadata to an
+    /// exact extent even when EOF contains no new record batch.
+    pub fn take_completed_stream_delta(
+        &mut self,
+        source: OpenedArrowIpcSource,
+    ) -> Result<ArrowStreamDelta> {
+        let OpenedArrowIpcSource::Stream(mut source) = source else {
+            return Err(TabularkError::new(
+                ErrorCode::InvalidArgument,
+                "only a completed Arrow IPC Stream can produce an EOF delta",
+            ));
+        };
+        let batch_start = self.published_stream_batches;
+        if batch_start > source.batches.len() {
+            return Err(TabularkError::new(
+                ErrorCode::RuntimeFailure,
+                "published Arrow IPC Stream batch count exceeds the completed source",
+            ));
+        }
+        let batches = source.batches.split_off(batch_start);
+        self.published_stream_batches =
+            batch_start.checked_add(batches.len()).ok_or_else(|| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "Arrow IPC Stream batch count overflows",
+                )
+            })?;
+        self.stream_metadata_published = true;
+        Ok(ArrowStreamDelta {
+            arrow_schema: source.arrow_schema,
+            options: self.options.clone(),
+            batch_start,
+            batches,
+            cumulative_rows: *source.row_offsets.last().unwrap_or(&0),
+            cumulative_decoded_bytes: source.decoded_bytes,
+            exact: true,
+        })
     }
 
     /// Supplies exactly the bytes requested by [`Self::next_action`].
@@ -1246,6 +1574,60 @@ impl ArrowIpcOpenOperation {
                 ErrorCode::HandleClosed,
                 "Arrow open operation is complete",
             )),
+        }
+    }
+
+    /// Supplies one complete batch of independently requested File metadata
+    /// ranges. The full result set is validated before any index state moves.
+    pub fn feed_many_owned(
+        &mut self,
+        results: Vec<(u64, Vec<u8>, bool)>,
+    ) -> Result<Option<OpenedArrowIpcSource>> {
+        if results.is_empty() {
+            return Err(TabularkError::new(
+                ErrorCode::InvalidArgument,
+                "Arrow open operation result set must not be empty",
+            ));
+        }
+        if !matches!(self.state, OpenState::FileIndex(_)) {
+            if results.len() != 1 {
+                return Err(TabularkError::new(
+                    ErrorCode::InvalidArgument,
+                    "sequential Arrow open states accept exactly one source result",
+                ));
+            }
+            let (offset, bytes, eof) = results
+                .into_iter()
+                .next()
+                .expect("one Arrow result was validated");
+            return self.feed_owned(offset, bytes, eof);
+        }
+
+        let expected = self.next_actions(results.len(), u64::MAX)?;
+        if expected.len() != results.len() {
+            return Err(TabularkError::new(
+                ErrorCode::InvalidArgument,
+                "Arrow File metadata result set has an unexpected range count",
+            )
+            .with_detail("expectedResults", expected.len())
+            .with_detail("actualResults", results.len()));
+        }
+        for (action, (offset, bytes, eof)) in expected.iter().copied().zip(&results) {
+            validate_action_response(action, *offset, bytes, *eof, self.source_length)?;
+        }
+        let OpenState::FileIndex(mut state) =
+            std::mem::replace(&mut self.state, OpenState::Complete)
+        else {
+            unreachable!("validated Arrow File index state changed")
+        };
+        for (_, bytes, _) in results {
+            index_file_metadata(&mut state, &bytes, &self.options.limits)?;
+        }
+        if state.metadata_complete() {
+            self.complete_file(state).map(Some)
+        } else {
+            self.state = OpenState::FileIndex(state);
+            Ok(None)
         }
     }
 
@@ -1344,10 +1726,11 @@ impl ArrowIpcOpenOperation {
             version: footer.version(),
             dictionaries,
             records,
+            next_dictionary: 0,
             next_record: 0,
             rows: 0,
         };
-        if state.records.is_empty() {
+        if state.metadata_complete() {
             self.complete_file(state).map(Some)
         } else {
             self.state = OpenState::FileIndex(state);
@@ -1360,20 +1743,8 @@ impl ArrowIpcOpenOperation {
         mut state: FileIndexState,
         bytes: &[u8],
     ) -> Result<Option<OpenedArrowIpcSource>> {
-        let record = state.records.get_mut(state.next_record).ok_or_else(|| {
-            TabularkError::new(
-                ErrorCode::RuntimeFailure,
-                "Arrow File index is inconsistent",
-            )
-        })?;
-        let row_count = record_batch_row_count(bytes, &record.block, &self.options.limits)?;
-        record.row_start = state.rows;
-        record.row_count = row_count;
-        state.rows = state.rows.checked_add(row_count).ok_or_else(|| {
-            TabularkError::new(ErrorCode::ResourceLimit, "Arrow IPC row count overflows")
-        })?;
-        state.next_record += 1;
-        if state.next_record == state.records.len() {
+        index_file_metadata(&mut state, bytes, &self.options.limits)?;
+        if state.metadata_complete() {
             self.complete_file(state).map(Some)
         } else {
             self.state = OpenState::FileIndex(state);
@@ -1437,6 +1808,10 @@ impl ArrowIpcOpenOperation {
                             "Arrow IPC decoded memory estimate overflows",
                         )
                     })?;
+                state.rows = state.rows.checked_add(batch.num_rows()).ok_or_else(|| {
+                    TabularkError::new(ErrorCode::ResourceLimit, "Arrow IPC row count overflows")
+                })?;
+                state.row_offsets.push(state.rows);
                 if state.decoded_bytes > self.options.limits.max_decoded_bytes {
                     return Err(TabularkError::new(
                         ErrorCode::ResourceLimit,
@@ -1471,12 +1846,21 @@ impl ArrowIpcOpenOperation {
             let schema = state.decoder.schema().ok_or_else(|| {
                 TabularkError::new(ErrorCode::ParseFailed, "Arrow IPC Stream has no schema")
             })?;
-            let source = ArrowIpcSource::from_batches(
-                ResolvedArrowIpcContainer::Stream,
-                schema,
-                state.batches,
-                self.options.clone(),
-            )?;
+            let rows = u64::try_from(state.rows).map_err(|_| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "Arrow IPC row count exceeds the public range",
+                )
+            })?;
+            let source = ArrowIpcSource {
+                container: ResolvedArrowIpcContainer::Stream,
+                arrow_schema: schema.clone(),
+                metadata: exact_metadata(&schema, rows, self.options.table_name.clone())?,
+                batches: state.batches,
+                row_offsets: state.row_offsets,
+                decoded_bytes: state.decoded_bytes,
+                limits: self.options.limits.clone(),
+            };
             self.state = OpenState::Complete;
             Ok(Some(OpenedArrowIpcSource::Stream(source)))
         } else {
@@ -2620,6 +3004,57 @@ fn record_batch_row_count(
     })
 }
 
+fn index_file_metadata(
+    state: &mut FileIndexState,
+    bytes: &[u8],
+    limits: &ArrowIpcLimits,
+) -> Result<()> {
+    if let Some(block) = state.dictionaries.get(state.next_dictionary) {
+        let message = encapsulated_message(bytes, limits)?;
+        if message.header_type() != MessageHeader::DictionaryBatch {
+            return Err(TabularkError::new(
+                ErrorCode::ParseFailed,
+                "Arrow IPC File dictionary index points to a non-dictionary message",
+            ));
+        }
+        let dictionary = message.header_as_dictionary_batch().ok_or_else(|| {
+            TabularkError::new(
+                ErrorCode::ParseFailed,
+                "Arrow IPC File dictionary message has no DictionaryBatch header",
+            )
+        })?;
+        if dictionary.data().is_none() {
+            return Err(TabularkError::new(
+                ErrorCode::ParseFailed,
+                "Arrow IPC File dictionary message has no RecordBatch body header",
+            ));
+        }
+        if usize::try_from(message.bodyLength()).ok() != Some(block.body_length) {
+            return Err(TabularkError::new(
+                ErrorCode::ParseFailed,
+                "Arrow IPC File footer and dictionary message body lengths disagree",
+            ));
+        }
+        state.next_dictionary += 1;
+        return Ok(());
+    }
+
+    let record = state.records.get_mut(state.next_record).ok_or_else(|| {
+        TabularkError::new(
+            ErrorCode::RuntimeFailure,
+            "Arrow File metadata index is inconsistent",
+        )
+    })?;
+    let row_count = record_batch_row_count(bytes, &record.block, limits)?;
+    record.row_start = state.rows;
+    record.row_count = row_count;
+    state.rows = state.rows.checked_add(row_count).ok_or_else(|| {
+        TabularkError::new(ErrorCode::ResourceLimit, "Arrow IPC row count overflows")
+    })?;
+    state.next_record += 1;
+    Ok(())
+}
+
 fn encapsulated_message<'a>(
     bytes: &'a [u8],
     limits: &ArrowIpcLimits,
@@ -2820,6 +3255,81 @@ impl ArrowIpcRuntime {
             .limits()
             .validate_for_memory_budget(self.config.memory_budget_bytes)?;
         self.register_source(RuntimeSource::Incremental(source))
+    }
+
+    /// Registers the first published prefix of an IPC Stream from a delta.
+    pub fn open_incremental_stream(
+        &mut self,
+        delta: ArrowStreamDelta,
+    ) -> Result<ArrowSourceHandle> {
+        delta
+            .options
+            .limits
+            .validate_for_memory_budget(self.config.memory_budget_bytes)?;
+        let source = ArrowIpcSource::from_stream_delta(delta)?;
+        self.register_source(RuntimeSource::Incremental(OpenedArrowIpcSource::Stream(
+            source,
+        )))
+    }
+
+    /// Appends newly decoded Stream batches without rebuilding the published
+    /// prefix, its prior row offsets, or prior metadata inputs.
+    pub fn append_incremental_stream(
+        &mut self,
+        handle: ArrowSourceHandle,
+        delta: ArrowStreamDelta,
+    ) -> Result<()> {
+        delta
+            .options
+            .limits
+            .validate_for_memory_budget(self.config.memory_budget_bytes)?;
+        let previous = self
+            .sources
+            .get(&handle)
+            .ok_or_else(|| closed_handle("source"))?;
+        let RuntimeSource::Incremental(OpenedArrowIpcSource::Stream(previous)) = previous else {
+            return Err(TabularkError::new(
+                ErrorCode::InvalidArgument,
+                "only a progressively opened Arrow IPC Stream accepts batch deltas",
+            ));
+        };
+        let appended_decoded_bytes = delta
+            .cumulative_decoded_bytes
+            .checked_sub(previous.decoded_bytes)
+            .ok_or_else(|| {
+                TabularkError::new(
+                    ErrorCode::InvalidArgument,
+                    "Arrow IPC Stream delta decoded-byte total is stale",
+                )
+            })?;
+        let retained_bytes = self
+            .retained_bytes
+            .checked_add(appended_decoded_bytes)
+            .ok_or_else(|| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "Arrow runtime memory estimate overflows",
+                )
+            })?;
+        if retained_bytes > self.config.memory_budget_bytes {
+            return Err(TabularkError::new(
+                ErrorCode::ResourceLimit,
+                "Arrow runtime exceeds its aggregate decoded-array budget",
+            )
+            .with_detail("retainedBytes", retained_bytes)
+            .with_detail("memoryBudgetBytes", self.config.memory_budget_bytes));
+        }
+        let RuntimeSource::Incremental(OpenedArrowIpcSource::Stream(source)) = self
+            .sources
+            .get_mut(&handle)
+            .expect("validated Arrow Stream source remains registered")
+        else {
+            unreachable!("validated Arrow Stream source changed while mutably borrowed")
+        };
+        let actual_appended = source.append_stream_delta(delta)?;
+        debug_assert_eq!(actual_appended, appended_decoded_bytes);
+        self.retained_bytes = retained_bytes;
+        Ok(())
     }
 
     /// Replaces a progressively published Stream prefix without changing its
@@ -5144,6 +5654,151 @@ mod tests {
         assert_eq!(metadata.capabilities().random_access(), RandomAccess::Full);
         assert!(runtime.close_table(table));
         assert!(runtime.close_source(source));
+    }
+
+    #[test]
+    fn stream_deltas_append_each_batch_once_and_finalize_in_place() {
+        let bytes = encode(TestContainer::Stream, Some(CompressionType::LZ4_FRAME));
+        let options = ArrowIpcOptions {
+            container: ArrowIpcContainer::Stream,
+            limits: ArrowIpcLimits {
+                stream_chunk_bytes: 11,
+                ..ArrowIpcLimits::default()
+            },
+            ..ArrowIpcOptions::default()
+        };
+        let mut operation =
+            ArrowIpcOpenOperation::new(bytes.len(), options).expect("stream operation");
+        let mut runtime = ArrowIpcRuntime::default();
+        let mut source = None;
+        let mut published_batches = 0_usize;
+        let mut delta_batch_visits = 0_usize;
+
+        loop {
+            let action = operation
+                .next_action()
+                .expect("stream action")
+                .expect("stream remains active");
+            let start = usize::try_from(action.offset).expect("action offset");
+            let end = usize::try_from(action.offset + action.length).expect("action end");
+            let completed = operation
+                .feed_owned(
+                    action.offset,
+                    bytes[start..end].to_vec(),
+                    end == bytes.len(),
+                )
+                .expect("stream ingress");
+            if let Some(completed) = completed {
+                let handle = match source {
+                    Some(handle) => {
+                        let delta = operation
+                            .take_completed_stream_delta(completed)
+                            .expect("EOF delta");
+                        assert_eq!(delta.batch_start(), published_batches);
+                        assert!(delta.is_exact());
+                        published_batches += delta.batch_count();
+                        delta_batch_visits += delta.batch_count();
+                        runtime
+                            .append_incremental_stream(handle, delta)
+                            .expect("append EOF delta");
+                        handle
+                    }
+                    None => runtime
+                        .open_incremental_source(completed)
+                        .expect("register one-chunk stream"),
+                };
+                source = Some(handle);
+                break;
+            }
+            let Some(delta) = operation.take_stream_delta().expect("stream delta") else {
+                continue;
+            };
+            assert_eq!(delta.batch_start(), published_batches);
+            assert!(!delta.is_exact());
+            published_batches += delta.batch_count();
+            delta_batch_visits += delta.batch_count();
+            source = Some(match source {
+                Some(handle) => {
+                    runtime
+                        .append_incremental_stream(handle, delta)
+                        .expect("append stream delta");
+                    handle
+                }
+                None => runtime
+                    .open_incremental_stream(delta)
+                    .expect("register first stream delta"),
+            });
+        }
+
+        assert_eq!(published_batches, fixture_batches().len());
+        assert_eq!(
+            delta_batch_visits,
+            fixture_batches().len(),
+            "delta publication must visit each new batch once, not each full prefix"
+        );
+        let source = source.expect("published stream source");
+        let table = runtime.open_table(source, "table-0").expect("open table");
+        assert_eq!(
+            runtime
+                .metadata(table)
+                .expect("exact metadata")
+                .extent()
+                .rows(),
+            AxisExtent::exact(3).expect("extent")
+        );
+        assert_eq!(
+            runtime
+                .read_range(table, RangeRequest::new(0, 3, 0, 1).expect("range"))
+                .expect("read finalized stream")
+                .range()
+                .row_count(),
+            3
+        );
+    }
+
+    #[test]
+    fn file_open_batches_record_metadata_ranges() {
+        let bytes = encode(TestContainer::File, Some(CompressionType::ZSTD));
+        let mut operation =
+            ArrowIpcOpenOperation::new(bytes.len(), ArrowIpcOptions::default()).expect("file open");
+        let mut saw_metadata_batch = false;
+        let source = loop {
+            let actions = operation.next_actions(32, u64::MAX).expect("file actions");
+            assert!(!actions.is_empty());
+            if actions.len() > 1 {
+                saw_metadata_batch = true;
+                assert!(
+                    actions.len() > fixture_batches().len(),
+                    "dictionary and record metadata should share the batch"
+                );
+            }
+            let ingress = actions
+                .into_iter()
+                .map(|action| {
+                    let start = usize::try_from(action.offset).expect("action offset");
+                    let end = usize::try_from(action.offset + action.length).expect("action end");
+                    (
+                        action.offset,
+                        bytes[start..end].to_vec(),
+                        end == bytes.len(),
+                    )
+                })
+                .collect();
+            if let Some(source) = operation
+                .feed_many_owned(ingress)
+                .expect("feed file action batch")
+            {
+                break source;
+            }
+        };
+        assert!(
+            saw_metadata_batch,
+            "record metadata must share one ABI step"
+        );
+        assert_eq!(
+            source.metadata().extent().rows(),
+            AxisExtent::exact(3).expect("extent")
+        );
     }
 
     #[test]

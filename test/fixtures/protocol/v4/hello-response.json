@@ -1,0 +1,20 @@
+{
+  "protocolVersion": 4,
+  "requestId": "hello-v4",
+  "status": "success",
+  "result": {
+    "kind": "hello",
+    "data": {
+      "protocolVersion": 4,
+      "adapterApiVersion": 3,
+      "batchLayoutVersion": 1,
+      "adapters": [
+        "tabulark:delimited",
+        "tabulark:arrow-ipc",
+        "tabulark:parquet",
+        "tabulark:excel"
+      ],
+      "transferableBatches": true
+    }
+  }
+}

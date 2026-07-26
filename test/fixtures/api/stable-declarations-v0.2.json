@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "compatibilityLine": "0.2.x",
+  "entrypoints": {
+    ".": "index.d.ts",
+    "./arrow": "arrow.d.ts",
+    "./parquet": "parquet.d.ts",
+    "./excel": "excel.d.ts"
+  },
+  "files": {
+    "dist/adapters.d.ts": {
+      "bytes": 3071,
+      "sha256": "70abe54938aa3761ef9958f8d183fc49831815ea703309075950e88986b05adc"
+    },
+    "dist/arrow.d.ts": {
+      "bytes": 329,
+      "sha256": "38bac185d689852de466d1053b537d305f348145996bd58915c776fe20b22658"
+    },
+    "dist/client.d.ts": {
+      "bytes": 5746,
+      "sha256": "6240096d2d4a52b5068f85119c228c524d585e3a59567ccf1fd008562034f0f8"
+    },
+    "dist/errors.d.ts": {
+      "bytes": 1171,
+      "sha256": "94949b34d8a8cc82b87e6a70af77d679539ebfe81f56d8ee99aeba5b221ad275"
+    },
+    "dist/excel.d.ts": {
+      "bytes": 302,
+      "sha256": "0e1fcf6c5e156a1cad4c30ea132ce4f1969dab0fea0825023381e87921cbb035"
+    },
+    "dist/index.d.ts": {
+      "bytes": 1488,
+      "sha256": "9d2439341e7cde6ae9eadb0c454c85b471a532b53e86506fe3dcdf0b877c438d"
+    },
+    "dist/model.d.ts": {
+      "bytes": 14766,
+      "sha256": "6f75490dec8ce6b98125d0720760b37d7784140682802a9385e3f365735b4349"
+    },
+    "dist/official-adapter-manifest.d.ts": {
+      "bytes": 1611,
+      "sha256": "986f1266d3fd54a0356abcb6f4643578da271ab9365c874e3594aeb58bd61850"
+    },
+    "dist/parquet.d.ts": {
+      "bytes": 290,
+      "sha256": "30bf76adcbe352fef13f274dec8c59e54816014d127bc695cea472fc9cbf1eff"
+    },
+    "dist/protocol.d.ts": {
+      "bytes": 2522,
+      "sha256": "28857a5cbfae9f61b1b39f336a97ec90293e836d405c9faef3e175e69433fe55"
+    },
+    "dist/source.d.ts": {
+      "bytes": 557,
+      "sha256": "2d5b3f47630a24af5ab32feec9680f8aaec7e7ff7e6a2dbeb382e9cb6cc6622a"
+    },
+    "dist/view/canvas-table-view-public.d.ts": {
+      "bytes": 2735,
+      "sha256": "d1500f3855954ea59ee71dd6c8a9a8812290b5c178063548ae2144e329c94fbc"
+    }
+  }
+}

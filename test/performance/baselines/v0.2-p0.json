@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "baselineSha": "1db0ac3b896a4e9678032bcdc26cb796acf37422",
+  "fixtureSeed": "tabulark-0.2-p0-2026-07-26",
+  "toolchain": {
+    "rust": "1.85.0",
+    "node": "24",
+    "playwright": "1.61.1",
+    "chromium": "149.0.7827.55 (revision 1228)",
+    "firefox": "151.0 (revision 1532)",
+    "webkit": "26.5 (revision 2311)"
+  },
+  "performanceReport": "test/performance/baselines/windows-chromium-16mib.json",
+  "sizeReport": "test/performance/baselines/package-sizes.json",
+  "shippedJavaScript": {
+    "compression": "Brotli Q11",
+    "brotliBytes": 105417,
+    "candidateMaximumBytes": 94875,
+    "workerBrotliBytes": 20532,
+    "workerMaximumBytes": 20532,
+    "removedArtifact": "dist/worker/large-excel-adapter.js"
+  }
+}

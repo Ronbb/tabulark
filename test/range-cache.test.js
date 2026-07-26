@@ -35,7 +35,7 @@ test("RESOURCE_LIMIT details always expose resource and required/available capac
   });
 });
 
-test("range cache isolates mutable batches and clears closed table entries", async () => {
+test("range cache isolates mutable facades, survives table handles, and clears with its dataset", async () => {
   const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
   Object.defineProperty(globalThis, "Worker", {
     configurable: true,
@@ -65,13 +65,13 @@ test("range cache isolates mutable batches and clears closed table entries", asy
     await table.close();
     const reopened = await dataset.openTable("table-0");
     assert.deepEqual((await reopened.readRange(range)).toRows(), [["a"]]);
-    assert.equal(worker.readRangeCount, 2, "closing a table should remove its cached ranges");
+    assert.equal(worker.readRangeCount, 1, "a logical table cache survives a temporary handle");
 
     await dataset.close();
     const reopenedDataset = await engine.open(new Blob(["value\na\n"]), csvOptions());
     const reopenedAfterDatasetClose = await reopenedDataset.openTable("table-0");
     assert.deepEqual((await reopenedAfterDatasetClose.readRange(range)).toRows(), [["a"]]);
-    assert.equal(worker.readRangeCount, 3, "closing a dataset should remove table cache entries");
+    assert.equal(worker.readRangeCount, 2, "closing a dataset removes its logical table cache");
   } finally {
     await engine?.close();
     if (originalWorker) {
@@ -79,6 +79,131 @@ test("range cache isolates mutable batches and clears closed table entries", asy
     } else {
       delete globalThis.Worker;
     }
+  }
+});
+
+test("twenty identical misses share one RPC and caller cancellation is independent", async () => {
+  const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  Object.defineProperty(globalThis, "Worker", {
+    configurable: true,
+    writable: true,
+    value: FakeWorker,
+  });
+
+  let engine;
+  try {
+    engine = await createTestEngine();
+    const worker = FakeWorker.latest;
+    const dataset = await engine.open(new Blob(["value\na\n"]), csvOptions());
+    const table = await dataset.openTable("table-0");
+    const range = { rowStart: 0, rowCount: 1, columnStart: 0, columnCount: 1 };
+
+    const batches = await Promise.all(Array.from({ length: 20 }, () => table.readRange(range)));
+    assert.equal(worker.readRangeCount, 1);
+    assert.ok(batches.every((value) => value.toRows()[0][0] === "a"));
+
+    worker.deferReads = true;
+    const adjacent = { ...range, rowStart: 1 };
+    const first = new AbortController();
+    const second = new AbortController();
+    const cancelled = table.readRange(adjacent, { signal: first.signal });
+    const retained = table.readRange(adjacent, { signal: second.signal });
+    first.abort();
+    await assert.rejects(cancelled, (error) => error.code === "CANCELLED");
+    assert.equal(worker.cancelCount, 0, "one caller cannot cancel shared work");
+    worker.flushReads();
+    assert.deepEqual((await retained).toRows(), [["a"]]);
+
+    const finalRange = { ...range, rowStart: 2 };
+    const third = new AbortController();
+    const fourth = new AbortController();
+    const thirdRead = table.readRange(finalRange, { signal: third.signal });
+    const fourthRead = table.readRange(finalRange, { signal: fourth.signal });
+    third.abort();
+    fourth.abort();
+    await Promise.all([
+      assert.rejects(thirdRead, (error) => error.code === "CANCELLED"),
+      assert.rejects(fourthRead, (error) => error.code === "CANCELLED"),
+    ]);
+    assert.equal(worker.cancelCount, 1, "all callers cause exactly one Worker cancel");
+  } finally {
+    await engine?.close();
+    if (originalWorker) Object.defineProperty(globalThis, "Worker", originalWorker);
+    else delete globalThis.Worker;
+  }
+});
+
+test("metadata revision and schema changes evict older logical table backings", async () => {
+  const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  Object.defineProperty(globalThis, "Worker", {
+    configurable: true,
+    writable: true,
+    value: FakeWorker,
+  });
+
+  let engine;
+  try {
+    engine = await createTestEngine();
+    const worker = FakeWorker.latest;
+    const dataset = await engine.open(new Blob(["value\na\n"]), csvOptions());
+    const table = await dataset.openTable("table-0");
+    const range = { rowStart: 0, rowCount: 1, columnStart: 0, columnCount: 1 };
+    await table.readRange(range);
+    await table.readRange(range);
+    assert.equal(worker.readRangeCount, 1);
+
+    worker.batchRevision = 1;
+    worker.batchSchemaVersion = 2;
+    worker.emitMetadata(1, 2);
+    assert.equal(table.metadata.revision, 1);
+    assert.equal(table.metadata.schema.version, 2);
+    await table.readRange(range);
+    await table.readRange(range);
+    assert.equal(worker.readRangeCount, 2, "the updated version has one new miss then a hit");
+  } finally {
+    await engine?.close();
+    if (originalWorker) Object.defineProperty(globalThis, "Worker", originalWorker);
+    else delete globalThis.Worker;
+  }
+});
+
+test("small batches are charged at 4 KiB and the client cache caps entry count", async () => {
+  const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  Object.defineProperty(globalThis, "Worker", {
+    configurable: true,
+    writable: true,
+    value: FakeWorker,
+  });
+
+  let engine;
+  try {
+    engine = await createTestEngine();
+    const worker = FakeWorker.latest;
+    const dataset = await engine.open(new Blob(["value\na\n"]), csvOptions());
+    const table = await dataset.openTable("table-0");
+
+    // An 8 MiB engine assigns 1 MiB to the main-thread cache. The 4 KiB
+    // minimum charge therefore allows 256 entries even though these batches
+    // contain only a few bytes of actual backing data.
+    for (let rowStart = 0; rowStart < 257; rowStart += 1) {
+      await table.readRange({
+        rowStart,
+        rowCount: 1,
+        columnStart: 0,
+        columnCount: 1,
+      });
+    }
+    await table.readRange({
+      rowStart: 0,
+      rowCount: 1,
+      columnStart: 0,
+      columnCount: 1,
+    });
+    assert.equal(worker.readRangeCount, 258, "the 257th entry evicts the oldest backing");
+  } finally {
+    await engine?.close();
+    if (originalWorker) Object.defineProperty(globalThis, "Worker", originalWorker);
+    else delete globalThis.Worker;
   }
 });
 
@@ -148,6 +273,45 @@ test("client never retains a batch truncated at a progressive prefix", async () 
     assert.equal(completed.complete, true);
     await table.readRange(range);
     assert.equal(worker.readRangeCount, 2, "only the complete retry may enter the client cache");
+  } finally {
+    await engine?.close();
+    if (originalWorker) Object.defineProperty(globalThis, "Worker", originalWorker);
+    else delete globalThis.Worker;
+  }
+});
+
+test("an invalid transferred backing is terminal protocol failure", async () => {
+  const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  Object.defineProperty(globalThis, "Worker", {
+    configurable: true,
+    writable: true,
+    value: FakeWorker,
+  });
+
+  let engine;
+  try {
+    engine = await createTestEngine();
+    const worker = FakeWorker.latest;
+    worker.batchOverride = (range) => {
+      const value = batch(range);
+      return {
+        ...value,
+        columns: [{
+          ...value.columns[0],
+          native: {
+            ...value.columns[0].native,
+            data: { buffer: 99 },
+          },
+        }],
+      };
+    };
+    const dataset = await engine.open(new Blob(["value\na\n"]), csvOptions());
+    const table = await dataset.openTable("table-0");
+    await assert.rejects(
+      table.readRange({ rowStart: 0, rowCount: 1, columnStart: 0, columnCount: 1 }),
+      (error) => error.code === "PROTOCOL_INCOMPATIBLE",
+    );
+    assert.equal(worker.terminated, true);
   } finally {
     await engine?.close();
     if (originalWorker) Object.defineProperty(globalThis, "Worker", originalWorker);
@@ -271,6 +435,31 @@ test("layout-v1 batches decode native recursive values separately from display t
       ["9223372036854775000", "123.45", "[1,2]", "0xabcd"],
       ["-1", "-0.42", "[3]", "0x00"],
     ]);
+    const firstBinary = batch.columns[3].getValue(0);
+    assert.ok(firstBinary instanceof Uint8Array);
+    firstBinary[0] = 0;
+    assert.deepEqual(
+      batch.columns[3].getValue(0),
+      new Uint8Array([0xab, 0xcd]),
+      "a binary getter returns a defensive copy",
+    );
+
+    const cachedBatch = await table.readRange({
+      rowStart: 0,
+      rowCount: 2,
+      columnStart: 0,
+      columnCount: 4,
+    });
+    assert.equal(FakeWorker.latest.readRangeCount, 1, "the second facade uses the cached backing");
+    const cachedBinary = cachedBatch.columns[3].getValue(0);
+    assert.ok(cachedBinary instanceof Uint8Array);
+    cachedBinary[1] = 0;
+    assert.deepEqual(
+      cachedBatch.columns[3].getValue(0),
+      new Uint8Array([0xab, 0xcd]),
+      "a cached facade cannot mutate its backing through a binary getter",
+    );
+    assert.deepEqual(batch.columns[3].getValue(0), new Uint8Array([0xab, 0xcd]));
     assert.equal("byteLength" in batch, false);
     assert.equal("native" in batch.columns[0], false);
     assert.equal("display" in batch.columns[0], false);
@@ -348,9 +537,15 @@ class FakeWorker {
   static latest;
 
   readRangeCount = 0;
+  cancelCount = 0;
+  deferReads = false;
+  batchRevision = 0;
+  batchSchemaVersion = 0;
   batchDataBytes = 1;
   batchOverride;
+  terminated = false;
   #listeners = new Map();
+  #deferredReads = [];
 
   constructor() {
     FakeWorker.latest = this;
@@ -376,8 +571,8 @@ class FakeWorker {
       case "hello":
         kind = "hello";
         data = {
-          protocolVersion: 3,
-          adapterApiVersion: 2,
+          protocolVersion: 4,
+          adapterApiVersion: 3,
           batchLayoutVersion: 1,
           adapters: request.payload.adapters.map((adapter) => adapter.id),
           transferableBatches: true,
@@ -413,8 +608,14 @@ class FakeWorker {
         data = typeof this.batchOverride === "function"
           ? this.batchOverride(request.payload.range, this.readRangeCount)
           : this.batchOverride ?? batch(request.payload.range, this.batchDataBytes);
+        data = {
+          ...data,
+          revision: this.batchRevision,
+          schemaVersion: this.batchSchemaVersion,
+        };
         break;
       case "cancel":
+        this.cancelCount += 1;
       case "closeTable":
       case "closeSource":
       case "shutdown":
@@ -425,19 +626,51 @@ class FakeWorker {
     }
 
     const response = {
-      protocolVersion: 3,
+      protocolVersion: 4,
       requestId: request.requestId,
       status: "success",
       result: data === undefined ? { kind } : { kind, data },
     };
+    if (request.op === "readRange" && this.deferReads) {
+      this.#deferredReads.push(() => this.#emit(response));
+      return;
+    }
     queueMicrotask(() => {
-      for (const listener of this.#listeners.get("message") ?? []) {
-        listener({ data: response });
-      }
+      this.#emit(response);
     });
   }
 
-  terminate() {}
+  flushReads() {
+    for (const respond of this.#deferredReads.splice(0)) respond();
+  }
+
+  emitMetadata(revision, schemaVersion) {
+    const value = metadata();
+    const payload = {
+      ...value,
+      revision,
+      schema: { ...value.schema, version: schemaVersion },
+    };
+    this.#emit({
+      protocolVersion: 4,
+      event: "metadata",
+      datasetHandle: "d1",
+      tableHandle: "t1",
+      tableId: "table-0",
+      revision,
+      payload,
+    });
+  }
+
+  #emit(data) {
+    for (const listener of this.#listeners.get("message") ?? []) {
+      listener({ data });
+    }
+  }
+
+  terminate() {
+    this.terminated = true;
+  }
 }
 
 function metadata() {

@@ -138,6 +138,36 @@ pub(crate) struct TablePresentation {
     pub(crate) styles: Vec<PresentationStyle>,
 }
 
+impl TablePresentation {
+    /// Conservative upper bound for the adapter-owned serialized envelope.
+    pub(crate) fn output_reservation_bytes(&self) -> Result<usize> {
+        const ENVELOPE_BYTES: usize = 512;
+        const AXIS_WIRE_BYTES: usize = 128;
+        const STYLE_WIRE_OVERHEAD: usize = 768;
+
+        let mut bytes = ENVELOPE_BYTES;
+        add_presentation_bytes(
+            &mut bytes,
+            self.rows
+                .len()
+                .checked_add(self.columns.len())
+                .and_then(|count| count.checked_mul(AXIS_WIRE_BYTES))
+                .ok_or_else(presentation_reservation_overflow)?,
+        )?;
+        add_presentation_bytes(
+            &mut bytes,
+            self.styles
+                .len()
+                .checked_mul(STYLE_WIRE_OVERHEAD)
+                .ok_or_else(presentation_reservation_overflow)?,
+        )?;
+        for style in &self.styles {
+            add_style_heap_bytes(&mut bytes, style)?;
+        }
+        Ok(bytes)
+    }
+}
+
 /// Presentation returned by a range-level query.
 #[derive(Clone, Debug)]
 pub(crate) struct TablePresentationRange {

@@ -6,8 +6,6 @@
 //! is provided only as a convenient native reference implementation and test
 //! fixture.
 
-use std::borrow::Cow;
-
 use csv_core::{ReadFieldResult, Reader, ReaderBuilder};
 use serde::{Deserialize, Serialize};
 
@@ -676,21 +674,25 @@ impl CsvScanner {
             .with_detail("maxColumns", self.options.limits.max_columns));
         }
 
-        let bytes = std::mem::take(&mut self.field);
-        let decoded = match std::str::from_utf8(&bytes) {
-            Ok(value) => Cow::Borrowed(value),
-            Err(_) => {
-                self.handle_diagnostic(CsvDiagnostic::new(
-                    CsvDiagnosticKind::InvalidUtf8,
-                    (!self.header_pending).then_some(self.rows),
-                    self.record_start_offset,
-                    "field contains invalid UTF-8; replacement characters were used",
-                ))?;
-                String::from_utf8_lossy(&bytes)
-            }
-        };
+        let valid_utf8 = std::str::from_utf8(&self.field).is_ok();
+        if !valid_utf8 {
+            self.handle_diagnostic(CsvDiagnostic::new(
+                CsvDiagnosticKind::InvalidUtf8,
+                (!self.header_pending).then_some(self.rows),
+                self.record_start_offset,
+                "field contains invalid UTF-8; replacement characters were used",
+            ))?;
+        }
         if self.header_pending {
-            self.header_names.push(decoded.into_owned());
+            let bytes = std::mem::take(&mut self.field);
+            let decoded = if valid_utf8 {
+                String::from_utf8(bytes).expect("validated UTF-8 field")
+            } else {
+                String::from_utf8_lossy(&bytes).into_owned()
+            };
+            self.header_names.push(decoded);
+        } else {
+            self.field.clear();
         }
         Ok(())
     }
@@ -810,7 +812,8 @@ pub struct RangeDecoder {
     field: Vec<u8>,
     field_index: usize,
     current_row: u64,
-    selected_values: Vec<Option<Vec<u8>>>,
+    selected_values: Vec<Vec<u8>>,
+    selected_valid: Vec<bool>,
     builders: Vec<StringColumnBuilder>,
     returned_rows: u64,
     batch_bytes: usize,
@@ -848,7 +851,8 @@ impl RangeDecoder {
             field: Vec::new(),
             field_index: 0,
             current_row: plan.checkpoint.row,
-            selected_values: vec![None; selected],
+            selected_values: (0..selected).map(|_| Vec::new()).collect(),
+            selected_valid: vec![false; selected],
             builders,
             returned_rows: 0,
             batch_bytes,
@@ -1030,24 +1034,27 @@ impl RangeDecoder {
             TabularkError::new(ErrorCode::ResourceLimit, "column start exceeds usize")
         })?;
         let end = start + self.selected_values.len();
-        let field = std::mem::take(&mut self.field);
         if self.current_row >= self.plan.request.row_start()
             && self.current_row < self.plan.request.row_end()?
             && (start..end).contains(&logical_index)
         {
-            let normalized = match std::str::from_utf8(&field) {
-                Ok(_) => field,
-                Err(_) => {
-                    self.handle_diagnostic(CsvDiagnostic::new(
-                        CsvDiagnosticKind::InvalidUtf8,
-                        Some(self.current_row),
-                        self.expected_offset,
-                        "field contains invalid UTF-8; replacement characters were used",
-                    ))?;
-                    String::from_utf8_lossy(&field).into_owned().into_bytes()
-                }
-            };
-            self.selected_values[logical_index - start] = Some(normalized);
+            if std::str::from_utf8(&self.field).is_err() {
+                self.handle_diagnostic(CsvDiagnostic::new(
+                    CsvDiagnosticKind::InvalidUtf8,
+                    Some(self.current_row),
+                    self.expected_offset,
+                    "field contains invalid UTF-8; replacement characters were used",
+                ))?;
+                self.field = String::from_utf8_lossy(&self.field)
+                    .into_owned()
+                    .into_bytes();
+            }
+            let selected_index = logical_index - start;
+            std::mem::swap(&mut self.field, &mut self.selected_values[selected_index]);
+            self.field.clear();
+            self.selected_valid[selected_index] = true;
+        } else {
+            self.field.clear();
         }
         Ok(())
     }
@@ -1068,9 +1075,14 @@ impl RangeDecoder {
         if self.current_row >= self.plan.request.row_start()
             && self.current_row < self.plan.request.row_end()?
         {
-            for (builder, value) in self.builders.iter_mut().zip(&mut self.selected_values) {
+            for ((builder, value), valid) in self
+                .builders
+                .iter_mut()
+                .zip(&self.selected_values)
+                .zip(&self.selected_valid)
+            {
                 builder.push(
-                    value.take(),
+                    valid.then_some(value.as_slice()),
                     &mut self.batch_bytes,
                     self.options.limits.max_batch_bytes,
                 )?;
@@ -1078,7 +1090,10 @@ impl RangeDecoder {
             self.returned_rows += 1;
         }
         self.field_index = 0;
-        self.selected_values.fill(None);
+        for value in &mut self.selected_values {
+            value.clear();
+        }
+        self.selected_valid.fill(false);
         self.current_row = self.current_row.checked_add(1).ok_or_else(|| {
             TabularkError::new(ErrorCode::ResourceLimit, "range row count overflow")
         })?;
@@ -1247,12 +1262,12 @@ impl StringColumnBuilder {
 
     fn push(
         &mut self,
-        value: Option<Vec<u8>>,
+        value: Option<&[u8]>,
         batch_bytes: &mut usize,
         max_batch_bytes: usize,
     ) -> Result<()> {
         let validity_byte = usize::from(self.values % 8 == 0);
-        let value_bytes = value.as_ref().map_or(0, Vec::len);
+        let value_bytes = value.map_or(0, <[u8]>::len);
         let encoded_bytes = value_bytes
             .checked_add(std::mem::size_of::<u32>())
             .and_then(|bytes| bytes.checked_add(validity_byte))
@@ -1269,7 +1284,7 @@ impl StringColumnBuilder {
             ));
         }
         if let Some(value) = value {
-            self.data.extend_from_slice(&value);
+            self.data.extend_from_slice(value);
             let byte = self.values / 8;
             if self.validity.len() <= byte {
                 self.validity.push(0);
@@ -1649,6 +1664,26 @@ mod tests {
             .expect("range read");
 
         assert_eq!(batch.columns()[0].value(0), Some(Some("�")));
+    }
+
+    #[test]
+    fn scanner_reuses_field_scratch_capacity_across_records() {
+        let mut options = DelimitedOptions::csv();
+        options.header = false;
+        let mut scanner = CsvScanner::new(options).expect("scanner");
+        let first = format!("{}\n", "x".repeat(64 * 1024));
+        scanner
+            .feed_chunk(0, first.as_bytes(), false)
+            .expect("large first record");
+        let capacity = scanner.field.capacity();
+        assert!(capacity >= 64 * 1024);
+        assert!(scanner.field.is_empty());
+
+        scanner
+            .feed_chunk(first.len() as u64, b"y\n", false)
+            .expect("small second record");
+        assert_eq!(scanner.field.capacity(), capacity);
+        assert!(scanner.field.is_empty());
     }
 
     #[test]

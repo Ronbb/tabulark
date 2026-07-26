@@ -1628,6 +1628,75 @@ impl TableBatch {
             columns,
         )
     }
+
+    /// Consumes a legacy UTF-8 batch into typed-buffer layout v1.
+    ///
+    /// Unlike [`Self::to_typed`], this path moves each values and validity
+    /// allocation directly into the transferable buffer pool. Only the u32
+    /// offsets require endian-stable byte encoding.
+    pub fn into_typed(self) -> Result<TypedTableBatch> {
+        let Self {
+            table_id,
+            revision,
+            schema_version,
+            range,
+            complete,
+            columns: legacy_columns,
+        } = self;
+        let mut buffers = Vec::new();
+        let mut buffers_by_fingerprint = HashMap::<u64, Vec<u32>>::new();
+        let mut columns = Vec::with_capacity(legacy_columns.len());
+
+        for column in legacy_columns {
+            let StringColumnBatch {
+                column_id,
+                data,
+                offsets: legacy_offsets,
+                validity: legacy_validity,
+            } = column;
+            let length = u64::try_from(legacy_offsets.len().saturating_sub(1)).map_err(|_| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "delimited batch row count exceeds the public range",
+                )
+            })?;
+            let values = intern_batch_buffer(&mut buffers, &mut buffers_by_fingerprint, data)?;
+            let mut offset_bytes = Vec::with_capacity(
+                legacy_offsets
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            );
+            for offset in legacy_offsets {
+                offset_bytes.extend_from_slice(&offset.to_le_bytes());
+            }
+            let offsets =
+                intern_batch_buffer(&mut buffers, &mut buffers_by_fingerprint, offset_bytes)?;
+            let validity_buffer =
+                intern_batch_buffer(&mut buffers, &mut buffers_by_fingerprint, legacy_validity)?;
+            let validity = Some(BitmapSlice::new(validity_buffer, 0)?);
+            let descriptor = ArrayDescriptor::new(
+                TableDataType::Utf8,
+                length,
+                validity,
+                ArrayLayout::VariableWidth { offsets, values },
+            )?;
+            columns.push(TypedColumnBatch::new(
+                column_id,
+                descriptor.clone(),
+                descriptor,
+            )?);
+        }
+
+        TypedTableBatch::new(
+            table_id,
+            revision,
+            schema_version,
+            range,
+            complete,
+            buffers,
+            columns,
+        )
+    }
 }
 
 fn intern_batch_buffer(
@@ -2008,5 +2077,42 @@ mod tests {
                 ArrayLayout::VariableWidth { .. }
             ));
         }
+    }
+
+    #[test]
+    fn consuming_delimited_conversion_moves_values_and_validity_buffers() {
+        let column = StringColumnBatch::new(
+            "c0",
+            b"alpha-beta".to_vec(),
+            vec![0, 5, 10],
+            vec![0b0000_0011],
+        )
+        .expect("string column");
+        let values_pointer = column.data().as_ptr();
+        let validity_pointer = column.validity().as_ptr();
+        let legacy = TableBatch::new(
+            "table-0",
+            0,
+            1,
+            RangeRequest::new(0, 2, 0, 1).expect("range"),
+            true,
+            vec![column],
+        );
+
+        let typed = legacy.into_typed().expect("consuming conversion");
+        assert!(
+            typed
+                .buffers()
+                .iter()
+                .any(|buffer| buffer.data().as_ptr() == values_pointer),
+            "UTF-8 values allocation must be moved into the typed pool"
+        );
+        assert!(
+            typed
+                .buffers()
+                .iter()
+                .any(|buffer| buffer.data().as_ptr() == validity_pointer),
+            "validity allocation must be moved into the typed pool"
+        );
     }
 }

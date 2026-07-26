@@ -64,7 +64,9 @@ try {
     page.setDefaultTimeout(60_000);
     const pageErrors = [];
     page.on("pageerror", (error) => pageErrors.push(error.message));
-    await page.goto(`${baseURL}/test/performance/harness.html`, { waitUntil: "load" });
+    const harnessUrl = new URL("/test/performance/harness.html", baseURL);
+    if (options.allowCacheRpc) harnessUrl.searchParams.set("allow-cache-rpc", "1");
+    await page.goto(harnessUrl.href, { waitUntil: "load" });
     await page.waitForFunction(() => globalThis.__tabularkPerformanceReady === true);
     await page.locator("#source").setInputFiles(datasetPath);
     const result = scenarioKind === "arrow"
@@ -210,6 +212,8 @@ function validateResult(result, expected) {
     result.completedScan.mibPerSecond,
     result.rangeRead.medianMs,
     result.rangeRead.p95Ms,
+    result.cacheHit.durationMs,
+    result.lifecycleCloseMs,
     result.scroll.medianMs,
     result.scroll.p95Ms,
     result.scroll.maxMs,
@@ -312,6 +316,8 @@ function summarizeResults(results) {
       results.map((result) => result.completedScan.mibPerSecond),
     ),
     rangeReadMedianMs: distribution(results.map((result) => result.rangeRead.medianMs)),
+    cacheHitMs: distribution(results.map((result) => result.cacheHit.durationMs)),
+    lifecycleCloseMs: distribution(results.map((result) => result.lifecycleCloseMs)),
     scrollP95Ms: distribution(results.map((result) => result.scroll.p95Ms)),
     scrollMaximumTop: distribution(results.map((result) => result.scroll.maximumScrollTop)),
     scrollObservedTop: distribution(
@@ -397,6 +403,7 @@ function parseArguments(args) {
     iterations: undefined,
     warmups: undefined,
     headed: false,
+    allowCacheRpc: false,
   };
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
@@ -405,8 +412,9 @@ function parseArguments(args) {
     else if (argument === "--iterations") parsed.iterations = positiveInteger(requiredValue(args, ++index, argument));
     else if (argument === "--warmups") parsed.warmups = nonNegativeInteger(requiredValue(args, ++index, argument));
     else if (argument === "--headed") parsed.headed = true;
+    else if (argument === "--allow-cache-rpc") parsed.allowCacheRpc = true;
     else if (argument === "--help" || argument === "-h") {
-      process.stdout.write("Usage: node test/performance/run-browser.mjs [--scenario NAME] [--iterations N] [--warmups N] [--output PATH] [--headed]\n");
+      process.stdout.write("Usage: node test/performance/run-browser.mjs [--scenario NAME] [--iterations N] [--warmups N] [--output PATH] [--headed] [--allow-cache-rpc]\n");
       process.exit(0);
     } else throw new Error(`unknown argument: ${argument}`);
   }

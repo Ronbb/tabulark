@@ -109,14 +109,14 @@ class StabilityWorker {
 
   postMessage(request) {
     const respond = (result, payload) => queueMicrotask(() => this.#emit({
-      protocolVersion: 3,
+      protocolVersion: 4,
       requestId: request.requestId,
       status: "success",
       result: { kind: result, ...(payload === undefined ? {} : { data: payload }) },
     }));
     switch (request.op) {
       case "hello":
-        respond("hello", { protocolVersion: 3, adapterApiVersion: 2, batchLayoutVersion: 1, adapters: ["tabulark:delimited"] });
+        respond("hello", { protocolVersion: 4, adapterApiVersion: 3, batchLayoutVersion: 1, adapters: ["tabulark:delimited"] });
         break;
       case "openSource":
         respond("dataset", { datasetHandle: "d1" });
@@ -142,7 +142,7 @@ class StabilityWorker {
 
   emitWarning(table = false, tableId) {
     this.#emit({
-      protocolVersion: 3,
+      protocolVersion: 4,
       event: "warning",
       datasetHandle: "d1",
       ...(table ? { tableHandle: "t1", tableId: "table-0", revision: 3 } : {}),

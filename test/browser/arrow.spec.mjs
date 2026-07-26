@@ -442,18 +442,39 @@ test("keeps concurrent CSV and Arrow sources isolated across close and Arrow fai
   expect(result.reopenedRows[0][0]).toBe(9_007_199_254_740_993n);
 });
 
-test("loads only the selected adapter WASM and reuses the Arrow artifact", async ({ page }) => {
-  const requested = [];
-  page.on("request", (request) => requested.push(request.url()));
+test("loads only the selected adapter WASM and reuses the Arrow artifact", async (
+  { page },
+  testInfo,
+) => {
+  const requestScope = [
+    "arrow-lazy",
+    testInfo.project.name,
+    testInfo.workerIndex,
+    testInfo.retry,
+    Date.now(),
+  ].join("-");
+  await page.context().setExtraHTTPHeaders({ "x-tabulark-test-scope": requestScope });
+  const reset = await page.request.delete(
+    `/__tabulark-test/requests?scope=${encodeURIComponent(requestScope)}`,
+  );
+  expect(reset.ok()).toBe(true);
   await page.goto("/test/browser/harness.html");
+
+  const requested = async () => {
+    const response = await page.request.get(
+      `/__tabulark-test/requests?scope=${encodeURIComponent(requestScope)}`,
+    );
+    expect(response.ok()).toBe(true);
+    return (await response.json()).map(({ path }) => path);
+  };
 
   await page.evaluate(async () => {
     const { createEngine, delimitedAdapter } = await import("/dist/index.js");
     const { arrowIpcAdapter } = await import("/dist/arrow.js");
     window.__m4Engine = await createEngine({ adapters: [delimitedAdapter, arrowIpcAdapter] });
   });
-  expect(requested.filter((url) => url.includes("/dist/wasm/"))).toHaveLength(0);
-  expect(requested.filter((url) => url.includes("_bg.wasm"))).toHaveLength(0);
+  expect((await requested()).filter((url) => url.includes("/dist/wasm/"))).toHaveLength(0);
+  expect((await requested()).filter((url) => url.includes("_bg.wasm"))).toHaveLength(0);
 
   await page.evaluate(async () => {
     const { delimitedAdapter } = await import("/dist/index.js");
@@ -463,10 +484,9 @@ test("loads only the selected adapter WASM and reuses the Arrow artifact", async
     });
     await dataset.close();
   });
-  expect(requested.filter((url) => url.includes("tabulark_delimited_bg.wasm"))).toHaveLength(1);
-  expect(requested.filter((url) => url.includes("wasm/delimited/tabulark_delimited.js"))).toHaveLength(1);
-  expect(requested.filter((url) => url.includes("tabulark_arrow_bg.wasm"))).toHaveLength(0);
-  expect(requested.filter((url) => url.includes("wasm/arrow/tabulark_arrow.js"))).toHaveLength(0);
+  let requestPaths = await requested();
+  expect(requestPaths.filter((url) => url.includes("tabulark_delimited_bg.wasm"))).toHaveLength(1);
+  expect(requestPaths.filter((url) => url.includes("tabulark_arrow_bg.wasm"))).toHaveLength(0);
 
   await page.evaluate(async ({ fixture }) => {
     const { arrowIpcAdapter } = await import("/dist/arrow.js");
@@ -477,9 +497,9 @@ test("loads only the selected adapter WASM and reuses the Arrow artifact", async
     ]);
     await Promise.all(datasets.map((dataset) => dataset.close()));
   }, { fixture: fixtureUrl });
-  const arrowWasmRequests = requested.filter((url) => url.includes("tabulark_arrow_bg.wasm"));
+  requestPaths = await requested();
+  const arrowWasmRequests = requestPaths.filter((url) => url.includes("tabulark_arrow_bg.wasm"));
   expect(arrowWasmRequests).toHaveLength(1);
-  expect(requested.filter((url) => url.includes("wasm/arrow/tabulark_arrow.js"))).toHaveLength(1);
 
   await page.evaluate(async ({ fixture }) => {
     const { arrowIpcAdapter } = await import("/dist/arrow.js");
@@ -489,5 +509,6 @@ test("loads only the selected adapter WASM and reuses the Arrow artifact", async
     await window.__m4Engine.close();
     delete window.__m4Engine;
   }, { fixture: fixtureUrl });
-  expect(requested.filter((url) => url.includes("tabulark_arrow_bg.wasm"))).toHaveLength(1);
+  requestPaths = await requested();
+  expect(requestPaths.filter((url) => url.includes("tabulark_arrow_bg.wasm"))).toHaveLength(1);
 });

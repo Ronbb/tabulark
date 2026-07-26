@@ -1,0 +1,14 @@
+{
+  "kind": "progress",
+  "operationHandle": 17,
+  "operationRevision": 2,
+  "actions": [],
+  "cooperativeYield": true,
+  "payload": {
+    "operation": "open",
+    "sourceHandle": 3,
+    "bytesScanned": 4096,
+    "rowsDiscovered": 256,
+    "done": false
+  }
+}

@@ -4,6 +4,10 @@ import { pathToFileURL } from "node:url";
 
 const declarationRoot = new URL("../dist/", import.meta.url);
 const snapshotUrl = new URL(
+  "../test/fixtures/api/stable-declarations-v0.2.json",
+  import.meta.url,
+);
+const historicalV01SnapshotUrl = new URL(
   "../test/fixtures/api/stable-declarations-v0.1.json",
   import.meta.url,
 );
@@ -40,7 +44,7 @@ export async function collectStableDeclarationSnapshot() {
 
   return Object.freeze({
     schemaVersion: 1,
-    compatibilityLine: "0.1.x",
+    compatibilityLine: "0.2.x",
     entrypoints: stableEntrypoints,
     files: Object.fromEntries([...declarations].sort(([left], [right]) => left.localeCompare(right))),
   });
@@ -48,6 +52,10 @@ export async function collectStableDeclarationSnapshot() {
 
 export async function readCommittedStableDeclarationSnapshot() {
   return JSON.parse(await readFile(snapshotUrl, "utf8"));
+}
+
+export async function readHistoricalV01DeclarationSnapshot() {
+  return JSON.parse(await readFile(historicalV01SnapshotUrl, "utf8"));
 }
 
 function normalizeDeclaration(source) {
@@ -79,7 +87,7 @@ async function main() {
   const expected = await readCommittedStableDeclarationSnapshot();
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     process.stderr.write(
-      "Stable 0.1 declaration surface changed. Review compatibility and update the checked-in snapshot deliberately.\n",
+      "Stable 0.2 declaration surface changed. Review compatibility and update the checked-in snapshot deliberately.\n",
     );
     process.exitCode = 1;
   }

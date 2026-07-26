@@ -35,7 +35,6 @@ const parquetRuntimePaths = [
 ];
 const excelRuntimePaths = [
   entrypointBundle(excelArtifact),
-  "dist/worker/large-excel-adapter.js",
   ...wasmRuntimePaths(excelArtifact),
 ];
 
@@ -49,6 +48,24 @@ const runtimeFiles = [
   ...parquetRuntimeFiles,
   ...excelRuntimeFiles,
 ];
+const shippedJavaScriptFiles = [];
+for (const path of await walkFiles(resolve(repositoryRoot, "dist"))) {
+  if (path.endsWith(".js")) {
+    shippedJavaScriptFiles.push(await measureFile(path, repositoryRoot));
+  }
+}
+const p0Baseline = JSON.parse(await readFile(
+  resolve(repositoryRoot, "test/performance/baselines/v0.2-p0.json"),
+  "utf8",
+));
+for (const [name, value] of Object.entries({
+  candidateMaximumBytes: p0Baseline.shippedJavaScript?.candidateMaximumBytes,
+  workerMaximumBytes: p0Baseline.shippedJavaScript?.workerMaximumBytes,
+})) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`invalid P0 JavaScript size threshold: ${name}`);
+  }
+}
 const pagesFiles = await walkFiles(resolve(repositoryRoot, "target/pages"));
 const pagesMeasured = [];
 for (const path of pagesFiles) {
@@ -67,6 +84,7 @@ const report = {
     brotliBytes: sum(runtimeFiles, "brotliBytes"),
     files: runtimeFiles,
   },
+  shippedJavaScript: measuredGroup(shippedJavaScriptFiles),
   npm,
   pages: {
     rawBytes: sum(pagesMeasured, "rawBytes"),
@@ -89,6 +107,10 @@ const actual = {
   npmUnpacked: report.npm.unpackedBytes,
   pagesRaw: report.pages.rawBytes,
   pagesBrotli: report.pages.brotliBytes,
+  shippedJavaScriptBrotli: report.shippedJavaScript.brotliBytes,
+  workerJavaScriptBrotli: report.shippedJavaScript.files.find(
+    ({ path }) => path === "dist/worker.js",
+  )?.brotliBytes,
 };
 const comparisons = Object.fromEntries(Object.entries(budget.maximumBytes).map(([name, maximum]) => {
   const bytes = actual[name];
@@ -96,7 +118,35 @@ const comparisons = Object.fromEntries(Object.entries(budget.maximumBytes).map((
   return [name, { bytes, maximumBytes: maximum, remainingBytes: maximum - bytes }];
 }));
 report.budget = { schemaVersion: budget.schemaVersion, comparisons };
-const failures = Object.entries(comparisons).filter(([, value]) => value.remainingBytes < 0);
+const p0Comparisons = {
+  shippedJavaScriptBrotli: {
+    bytes: actual.shippedJavaScriptBrotli,
+    maximumBytes: p0Baseline.shippedJavaScript.candidateMaximumBytes,
+    remainingBytes:
+      p0Baseline.shippedJavaScript.candidateMaximumBytes - actual.shippedJavaScriptBrotli,
+  },
+  workerJavaScriptBrotli: {
+    bytes: actual.workerJavaScriptBrotli,
+    maximumBytes: p0Baseline.shippedJavaScript.workerMaximumBytes,
+    remainingBytes:
+      p0Baseline.shippedJavaScript.workerMaximumBytes - actual.workerJavaScriptBrotli,
+  },
+};
+for (const [name, value] of Object.entries(p0Comparisons)) {
+  if (!Number.isSafeInteger(value.bytes) || value.bytes < 0) {
+    throw new Error(`missing shipped JavaScript size metric: ${name}`);
+  }
+}
+report.p0Comparisons = p0Comparisons;
+const failures = [
+  ...Object.entries(comparisons),
+  ...Object.entries(p0Comparisons),
+].filter(([, value]) => value.remainingBytes < 0);
+if (report.shippedJavaScript.files.some(({ path }) => (
+  path === p0Baseline.shippedJavaScript.removedArtifact
+))) {
+  failures.push(["largeExcelAdapterRemoved", { remainingBytes: -1 }]);
+}
 
 const output = resolve(repositoryRoot, options.output);
 await mkdir(dirname(output), { recursive: true });

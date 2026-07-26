@@ -99,6 +99,108 @@ test("preserves a File name and replays initial scan diagnostics after open", as
   });
 });
 
+test("presentation resource warnings reach public diagnostics without disabling table reads", async ({
+  page,
+}) => {
+  await page.goto("/test/browser/harness.html");
+
+  const result = await page.evaluate(async () => {
+    const NativeWorker = globalThis.Worker;
+    const workerUrl = new URL(
+      "/test/browser/excel-presentation-budget-worker.mjs",
+      globalThis.location.href,
+    );
+    globalThis.Worker = class TestBudgetWorker {
+      constructor(_url, options) {
+        return new NativeWorker(workerUrl, options);
+      }
+    };
+
+    let engine;
+    let dataset;
+    let table;
+    try {
+      const { createEngine } = await import("/dist/index.js");
+      const { excelAdapter } = await import("/dist/excel.js");
+      const response = await fetch("/test/fixtures/excel/v1/tabulark-ooxml.xlsx");
+      if (!response.ok) throw new Error(`fixture request failed: ${response.status}`);
+      engine = await createEngine({
+        adapters: [excelAdapter],
+        memoryBudgetBytes: 8 * 1024 * 1024,
+      });
+      dataset = await engine.open(new Blob([await response.arrayBuffer()]), {
+        adapter: excelAdapter,
+        adapterOptions: { format: "xlsx", sourceName: "budget.xlsx" },
+      });
+      table = await dataset.openTable(dataset.tables[0].id);
+
+      const warnings = [];
+      const tableWarnings = [];
+      const diagnostics = [];
+      const tableDiagnostics = [];
+      const unsubscribeWarning = dataset.subscribe((event) => {
+        if (event.type === "warning") warnings.push(event.warning);
+      });
+      const unsubscribeTableWarning = table.subscribe((event) => {
+        if (event.type === "warning") tableWarnings.push(event.warning);
+      });
+      const unsubscribeDiagnostic = dataset.subscribeDiagnostics((diagnostic) => {
+        diagnostics.push(diagnostic);
+      });
+      const unsubscribeTableDiagnostic = table.subscribeDiagnostics((diagnostic) => {
+        tableDiagnostics.push(diagnostic);
+      });
+
+      try {
+        const presentation = await table.getPresentation();
+        const batch = await table.readRange({
+          rowStart: 0,
+          rowCount: 1,
+          columnStart: 0,
+          columnCount: 1,
+        });
+        return {
+          presentation,
+          rows: batch.toDisplayRows(),
+          warning: warnings.find(({ kind }) => kind === "presentation-resource-limit"),
+          tableWarning: tableWarnings.find(({ kind }) => kind === "presentation-resource-limit"),
+          diagnostic: diagnostics.find(({ code }) => code === "presentation-resource-limit"),
+          tableDiagnostic: tableDiagnostics.find(({ code }) => code === "presentation-resource-limit"),
+        };
+      } finally {
+        unsubscribeWarning();
+        unsubscribeTableWarning();
+        unsubscribeDiagnostic();
+        unsubscribeTableDiagnostic();
+      }
+    } finally {
+      globalThis.Worker = NativeWorker;
+      await table?.close();
+      await dataset?.close();
+      await engine?.close();
+    }
+  });
+
+  expect(result.presentation).toBeNull();
+  expect(result.rows[0][0]).not.toBeNull();
+  expect(result.warning).toMatchObject({
+    kind: "presentation-resource-limit",
+    tableId: "sheet-0",
+    resource: "presentation-output",
+    availableBytes: 512,
+  });
+  expect(result.warning.requiredBytes).toBeGreaterThan(result.warning.availableBytes);
+  expect(result.tableWarning).toEqual(result.warning);
+  expect(result.diagnostic).toMatchObject({
+    code: "presentation-resource-limit",
+    tableId: "sheet-0",
+    resource: "presentation-output",
+    availableBytes: 512,
+  });
+  expect(result.diagnostic.requiredBytes).toBeGreaterThan(result.diagnostic.availableBytes);
+  expect(result.tableDiagnostic).toEqual(result.diagnostic);
+});
+
 test("cancels a range read with AbortSignal", async ({ page }) => {
   await page.goto("/test/browser/harness.html");
 

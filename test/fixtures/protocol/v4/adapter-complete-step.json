@@ -1,0 +1,11 @@
+{
+  "kind": "complete",
+  "operationHandle": 17,
+  "operationRevision": 3,
+  "actions": [],
+  "cooperativeYield": false,
+  "payload": {
+    "operation": "read",
+    "resultKind": "batch"
+  }
+}

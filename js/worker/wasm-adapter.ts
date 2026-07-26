@@ -3,6 +3,7 @@ import {
   ADAPTER_API_VERSION,
   BATCH_LAYOUT_VERSION,
   PROTOCOL_VERSION,
+  isRecord,
 } from "../protocol.js";
 import type { OfficialAdapterId } from "../adapters.js";
 
@@ -12,16 +13,15 @@ interface RawWasmRuntime {
   batchLayoutVersion(): number;
   adapterId(): string;
   beginOpen(options: unknown, sourceLength: number): unknown;
+  beginOpenTable(sourceHandle: string | number, tableId: string): unknown;
+  beginMetadata(tableHandle: string | number): unknown;
+  beginPresentation(tableHandle: string | number): unknown;
+  beginPresentationRange(tableHandle: string | number, request: unknown): unknown;
   continueOperation(
     operationHandle: string | number,
-    absoluteOffset: number,
-    bytes: Uint8Array,
-    eof: boolean,
+    operationRevision: number,
+    results: readonly AdapterActionResult[],
   ): unknown;
-  openTable(sourceHandle: string | number, tableId: string): unknown;
-  metadata(handle: string | number): unknown;
-  presentation(handle: string | number): unknown;
-  readPresentationRange(handle: string | number, request: unknown): unknown;
   beginRead(tableHandle: string | number, request: unknown): unknown;
   cancelOperation(operationHandle: string | number): unknown;
   closeTable(tableHandle: string | number): unknown;
@@ -30,21 +30,18 @@ interface RawWasmRuntime {
   free?(): void;
 }
 
-/** Private runtime seam shared by the compiled adapters and range-backed hosts. */
+/** Private runtime seam shared by the compiled adapters. */
 export interface AdapterRuntime {
-  /** True for the legacy WASM path that retains a staged workbook source. */
-  readonly retainsSourceBytes?: boolean;
-  metadata(sourceHandle: string | number): unknown | Promise<unknown>;
-  presentation(tableHandle: string | number): unknown | Promise<unknown>;
-  readPresentationRange(tableHandle: string | number, request: unknown): unknown | Promise<unknown>;
   beginOpen(options: unknown, sourceLength: number): unknown | Promise<unknown>;
+  beginOpenTable(sourceHandle: string | number, tableId: string): unknown | Promise<unknown>;
+  beginMetadata(tableHandle: string | number): unknown | Promise<unknown>;
+  beginPresentation(tableHandle: string | number): unknown | Promise<unknown>;
+  beginPresentationRange(tableHandle: string | number, request: unknown): unknown | Promise<unknown>;
   continueOperation(
     operationHandle: string | number,
-    absoluteOffset: number,
-    bytes: Uint8Array,
-    eof: boolean,
+    operationRevision: number,
+    results: readonly AdapterActionResult[],
   ): unknown | Promise<unknown>;
-  openTable(sourceHandle: string | number, tableId: string): unknown | Promise<unknown>;
   beginRead(tableHandle: string | number, request: unknown): unknown | Promise<unknown>;
   cancelOperation(operationHandle: string | number): unknown;
   closeTable(tableHandle: string | number): unknown;
@@ -58,45 +55,33 @@ interface WasmBindings {
   WasmRuntime?: new (config: unknown) => RawWasmRuntime;
 }
 
-interface AdapterPendingRead {
-  readonly operationHandle: string | number;
-  readonly action: Readonly<{
-    readonly kind: "read-bytes";
-    readonly offset: number;
-    readonly length: number;
-  }>;
-}
-
-export interface AdapterReadBytesStep extends AdapterPendingRead {
+export interface AdapterReadAction {
   readonly kind: "read-bytes";
+  readonly actionIndex: number;
+  readonly offset: number;
+  readonly length: number;
 }
 
-export interface AdapterOpenProgressStep extends AdapterPendingRead {
-  readonly kind: "open-progress";
-  readonly sourceHandle: string | number;
-  readonly tables: unknown;
-  readonly metadata: unknown;
-  readonly progress: unknown;
-  readonly warnings?: unknown;
+export interface AdapterActionResult {
+  readonly actionIndex: number;
+  readonly offset: number;
+  readonly bytes: Uint8Array;
+  readonly eof: boolean;
 }
 
-export interface AdapterOpenCompleteStep {
-  readonly kind: "open-complete";
-  readonly sourceHandle: string | number;
-  readonly tables: unknown;
-  readonly metadata: unknown;
-  readonly progress?: unknown;
-  readonly warnings?: unknown;
+export interface AdapterOperationStep {
+  readonly kind: "pending" | "progress" | "complete";
+  readonly operationHandle: string | number;
+  readonly operationRevision: number;
+  readonly actions: readonly AdapterReadAction[];
+  readonly cooperativeYield: boolean;
+  readonly payload?: unknown;
 }
 
-export interface AdapterReadCompleteStep {
-  readonly kind: "read-complete";
-  readonly batch: unknown;
+interface TrackedAdapterOperation {
+  readonly revision: number;
+  readonly actions: readonly AdapterReadAction[];
 }
-
-export type AdapterOpenStep = AdapterReadBytesStep | AdapterOpenProgressStep | AdapterOpenCompleteStep;
-export type AdapterReadStep = AdapterReadBytesStep | AdapterReadCompleteStep;
-export type AdapterOperationStep = AdapterOpenStep | AdapterReadStep;
 
 /**
  * The sole translation layer between the Worker protocol and wasm-bindgen.
@@ -104,8 +89,8 @@ export type AdapterOperationStep = AdapterOpenStep | AdapterReadStep;
  * this adapter, so the runtime may safely return views into WebAssembly memory.
  */
 export class WasmAdapter implements AdapterRuntime {
-  readonly retainsSourceBytes = true;
   readonly #runtime: RawWasmRuntime;
+  readonly #operations = new Map<string | number, TrackedAdapterOperation>();
 
   private constructor(runtime: RawWasmRuntime) {
     this.#runtime = runtime;
@@ -157,45 +142,82 @@ export class WasmAdapter implements AdapterRuntime {
     }
   }
 
-  metadata(sourceHandle: string | number): unknown {
-    return this.#call("metadata", () => this.#runtime.metadata(sourceHandle));
-  }
-
-  presentation(tableHandle: string | number): unknown {
-    return this.#call("presentation", () => this.#runtime.presentation(tableHandle));
-  }
-
-  readPresentationRange(tableHandle: string | number, request: unknown): unknown {
-    return this.#call(
-      "readPresentationRange",
-      () => this.#runtime.readPresentationRange(tableHandle, request),
+  beginOpen(options: unknown, sourceLength: number): AdapterOperationStep | Promise<AdapterOperationStep> {
+    return this.#callMapped(
+      "beginOpen",
+      () => this.#runtime.beginOpen(options, sourceLength),
+      (value) => this.#acceptInitialStep(value, "open"),
     );
   }
 
-  beginOpen(options: unknown, sourceLength: number): AdapterOpenStep {
-    return this.#call("beginOpen", () => this.#runtime.beginOpen(options, sourceLength));
+  beginOpenTable(sourceHandle: string | number, tableId: string): AdapterOperationStep | Promise<AdapterOperationStep> {
+    return this.#callMapped(
+      "beginOpenTable",
+      () => this.#runtime.beginOpenTable(sourceHandle, tableId),
+      (value) => this.#acceptInitialStep(value, "open-table"),
+    );
+  }
+
+  beginMetadata(tableHandle: string | number): AdapterOperationStep | Promise<AdapterOperationStep> {
+    return this.#callMapped(
+      "beginMetadata",
+      () => this.#runtime.beginMetadata(tableHandle),
+      (value) => this.#acceptInitialStep(value, "metadata"),
+    );
+  }
+
+  beginPresentation(tableHandle: string | number): AdapterOperationStep | Promise<AdapterOperationStep> {
+    return this.#callMapped(
+      "beginPresentation",
+      () => this.#runtime.beginPresentation(tableHandle),
+      (value) => this.#acceptInitialStep(value, "presentation"),
+    );
+  }
+
+  beginPresentationRange(
+    tableHandle: string | number,
+    request: unknown,
+  ): AdapterOperationStep | Promise<AdapterOperationStep> {
+    return this.#callMapped(
+      "beginPresentationRange",
+      () => this.#runtime.beginPresentationRange(tableHandle, request),
+      (value) => this.#acceptInitialStep(value, "presentation-range"),
+    );
   }
 
   continueOperation(
     operationHandle: string | number,
-    absoluteOffset: number,
-    bytes: Uint8Array,
-    eof: boolean,
-  ): AdapterOperationStep {
-    return this.#call("continueOperation", () =>
-      this.#runtime.continueOperation(operationHandle, absoluteOffset, bytes, eof),
+    operationRevision: number,
+    results: readonly AdapterActionResult[],
+  ): AdapterOperationStep | Promise<AdapterOperationStep> {
+    const tracked = this.#operations.get(operationHandle);
+    if (!tracked) {
+      throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter operation handle is missing or closed");
+    }
+    if (operationRevision !== tracked.revision) {
+      throw new ProtocolFault(
+        "PROTOCOL_INCOMPATIBLE",
+        `Adapter operation revision ${operationRevision} is stale; expected ${tracked.revision}`,
+      );
+    }
+    const normalizedResults = validateActionResults(results, tracked.actions);
+    return this.#callMapped(
+      "continueOperation",
+      () => this.#runtime.continueOperation(operationHandle, operationRevision, normalizedResults),
+      (value) => this.#acceptContinuedStep(value, operationHandle, tracked.revision),
     );
   }
 
-  openTable(sourceHandle: string | number, tableId: string): unknown {
-    return this.#call("openTable", () => this.#runtime.openTable(sourceHandle, tableId));
-  }
-
-  beginRead(tableHandle: string | number, request: unknown): AdapterReadStep {
-    return this.#call("beginRead", () => this.#runtime.beginRead(tableHandle, request));
+  beginRead(tableHandle: string | number, request: unknown): AdapterOperationStep | Promise<AdapterOperationStep> {
+    return this.#callMapped(
+      "beginRead",
+      () => this.#runtime.beginRead(tableHandle, request),
+      (value) => this.#acceptInitialStep(value, "read"),
+    );
   }
 
   cancelOperation(operationHandle: string | number): void {
+    this.#operations.delete(operationHandle);
     this.#call("cancelOperation", () => this.#runtime.cancelOperation(operationHandle));
   }
 
@@ -208,6 +230,7 @@ export class WasmAdapter implements AdapterRuntime {
   }
 
   shutdown(): void {
+    this.#operations.clear();
     this.#call("shutdown", () => this.#runtime.shutdown());
   }
 
@@ -228,11 +251,11 @@ export class WasmAdapter implements AdapterRuntime {
       "batchLayoutVersion",
       "adapterId",
       "beginOpen",
+      "beginOpenTable",
+      "beginMetadata",
+      "beginPresentation",
+      "beginPresentationRange",
       "continueOperation",
-      "openTable",
-      "metadata",
-      "presentation",
-      "readPresentationRange",
       "beginRead",
       "cancelOperation",
       "closeTable",
@@ -271,4 +294,201 @@ export class WasmAdapter implements AdapterRuntime {
       throw faultFromUnknown(error, `WebAssembly ${operation} failed`);
     }
   }
+
+  #callMapped<T>(
+    operation: string,
+    call: () => unknown,
+    map: (value: unknown) => T,
+  ): T | Promise<T> {
+    let value: unknown;
+    try {
+      value = call();
+    } catch (error) {
+      throw faultFromUnknown(error, `WebAssembly ${operation} failed`);
+    }
+    if (isPromiseLike(value)) {
+      return Promise.resolve(value).then(
+        map,
+        (error) => { throw faultFromUnknown(error, `WebAssembly ${operation} failed`); },
+      );
+    }
+    return map(value);
+  }
+
+  #acceptInitialStep(value: unknown, operation: string): AdapterOperationStep {
+    const step = normalizeOperationStep(value);
+    if (step.operationRevision !== 1) {
+      throw new ProtocolFault(
+        "PROTOCOL_INCOMPATIBLE",
+        `Adapter ${operation} operation must begin at revision 1`,
+      );
+    }
+    if (this.#operations.has(step.operationHandle)) {
+      throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter reused an active operation handle");
+    }
+    this.#trackStep(step);
+    return step;
+  }
+
+  #acceptContinuedStep(
+    value: unknown,
+    operationHandle: string | number,
+    previousRevision: number,
+  ): AdapterOperationStep {
+    const step = normalizeOperationStep(value);
+    if (step.operationHandle !== operationHandle) {
+      throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter changed its operation handle");
+    }
+    if (step.operationRevision !== previousRevision + 1) {
+      throw new ProtocolFault(
+        "PROTOCOL_INCOMPATIBLE",
+        "Adapter returned a missing, duplicate, or stale operation revision",
+      );
+    }
+    this.#trackStep(step);
+    return step;
+  }
+
+  #trackStep(step: AdapterOperationStep): void {
+    if (step.kind === "complete") {
+      this.#operations.delete(step.operationHandle);
+      return;
+    }
+    this.#operations.set(step.operationHandle, Object.freeze({
+      revision: step.operationRevision,
+      actions: step.actions,
+    }));
+  }
+}
+
+const MAX_ACTIONS_PER_STEP = 32;
+
+function normalizeOperationStep(value: unknown): AdapterOperationStep {
+  if (!isRecord(value)) {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter operation step must be an object");
+  }
+  const kind = value.kind;
+  if (kind !== "pending" && kind !== "progress" && kind !== "complete") {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter operation step has an invalid kind");
+  }
+  const operationHandle = normalizeHandle(value.operationHandle, "operationHandle");
+  const operationRevision = positiveSafeInteger(value.operationRevision, "operationRevision");
+  if (!Array.isArray(value.actions) || value.actions.length > MAX_ACTIONS_PER_STEP) {
+    throw new ProtocolFault(
+      "PROTOCOL_INCOMPATIBLE",
+      `Adapter operation step may request at most ${MAX_ACTIONS_PER_STEP} ranges`,
+    );
+  }
+  const indexes = new Set<number>();
+  let totalBytes = 0;
+  const actions = value.actions.map((entry, position) => {
+    if (!isRecord(entry) || entry.kind !== "read-bytes") {
+      throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", `Adapter action ${position} is invalid`);
+    }
+    const actionIndex = nonNegativeSafeInteger(entry.actionIndex, `actions[${position}].actionIndex`);
+    if (actionIndex > 0xffff_ffff || indexes.has(actionIndex)) {
+      throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter action indexes must be unique u32 values");
+    }
+    indexes.add(actionIndex);
+    const offset = nonNegativeSafeInteger(entry.offset, `actions[${position}].offset`);
+    const length = nonNegativeSafeInteger(entry.length, `actions[${position}].length`);
+    totalBytes += length;
+    if (!Number.isSafeInteger(totalBytes)) {
+      throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter action bytes overflow safe integers");
+    }
+    return Object.freeze({ kind: "read-bytes" as const, actionIndex, offset, length });
+  });
+  const cooperativeYield = value.cooperativeYield === true;
+  if (kind === "complete" && (actions.length !== 0 || cooperativeYield)) {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "A complete adapter step requested more work");
+  }
+  if (kind !== "complete" && actions.length === 0 && !cooperativeYield) {
+    throw new ProtocolFault(
+      "PROTOCOL_INCOMPATIBLE",
+      "A pending adapter step without ranges must request a cooperative yield",
+    );
+  }
+  if (actions.length !== 0 && cooperativeYield) {
+    throw new ProtocolFault(
+      "PROTOCOL_INCOMPATIBLE",
+      "An adapter step cannot combine ranges with a cooperative yield",
+    );
+  }
+  return Object.freeze({
+    kind,
+    operationHandle,
+    operationRevision,
+    actions: Object.freeze(actions),
+    cooperativeYield,
+    ...operationStepPayload(value),
+  });
+}
+
+function operationStepPayload(value: Record<string, unknown>): Readonly<{ payload?: unknown }> {
+  if (value.payload !== undefined) return Object.freeze({ payload: value.payload });
+  const payload = Object.fromEntries(Object.entries(value).filter(([key]) => (
+    key !== "kind"
+    && key !== "operationHandle"
+    && key !== "operationRevision"
+    && key !== "actions"
+    && key !== "cooperativeYield"
+  )));
+  return Object.keys(payload).length === 0
+    ? Object.freeze({})
+    : Object.freeze({ payload: Object.freeze(payload) });
+}
+
+function validateActionResults(
+  results: readonly AdapterActionResult[],
+  actions: readonly AdapterReadAction[],
+): readonly AdapterActionResult[] {
+  if (!Array.isArray(results) || results.length !== actions.length) {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter action results are missing or unexpected");
+  }
+  const expected = new Map(actions.map((action) => [action.actionIndex, action]));
+  const seen = new Set<number>();
+  const normalized = results.map((result, position) => {
+    if (!isRecord(result)) {
+      throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", `Adapter action result ${position} is invalid`);
+    }
+    const actionIndex = nonNegativeSafeInteger(result.actionIndex, "result actionIndex");
+    const action = expected.get(actionIndex);
+    if (!action || seen.has(actionIndex)) {
+      throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter action result is duplicate or unexpected");
+    }
+    seen.add(actionIndex);
+    const offset = nonNegativeSafeInteger(result.offset, "result offset");
+    if (offset !== action.offset || !(result.bytes instanceof Uint8Array)) {
+      throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter action result does not match its range");
+    }
+    if (result.bytes.byteLength !== action.length || typeof result.eof !== "boolean") {
+      throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter action result has an invalid length or EOF flag");
+    }
+    return Object.freeze({ actionIndex, offset, bytes: result.bytes, eof: result.eof });
+  });
+  return Object.freeze(normalized);
+}
+
+function normalizeHandle(value: unknown, name: string): string | number {
+  if (typeof value === "string" && value.length > 0) return value;
+  return nonNegativeSafeInteger(value, name);
+}
+
+function positiveSafeInteger(value: unknown, name: string): number {
+  const normalized = nonNegativeSafeInteger(value, name);
+  if (normalized === 0) {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", `${name} must be positive`);
+  }
+  return normalized;
+}
+
+function nonNegativeSafeInteger(value: unknown, name: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", `${name} must be a non-negative safe integer`);
+  }
+  return value as number;
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return isRecord(value) && typeof value.then === "function";
 }

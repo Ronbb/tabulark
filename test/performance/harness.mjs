@@ -6,6 +6,7 @@ import {
 import { arrowIpcAdapter } from "../../dist/arrow.js";
 
 const NativeWorker = globalThis.Worker;
+const allowCacheRpc = new URL(location.href).searchParams.get("allow-cache-rpc") === "1";
 let workerMetrics = freshWorkerMetrics();
 let pendingFirstDataPaint = null;
 
@@ -140,6 +141,25 @@ async function runScenario({ expectedRows, requireMemory = true, scrollFrames = 
       rangeReadMs.push(performance.now() - started);
       rangeBatchBytes.push(workerMetrics.batchPayloadBytes - transferredBefore);
     }
+    const cacheRequest = {
+      rowStart: Math.min(7, Math.max(0, rowCount - 1)),
+      rowCount: Math.min(64, rowCount),
+      columnStart: 0,
+      columnCount,
+    };
+    const responsesBeforeCacheMiss = workerMetrics.batchResponses;
+    await table.readRange(cacheRequest);
+    const responsesAfterCacheMiss = workerMetrics.batchResponses;
+    const cacheHitStart = performance.now();
+    await table.readRange(cacheRequest);
+    const cacheHitMs = performance.now() - cacheHitStart;
+    const responsesAfterCacheHit = workerMetrics.batchResponses;
+    if (
+      responsesAfterCacheMiss <= responsesBeforeCacheMiss
+      || (!allowCacheRpc && responsesAfterCacheHit !== responsesAfterCacheMiss)
+    ) {
+      throw new Error("main-thread cache hit performed another Worker batch RPC");
+    }
 
     const scroller = view.element.querySelector("[data-tabulark-scroll]");
     if (!(scroller instanceof HTMLElement)) {
@@ -149,6 +169,7 @@ async function runScenario({ expectedRows, requireMemory = true, scrollFrames = 
     await nextAnimationFrame();
     await measureMemory("scroll-complete");
 
+    const lifecycleStart = performance.now();
     view.destroy();
     view = undefined;
     await table.close();
@@ -157,6 +178,7 @@ async function runScenario({ expectedRows, requireMemory = true, scrollFrames = 
     dataset = undefined;
     await engine.close();
     engine = undefined;
+    const lifecycleCloseMs = performance.now() - lifecycleStart;
     await nextAnimationFrame();
     await measureMemory("closed");
 
@@ -175,6 +197,11 @@ async function runScenario({ expectedRows, requireMemory = true, scrollFrames = 
         mibPerSecond: source.size / (1024 * 1024) / (completedScanMs / 1000),
       },
       rangeRead: summarize(rangeReadMs, { samples: rangeReadMs }),
+      cacheHit: {
+        durationMs: cacheHitMs,
+        workerBatchResponses: responsesAfterCacheHit - responsesAfterCacheMiss,
+      },
+      lifecycleCloseMs,
       rangeBatchBytes,
       scroll: summarize(scrollMeasurement.frameDeltas, {
         frames: scrollMeasurement.frameDeltas.length,

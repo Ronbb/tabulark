@@ -59,8 +59,8 @@ jobs:
       - name: Build static site
         run: npm run build:pages
 
-      - name: Install Chromium
-        run: npx --no-install playwright install --with-deps chromium
+      - name: Install pinned desktop browsers
+        run: npx --no-install playwright install --with-deps chromium firefox webkit
 
       - name: Test the assembled Pages artifact
         run: >-
@@ -107,8 +107,8 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Install Chromium
-        run: npx --no-install playwright install --with-deps chromium
+      - name: Install pinned desktop browsers
+        run: npx --no-install playwright install --with-deps chromium firefox webkit
 
       - name: Smoke-test the deployed Pages URL
         env:

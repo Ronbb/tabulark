@@ -63,6 +63,36 @@ test("large Blob mode permits the exact 2 GiB boundary and keeps ArrayBuffer lim
   }
 });
 
+test("large mode is reserved for local Blob or File sources", async () => {
+  const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  Object.defineProperty(globalThis, "Worker", {
+    configurable: true,
+    writable: true,
+    value: SourceModeWorker,
+  });
+  let engine;
+  try {
+    engine = await createEngine({ adapters: [delimitedAdapter] });
+    await assert.rejects(
+      engine.open(new ArrayBuffer(8), {
+        adapter: delimitedAdapter,
+        sourceMode: "large",
+      }),
+      (error) => {
+        assert.equal(error.code, "INVALID_ARGUMENT");
+        return true;
+      },
+    );
+    assert.equal(
+      SourceModeWorker.latest.requests.some((request) => request.op === "openSource"),
+      false,
+    );
+  } finally {
+    await engine?.close();
+    restoreWorker(originalWorker);
+  }
+});
+
 class SizedBlob extends Blob {
   #reportedSize;
 
@@ -103,8 +133,8 @@ class SourceModeWorker {
       result = {
         kind: "hello",
         data: {
-          protocolVersion: 3,
-          adapterApiVersion: 2,
+          protocolVersion: 4,
+          adapterApiVersion: 3,
           batchLayoutVersion: 1,
           adapters: request.payload.adapters.map(({ id }) => id),
         },
@@ -118,7 +148,7 @@ class SourceModeWorker {
     }
     queueMicrotask(() => {
       const response = {
-        protocolVersion: 3,
+        protocolVersion: 4,
         requestId: request.requestId,
         status: "success",
         result,

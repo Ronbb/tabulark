@@ -1,0 +1,10 @@
+{
+  "kind": "pending",
+  "operationHandle": 17,
+  "operationRevision": 1,
+  "actions": [
+    { "kind": "read-bytes", "actionIndex": 0, "offset": 0, "length": 4096 },
+    { "kind": "read-bytes", "actionIndex": 1, "offset": 2147482624, "length": 1024 }
+  ],
+  "cooperativeYield": false
+}

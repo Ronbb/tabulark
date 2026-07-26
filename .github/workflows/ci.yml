@@ -196,10 +196,12 @@ jobs:
         run: npm run pages:check
 
   browser:
-    name: Chromium Worker, accessibility, presentation, and visual integration
+    name: Chromium, Firefox, and WebKit release browser gates
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -233,20 +235,22 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Install Chromium
-        run: npx --no-install playwright install --with-deps chromium
+      - name: Install pinned desktop browsers
+        run: npx --no-install playwright install --with-deps chromium firefox webkit
 
-      - name: Record exact Chromium version
+      - name: Record exact browser versions
         shell: bash
         run: |
           mkdir -p target/bench
-          node --input-type=module <<'NODE' > target/bench/chromium-version.txt
-          import { chromium } from "@playwright/test";
-          const browser = await chromium.launch({ headless: true });
-          console.log(`Playwright 1.61.1 / Chromium ${await browser.version()}`);
-          await browser.close();
+          node --input-type=module <<'NODE' > target/bench/browser-versions.txt
+          import { chromium, firefox, webkit } from "@playwright/test";
+          for (const [name, type] of Object.entries({ Chromium: chromium, Firefox: firefox, WebKit: webkit })) {
+            const browser = await type.launch({ headless: true });
+            console.log(`Playwright 1.61.1 / ${name} ${await browser.version()}`);
+            await browser.close();
+          }
           NODE
-          cat target/bench/chromium-version.txt
+          cat target/bench/browser-versions.txt
 
       - name: Build JavaScript and WebAssembly
         run: npm run build
@@ -266,17 +270,40 @@ jobs:
       - name: Enforce package and site size budgets
         run: npm run benchmark:size
 
+      - name: Compare paired Chromium medians with the frozen P0 runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate="$GITHUB_WORKSPACE"
+          baseline="$RUNNER_TEMP/tabulark-p0"
+          baseline_sha="$(jq -er .baselineSha test/performance/baselines/v0.2-p0.json)"
+          git worktree add --detach "$baseline" "$baseline_sha"
+          cleanup_worktree() {
+            git -C "$candidate" worktree remove --force "$baseline" || true
+          }
+          trap cleanup_worktree EXIT
+          (
+            cd "$baseline"
+            npm ci
+            npm run build
+          )
+          cp test/performance/harness.html "$baseline/test/performance/harness.html"
+          cp test/performance/harness.mjs "$baseline/test/performance/harness.mjs"
+          cp test/performance/run-browser.mjs "$baseline/test/performance/run-browser.mjs"
+          node scripts/run-performance-gate.mjs --baseline-root "$baseline"
+
       - name: Upload performance measurements
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: performance-smoke-${{ github.sha }}
           path: |
-            target/bench/chromium-version.txt
+            target/bench/browser-versions.txt
             target/bench/performance-smoke.json
             target/bench/performance-arrow-*.json
             target/bench/performance-format-adapters.json
             target/bench/package-sizes.json
+            target/bench/performance-gate/
           if-no-files-found: ignore
           retention-days: 14
 

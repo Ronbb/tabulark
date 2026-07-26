@@ -89,10 +89,12 @@ test.describe("CSV preview example", () => {
 
   test("cancels an opening source and retries the same File", async ({ page }) => {
     let delayWorker = true;
+    let releaseWorker;
+    const workerBlocked = new Promise((resolve) => { releaseWorker = resolve; });
     await page.route("**/dist/worker.js", async (route) => {
       if (delayWorker) {
         delayWorker = false;
-        await new Promise((resolve) => setTimeout(resolve, 650));
+        await workerBlocked;
       }
       await route.continue();
     });
@@ -109,7 +111,8 @@ test.describe("CSV preview example", () => {
     await expect(page.getByTestId("advanced-options")).toHaveAttribute("inert", "");
     await expect(page.getByTestId("file-picker")).toHaveAttribute("aria-disabled", "true");
     await expect(page.getByTestId("cancel-button")).toBeFocused();
-    await page.getByTestId("cancel-button").click();
+    await page.getByTestId("cancel-button").evaluate((button) => button.click());
+    releaseWorker();
 
     await expect(page.getByTestId("app")).toHaveAttribute("data-state", "cancelled");
     await expect(page.getByTestId("state-label")).toHaveText("Cancelled");

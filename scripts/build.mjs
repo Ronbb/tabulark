@@ -53,16 +53,12 @@ await Promise.all([
   }),
   build({
     ...shared,
+    // The Worker is a private protocol endpoint: compact its internal names
+    // while keeping source maps for diagnostics. This pays for ABI-v3
+    // validation without relaxing the frozen P0 Worker-size ceiling.
+    minifyIdentifiers: true,
     entryPoints: [fileURLToPath(new URL("js/worker.ts", rootUrl))],
     outfile: fileURLToPath(new URL("dist/worker.js", rootUrl)),
-  }),
-  // The large XLSX parser is loaded by the Worker only for an explicit
-  // `sourceMode: "large"` + `format: "xlsx"` open. Keep it out of the core
-  // Worker bundle so the established core delivery budget remains intact.
-  build({
-    ...shared,
-    entryPoints: [fileURLToPath(new URL("js/worker/large-excel-adapter.ts", rootUrl))],
-    outfile: fileURLToPath(new URL("dist/worker/large-excel-adapter.js", rootUrl)),
   }),
 ]);
 

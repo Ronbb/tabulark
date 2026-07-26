@@ -1,19 +1,21 @@
-//! Adapter-ABI-v2 WebAssembly exports for the dedicated delimited artifact.
+//! Adapter-ABI-v3 WebAssembly exports for the dedicated delimited artifact.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use serde::Serialize;
-use wasm_bindgen::JsValue;
 use wasm_bindgen::prelude::wasm_bindgen;
+use wasm_bindgen::{JsCast, JsValue};
 
 use crate::csv::{CsvDiagnostic, DelimitedOptions};
 use crate::error::{ErrorCode, TabularkError};
 use crate::model::{RangeRequest, TableMetadata, TypedTableBatch};
 use crate::protocol::{
-    ADAPTER_API_VERSION, BATCH_LAYOUT_VERSION, DELIMITED_ADAPTER_ID, PROTOCOL_VERSION,
+    ADAPTER_API_VERSION, AdapterAction, AdapterActionResult, AdapterOperationCursor,
+    BATCH_LAYOUT_VERSION, DELIMITED_ADAPTER_ID, MAX_OPERATION_RANGES_PER_STEP, PROTOCOL_VERSION,
 };
+use crate::resource::{ResourceCategory, ResourceLedger};
 use crate::runtime::{FeedRangeResult, RangeHandle, Runtime, RuntimeConfig, SourceHandle};
 
 struct PendingOpen {
@@ -36,12 +38,19 @@ enum PendingOperation {
     Read(PendingRead),
 }
 
+struct TrackedOperation {
+    cursor: AdapterOperationCursor,
+    pending: PendingOperation,
+}
+
 struct State {
     runtime: Runtime,
     chunk_bytes: u64,
+    operation_budget_bytes: u64,
+    ledger: ResourceLedger,
     next_operation: u32,
     next_table: u32,
-    operations: HashMap<u32, PendingOperation>,
+    operations: HashMap<u32, TrackedOperation>,
     source_lengths: HashMap<SourceHandle, u64>,
     tables: HashMap<u32, SourceHandle>,
 }
@@ -86,13 +95,13 @@ impl State {
             .operations
             .iter()
             .filter_map(|(handle, operation)| {
-                matches!(operation, PendingOperation::Read(read) if read.table == table)
+                matches!(&operation.pending, PendingOperation::Read(read) if read.table == table)
                     .then_some(*handle)
             })
             .collect::<Vec<_>>();
         for handle in handles {
             if let Some(operation) = self.operations.remove(&handle) {
-                self.cancel_pending(operation);
+                self.cancel_pending(operation.pending);
             }
         }
     }
@@ -101,7 +110,7 @@ impl State {
         let handles = self
             .operations
             .iter()
-            .filter_map(|(handle, operation)| match operation {
+            .filter_map(|(handle, operation)| match &operation.pending {
                 PendingOperation::Open(open) if open.source == source => Some(*handle),
                 PendingOperation::Read(read) if read.source == source => Some(*handle),
                 _ => None,
@@ -109,7 +118,7 @@ impl State {
             .collect::<Vec<_>>();
         for handle in handles {
             if let Some(operation) = self.operations.remove(&handle) {
-                self.cancel_pending(operation);
+                self.cancel_pending(operation.pending);
             }
         }
     }
@@ -137,10 +146,18 @@ impl WasmRuntime {
                 "configured delimited chunk size exceeds the public range",
             ))
         })?;
+        let operation_budget_bytes = u64::try_from(config.memory_budget_bytes).map_err(|_| {
+            error_to_js(TabularkError::new(
+                ErrorCode::ResourceLimit,
+                "configured delimited operation budget exceeds u64",
+            ))
+        })?;
         Ok(Self {
             state: RefCell::new(State {
                 runtime: Runtime::new(config).map_err(error_to_js)?,
                 chunk_bytes,
+                operation_budget_bytes,
+                ledger: ResourceLedger::new(operation_budget_bytes).map_err(error_to_js)?,
                 next_operation: 1,
                 next_table: 1,
                 operations: HashMap::new(),
@@ -156,7 +173,7 @@ impl WasmRuntime {
         PROTOCOL_VERSION
     }
 
-    /// Returns official adapter ABI version two.
+    /// Returns official adapter ABI version three.
     #[wasm_bindgen(js_name = adapterApiVersion)]
     pub fn adapter_api_version(&self) -> u32 {
         ADAPTER_API_VERSION
@@ -172,6 +189,40 @@ impl WasmRuntime {
     #[wasm_bindgen(js_name = adapterId)]
     pub fn adapter_id(&self) -> String {
         DELIMITED_ADAPTER_ID.to_owned()
+    }
+
+    /// Returns the private adapter-owned resource ledger snapshot.
+    #[wasm_bindgen(js_name = resourceSnapshot)]
+    pub fn resource_snapshot(&self) -> std::result::Result<JsValue, JsValue> {
+        let wasm_memory_pages = current_wasm_memory_pages();
+        let mut state = self.state.borrow_mut();
+        let persistent = u64::try_from(state.runtime.retained_bytes()).map_err(|_| {
+            error_to_js(TabularkError::new(
+                ErrorCode::ResourceLimit,
+                "delimited retained-byte estimate exceeds u64",
+            ))
+        })?;
+        let active = state
+            .operations
+            .len()
+            .checked_mul(std::mem::size_of::<TrackedOperation>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| {
+                error_to_js(TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "delimited active-operation estimate overflows",
+                ))
+            })?;
+        state
+            .ledger
+            .replace(ResourceCategory::Persistent, persistent)
+            .map_err(error_to_js)?;
+        state
+            .ledger
+            .replace(ResourceCategory::ActiveOperation, active)
+            .map_err(error_to_js)?;
+        state.ledger.observe_wasm_memory_pages(wasm_memory_pages);
+        to_js(&state.ledger.snapshot())
     }
 
     /// Starts a progressive scan using bounded sequential byte actions.
@@ -217,14 +268,19 @@ impl WasmRuntime {
                 return Err(error_to_js(error));
             }
         };
+        let mut cursor = AdapterOperationCursor::new();
         let result = match open_operation_action(
             operation,
+            &mut cursor,
             action,
-            source,
-            &table_name,
-            &metadata,
-            &[],
-            0,
+            OpenProgress {
+                source,
+                table_name: &table_name,
+                metadata: &metadata,
+                warnings: &[],
+                bytes_scanned: 0,
+            },
+            state.operation_budget_bytes,
         ) {
             Ok(result) => result,
             Err(error) => {
@@ -233,31 +289,62 @@ impl WasmRuntime {
             }
         };
         state.source_lengths.insert(source, source_length);
-        state
-            .operations
-            .insert(operation, PendingOperation::Open(pending));
+        state.operations.insert(
+            operation,
+            TrackedOperation {
+                cursor,
+                pending: PendingOperation::Open(pending),
+            },
+        );
         Ok(result)
     }
 
-    /// Supplies exactly one requested source chunk and advances an open or
-    /// range-read operation.
+    /// Supplies a complete, revision-matched result set and advances an open
+    /// or range-read operation.
     #[wasm_bindgen(js_name = continueOperation)]
     pub fn continue_operation(
         &self,
         operation_handle: u32,
-        absolute_offset: f64,
-        bytes: Uint8Array,
-        eof: bool,
+        operation_revision: f64,
+        results: Array,
     ) -> std::result::Result<JsValue, JsValue> {
-        let absolute_offset = safe_u64(absolute_offset, "absoluteOffset")?;
-        let owned = bytes.to_vec();
+        let operation_revision = safe_u64(operation_revision, "operationRevision")?;
+        let mut results = operation_results(results)?;
+        let descriptors = results
+            .iter()
+            .map(|result| result.descriptor)
+            .collect::<Vec<_>>();
         let mut state = self.state.borrow_mut();
-        let pending = state.operations.remove(&operation_handle).ok_or_else(|| {
+        let tracked = state.operations.get_mut(&operation_handle).ok_or_else(|| {
             error_to_js(TabularkError::new(
                 ErrorCode::HandleClosed,
                 "delimited operation handle is closed",
             ))
         })?;
+        tracked
+            .cursor
+            .validate_results(operation_revision, &descriptors)
+            .map_err(error_to_js)?;
+        let TrackedOperation {
+            mut cursor,
+            pending,
+        } = state
+            .operations
+            .remove(&operation_handle)
+            .expect("validated operation remains registered");
+        if results.len() != 1 {
+            state
+                .operations
+                .insert(operation_handle, TrackedOperation { cursor, pending });
+            return Err(error_to_js(TabularkError::new(
+                ErrorCode::RuntimeFailure,
+                "delimited operations issue exactly one source range per step",
+            )));
+        }
+        let result = results.pop().expect("one validated result");
+        let absolute_offset = result.descriptor.offset;
+        let eof = result.descriptor.eof;
+        let owned = result.bytes;
         match pending {
             PendingOperation::Open(mut pending) => {
                 let expected = match read_action(
@@ -295,7 +382,10 @@ impl WasmRuntime {
                             return Err(error_to_js(error));
                         }
                     };
+                    let operation_revision = cursor.complete_revision().map_err(error_to_js)?;
                     match complete_open(
+                        operation_handle,
+                        operation_revision,
                         pending.source,
                         &pending.table_name,
                         &metadata,
@@ -323,12 +413,16 @@ impl WasmRuntime {
                     };
                     let result = match open_operation_action(
                         operation_handle,
+                        &mut cursor,
                         action,
-                        pending.source,
-                        &pending.table_name,
-                        &update.metadata,
-                        &update.warnings,
-                        pending.next_offset,
+                        OpenProgress {
+                            source: pending.source,
+                            table_name: &pending.table_name,
+                            metadata: &update.metadata,
+                            warnings: &update.warnings,
+                            bytes_scanned: pending.next_offset,
+                        },
+                        state.operation_budget_bytes,
                     ) {
                         Ok(result) => result,
                         Err(error) => {
@@ -336,9 +430,13 @@ impl WasmRuntime {
                             return Err(error);
                         }
                     };
-                    state
-                        .operations
-                        .insert(operation_handle, PendingOperation::Open(pending));
+                    state.operations.insert(
+                        operation_handle,
+                        TrackedOperation {
+                            cursor,
+                            pending: PendingOperation::Open(pending),
+                        },
+                    );
                     Ok(result)
                 }
             }
@@ -364,7 +462,10 @@ impl WasmRuntime {
                         .feed_range(pending.range, absolute_offset, &owned, eof)
                     {
                         Ok(update) => update,
-                        Err(error) => return Err(error_to_js(error)),
+                        Err(error) => {
+                            state.runtime.cancel(pending.range);
+                            return Err(error_to_js(error));
+                        }
                     };
                 match update {
                     FeedRangeResult::NeedMore {
@@ -392,21 +493,31 @@ impl WasmRuntime {
                                 return Err(error);
                             }
                         };
-                        let result = match operation_action(operation_handle, action) {
+                        let result = match operation_action(
+                            operation_handle,
+                            &mut cursor,
+                            action,
+                            state.operation_budget_bytes,
+                        ) {
                             Ok(result) => result,
                             Err(error) => {
                                 state.runtime.cancel(pending.range);
                                 return Err(error);
                             }
                         };
-                        state
-                            .operations
-                            .insert(operation_handle, PendingOperation::Read(pending));
+                        state.operations.insert(
+                            operation_handle,
+                            TrackedOperation {
+                                cursor,
+                                pending: PendingOperation::Read(pending),
+                            },
+                        );
                         Ok(result)
                     }
                     FeedRangeResult::Complete { batch, warnings } => {
-                        let batch = batch.to_typed().map_err(error_to_js)?;
-                        complete_batch(&batch, &warnings)
+                        let batch = batch.into_typed().map_err(error_to_js)?;
+                        let operation_revision = cursor.complete_revision().map_err(error_to_js)?;
+                        complete_batch(operation_handle, operation_revision, &batch, &warnings)
                     }
                 }
             }
@@ -437,6 +548,20 @@ impl WasmRuntime {
         Ok(result.into())
     }
 
+    /// Starts and synchronously completes an open-table operation using the
+    /// common ABI-v3 step envelope.
+    #[wasm_bindgen(js_name = beginOpenTable)]
+    pub fn begin_open_table(
+        &self,
+        source_handle: u32,
+        table_id: String,
+    ) -> std::result::Result<JsValue, JsValue> {
+        let opened = self.open_table(source_handle, table_id)?;
+        let mut state = self.state.borrow_mut();
+        let operation = state.allocate_operation()?;
+        complete_value(operation, "open-table", "table", opened)
+    }
+
     /// Returns exact metadata for an opened table.
     pub fn metadata(&self, table_handle: u32) -> std::result::Result<JsValue, JsValue> {
         let state = self.state.borrow();
@@ -448,6 +573,15 @@ impl WasmRuntime {
         })?;
         let metadata = state.runtime.metadata(source).map_err(error_to_js)?;
         to_js(&metadata)
+    }
+
+    /// Starts and synchronously completes a metadata operation.
+    #[wasm_bindgen(js_name = beginMetadata)]
+    pub fn begin_metadata(&self, table_handle: u32) -> std::result::Result<JsValue, JsValue> {
+        let metadata = self.metadata(table_handle)?;
+        let mut state = self.state.borrow_mut();
+        let operation = state.allocate_operation()?;
+        complete_value(operation, "metadata", "metadata", metadata)
     }
 
     /// Returns no static presentation for delimited text tables.
@@ -462,6 +596,15 @@ impl WasmRuntime {
         Ok(JsValue::NULL)
     }
 
+    /// Starts and synchronously completes a static-presentation operation.
+    #[wasm_bindgen(js_name = beginPresentation)]
+    pub fn begin_presentation(&self, table_handle: u32) -> std::result::Result<JsValue, JsValue> {
+        let presentation = self.presentation(table_handle)?;
+        let mut state = self.state.borrow_mut();
+        let operation = state.allocate_operation()?;
+        complete_value(operation, "presentation", "presentation", presentation)
+    }
+
     /// Returns no range presentation for delimited text tables.
     #[wasm_bindgen(js_name = readPresentationRange)]
     pub fn read_presentation_range(
@@ -471,6 +614,24 @@ impl WasmRuntime {
     ) -> std::result::Result<JsValue, JsValue> {
         let _: RangeRequest = from_js(request)?;
         self.presentation(table_handle)
+    }
+
+    /// Starts and synchronously completes a range-presentation operation.
+    #[wasm_bindgen(js_name = beginPresentationRange)]
+    pub fn begin_presentation_range(
+        &self,
+        table_handle: u32,
+        request: JsValue,
+    ) -> std::result::Result<JsValue, JsValue> {
+        let presentation = self.read_presentation_range(table_handle, request)?;
+        let mut state = self.state.borrow_mut();
+        let operation = state.allocate_operation()?;
+        complete_value(
+            operation,
+            "presentation-range",
+            "presentation",
+            presentation,
+        )
     }
 
     /// Starts a checkpoint-backed range read using the common operation ABI.
@@ -499,7 +660,11 @@ impl WasmRuntime {
             .begin_range(source, request)
             .map_err(error_to_js)?;
         if let Some(batch) = start.batch {
-            return complete_batch(&batch.to_typed().map_err(error_to_js)?, &[]);
+            let operation = state.allocate_operation()?;
+            let mut cursor = AdapterOperationCursor::new();
+            let operation_revision = cursor.complete_revision().map_err(error_to_js)?;
+            let batch = batch.into_typed().map_err(error_to_js)?;
+            return complete_batch(operation, operation_revision, &batch, &[]);
         }
         let operation = match state.allocate_operation() {
             Ok(operation) => operation,
@@ -516,22 +681,27 @@ impl WasmRuntime {
                 return Err(error);
             }
         };
-        let result = match operation_action(operation, action) {
-            Ok(result) => result,
-            Err(error) => {
-                state.runtime.cancel(start.range_handle);
-                return Err(error);
-            }
-        };
+        let mut cursor = AdapterOperationCursor::new();
+        let result =
+            match operation_action(operation, &mut cursor, action, state.operation_budget_bytes) {
+                Ok(result) => result,
+                Err(error) => {
+                    state.runtime.cancel(start.range_handle);
+                    return Err(error);
+                }
+            };
         state.operations.insert(
             operation,
-            PendingOperation::Read(PendingRead {
-                source,
-                source_length,
-                next_offset,
-                range: start.range_handle,
-                table: table_handle,
-            }),
+            TrackedOperation {
+                cursor,
+                pending: PendingOperation::Read(PendingRead {
+                    source,
+                    source_length,
+                    next_offset,
+                    range: start.range_handle,
+                    table: table_handle,
+                }),
+            },
         );
         Ok(result)
     }
@@ -543,7 +713,7 @@ impl WasmRuntime {
         let Some(operation) = state.operations.remove(&operation_handle) else {
             return false;
         };
-        state.cancel_pending(operation);
+        state.cancel_pending(operation.pending);
         true
     }
 
@@ -573,6 +743,7 @@ impl WasmRuntime {
         state.tables.clear();
         state.source_lengths.clear();
         state.runtime.shutdown();
+        state.ledger.release_all();
     }
 }
 
@@ -635,10 +806,23 @@ fn validate_action(action: ReadAction, offset: u64, bytes: &[u8], eof: bool) -> 
 
 fn operation_action(
     operation_handle: u32,
+    cursor: &mut AdapterOperationCursor,
     action: ReadAction,
+    operation_budget_bytes: u64,
 ) -> std::result::Result<JsValue, JsValue> {
+    let operation_revision = cursor
+        .issue(
+            vec![AdapterAction::indexed_read_bytes(
+                0,
+                action.offset,
+                action.length,
+            )],
+            operation_budget_bytes,
+        )
+        .map_err(error_to_js)?;
     let action_value = Object::new();
     set(&action_value, "kind", JsValue::from_str("read-bytes"))?;
+    set(&action_value, "actionIndex", JsValue::from_f64(0.0))?;
     set(
         &action_value,
         "offset",
@@ -650,13 +834,21 @@ fn operation_action(
         JsValue::from_f64(action.length as f64),
     )?;
     let result = Object::new();
-    set(&result, "kind", JsValue::from_str("read-bytes"))?;
+    set(&result, "kind", JsValue::from_str("pending"))?;
     set(
         &result,
         "operationHandle",
         JsValue::from_f64(f64::from(operation_handle)),
     )?;
-    set(&result, "action", action_value.into())?;
+    set(
+        &result,
+        "operationRevision",
+        JsValue::from_f64(operation_revision as f64),
+    )?;
+    let actions = Array::new();
+    actions.push(&action_value);
+    set(&result, "actions", actions.into())?;
+    set(&result, "cooperativeYield", JsValue::from_bool(false))?;
     Ok(result.into())
 }
 
@@ -665,36 +857,59 @@ fn operation_action(
 /// A Worker can hand the pending action to a background scan after its initial
 /// preview prefix is available, while range reads retain the common
 /// `read-bytes` action contract unchanged.
+struct OpenProgress<'a> {
+    source: SourceHandle,
+    table_name: &'a str,
+    metadata: &'a TableMetadata,
+    warnings: &'a [CsvDiagnostic],
+    bytes_scanned: u64,
+}
+
 fn open_operation_action(
     operation_handle: u32,
+    cursor: &mut AdapterOperationCursor,
     action: ReadAction,
-    source: SourceHandle,
-    table_name: &str,
-    metadata: &TableMetadata,
-    warnings: &[CsvDiagnostic],
-    bytes_scanned: u64,
+    progress: OpenProgress<'_>,
+    operation_budget_bytes: u64,
 ) -> std::result::Result<JsValue, JsValue> {
-    let result = Object::from(operation_action(operation_handle, action)?);
-    set(&result, "kind", JsValue::from_str("open-progress"))?;
+    let result = Object::from(operation_action(
+        operation_handle,
+        cursor,
+        action,
+        operation_budget_bytes,
+    )?);
+    set(&result, "kind", JsValue::from_str("progress"))?;
+    set(&result, "operationKind", JsValue::from_str("open"))?;
     set(
         &result,
         "sourceHandle",
-        JsValue::from_f64(f64::from(source.get())),
+        JsValue::from_f64(f64::from(progress.source.get())),
     )?;
-    set(&result, "metadata", to_js(metadata)?)?;
-    set(&result, "tables", table_descriptors(table_name)?.into())?;
+    set(&result, "metadata", to_js(progress.metadata)?)?;
+    set(
+        &result,
+        "tables",
+        table_descriptors(progress.table_name)?.into(),
+    )?;
     set(
         &result,
         "progress",
-        progress_value(source, metadata, bytes_scanned, false)?,
+        progress_value(
+            progress.source,
+            progress.metadata,
+            progress.bytes_scanned,
+            false,
+        )?,
     )?;
-    if !warnings.is_empty() {
-        set(&result, "warnings", to_js(warnings)?)?;
+    if !progress.warnings.is_empty() {
+        set(&result, "warnings", to_js(progress.warnings)?)?;
     }
     Ok(result.into())
 }
 
 fn complete_open(
+    operation_handle: u32,
+    operation_revision: u64,
     source: SourceHandle,
     table_name: &str,
     metadata: &TableMetadata,
@@ -702,7 +917,20 @@ fn complete_open(
     bytes_scanned: u64,
 ) -> std::result::Result<JsValue, JsValue> {
     let result = Object::new();
-    set(&result, "kind", JsValue::from_str("open-complete"))?;
+    set(&result, "kind", JsValue::from_str("complete"))?;
+    set(&result, "operationKind", JsValue::from_str("open"))?;
+    set(
+        &result,
+        "operationHandle",
+        JsValue::from_f64(f64::from(operation_handle)),
+    )?;
+    set(
+        &result,
+        "operationRevision",
+        JsValue::from_f64(operation_revision as f64),
+    )?;
+    set(&result, "actions", Array::new().into())?;
+    set(&result, "cooperativeYield", JsValue::from_bool(false))?;
     set(
         &result,
         "sourceHandle",
@@ -757,16 +985,145 @@ fn progress_value(
 }
 
 fn complete_batch(
+    operation_handle: u32,
+    operation_revision: u64,
     batch: &TypedTableBatch,
     warnings: &[CsvDiagnostic],
 ) -> std::result::Result<JsValue, JsValue> {
     let result = Object::new();
-    set(&result, "kind", JsValue::from_str("read-complete"))?;
+    set(&result, "kind", JsValue::from_str("complete"))?;
+    set(&result, "operationKind", JsValue::from_str("read"))?;
+    set(
+        &result,
+        "operationHandle",
+        JsValue::from_f64(f64::from(operation_handle)),
+    )?;
+    set(
+        &result,
+        "operationRevision",
+        JsValue::from_f64(operation_revision as f64),
+    )?;
+    set(&result, "actions", Array::new().into())?;
+    set(&result, "cooperativeYield", JsValue::from_bool(false))?;
     set(&result, "batch", batch_to_js(batch)?)?;
     if !warnings.is_empty() {
         set(&result, "warnings", to_js(warnings)?)?;
     }
     Ok(result.into())
+}
+
+fn complete_value(
+    operation_handle: u32,
+    operation_kind: &str,
+    field: &str,
+    value: JsValue,
+) -> std::result::Result<JsValue, JsValue> {
+    let mut cursor = AdapterOperationCursor::new();
+    let operation_revision = cursor.complete_revision().map_err(error_to_js)?;
+    let result = Object::new();
+    set(&result, "kind", JsValue::from_str("complete"))?;
+    set(&result, "operationKind", JsValue::from_str(operation_kind))?;
+    set(
+        &result,
+        "operationHandle",
+        JsValue::from_f64(f64::from(operation_handle)),
+    )?;
+    set(
+        &result,
+        "operationRevision",
+        JsValue::from_f64(operation_revision as f64),
+    )?;
+    set(&result, "actions", Array::new().into())?;
+    set(&result, "cooperativeYield", JsValue::from_bool(false))?;
+    set(&result, field, value)?;
+    Ok(result.into())
+}
+
+struct OwnedActionResult {
+    descriptor: AdapterActionResult,
+    bytes: Vec<u8>,
+}
+
+fn operation_results(results: Array) -> std::result::Result<Vec<OwnedActionResult>, JsValue> {
+    let count = usize::try_from(results.length()).map_err(|_| {
+        error_to_js(TabularkError::new(
+            ErrorCode::ResourceLimit,
+            "delimited result count exceeds usize",
+        ))
+    })?;
+    if count > MAX_OPERATION_RANGES_PER_STEP {
+        return Err(error_to_js(
+            TabularkError::new(
+                ErrorCode::ResourceLimit,
+                "delimited operation supplied too many source results",
+            )
+            .with_detail("resultCount", count)
+            .with_detail("maxResultCount", MAX_OPERATION_RANGES_PER_STEP),
+        ));
+    }
+    let mut parsed = Vec::with_capacity(count);
+    for index in 0..results.length() {
+        let value = results.get(index);
+        if !value.is_object() {
+            return Err(invalid_operation_result(index, "result must be an object"));
+        }
+        let action_index = result_number(&value, "actionIndex", index)?;
+        let action_index = u32::try_from(action_index)
+            .map_err(|_| invalid_operation_result(index, "actionIndex exceeds the u32 range"))?;
+        let offset = result_number(&value, "offset", index)?;
+        let bytes = Reflect::get(&value, &JsValue::from_str("bytes"))
+            .map_err(|_| invalid_operation_result(index, "bytes getter failed"))?
+            .dyn_into::<Uint8Array>()
+            .map_err(|_| invalid_operation_result(index, "bytes must be a Uint8Array"))?;
+        let eof = Reflect::get(&value, &JsValue::from_str("eof"))
+            .map_err(|_| invalid_operation_result(index, "eof getter failed"))?
+            .as_bool()
+            .ok_or_else(|| invalid_operation_result(index, "eof must be a boolean"))?;
+        let owned = bytes.to_vec();
+        let length = u64::try_from(owned.len())
+            .map_err(|_| invalid_operation_result(index, "result byte length exceeds u64"))?;
+        parsed.push(OwnedActionResult {
+            descriptor: AdapterActionResult {
+                action_index,
+                offset,
+                length,
+                eof,
+            },
+            bytes: owned,
+        });
+    }
+    Ok(parsed)
+}
+
+fn result_number(value: &JsValue, field: &str, index: u32) -> std::result::Result<u64, JsValue> {
+    let number = Reflect::get(value, &JsValue::from_str(field))
+        .map_err(|_| invalid_operation_result(index, "numeric field getter failed"))?
+        .as_f64()
+        .ok_or_else(|| invalid_operation_result(index, "numeric field must be a number"))?;
+    safe_u64(number, field)
+}
+
+fn invalid_operation_result(index: u32, reason: &str) -> JsValue {
+    error_to_js(
+        TabularkError::new(
+            ErrorCode::InvalidArgument,
+            "invalid delimited operation result",
+        )
+        .with_detail("resultIndex", index)
+        .with_detail("reason", reason),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn current_wasm_memory_pages() -> u64 {
+    let memory: js_sys::WebAssembly::Memory = wasm_bindgen::memory().unchecked_into();
+    let buffer: js_sys::ArrayBuffer = memory.buffer().unchecked_into();
+    u64::from(buffer.byte_length()).div_ceil(64 * 1024)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const fn current_wasm_memory_pages() -> u64 {
+    0
 }
 
 fn batch_to_js(batch: &TypedTableBatch) -> std::result::Result<JsValue, JsValue> {

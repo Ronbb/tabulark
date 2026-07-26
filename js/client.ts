@@ -43,10 +43,13 @@ import {
   type OfficialSourceAccess,
 } from "./official-adapter-manifest.js";
 import {
+  type BatchBacking,
   ByteLruCache,
-  cloneWireTableBatch,
+  createBatchBacking,
   rangeCacheKey,
-  rangeCacheKeyBelongsTo,
+  rangeCacheKeyBelongsToDataset,
+  rangeCacheKeyBelongsToTable,
+  rangeCacheKeyMatchesVersion,
   wireBatchByteLength,
 } from "./range-cache.js";
 import { WorkerRpcClient, type OperationTelemetry } from "./rpc-client.js";
@@ -67,6 +70,8 @@ const MAX_ORPHAN_EVENTS = 256;
 const MAX_DIAGNOSTICS = 1_000;
 const MAX_DIAGNOSTIC_MESSAGE_LENGTH = 512;
 const MAX_PERFORMANCE_SAMPLES = 128;
+const MIN_BATCH_CACHE_ENTRY_BYTES = 4 * 1024;
+const MAX_BATCH_CACHE_ENTRIES = 512;
 
 export interface OpenSourceOptions<Options = unknown> {
   /** One of the official descriptors registered when the engine was created. */
@@ -76,8 +81,8 @@ export interface OpenSourceOptions<Options = unknown> {
    * Selects the bounded default source path or the local Blob path that may
    * address files up to 2 GiB. Defaults to `auto`.
    *
-   * Large mode never changes ArrayBuffer staging limits; callers must provide
-   * a `File`/`Blob` for sources beyond those limits.
+   * Large mode is reserved for local `File`/`Blob` inputs and never changes
+   * ArrayBuffer staging limits.
    */
   readonly sourceMode?: SourceMode;
   /** Detaches an ArrayBuffer input. Defaults to false; Blob input cannot be transferred. */
@@ -110,6 +115,10 @@ export interface SourceWarning {
   readonly handle: string;
   readonly kind: string;
   readonly message: string;
+  readonly tableId?: string;
+  readonly resource?: string;
+  readonly requiredBytes?: number;
+  readonly availableBytes?: number;
   readonly byteOffset?: number;
   /** Compatible alias used by structured diagnostics. */
   readonly sourceOffset?: number;
@@ -123,6 +132,9 @@ export interface TabularkDiagnostic {
   readonly severity: "warning" | "error";
   readonly message: string;
   readonly recoverable: boolean;
+  readonly resource?: string;
+  readonly requiredBytes?: number;
+  readonly availableBytes?: number;
   readonly sourceOffset?: number;
   readonly tableId?: string;
   readonly revision?: number;
@@ -227,9 +239,22 @@ interface DatasetCapabilitySeed {
   readonly typedValues: boolean;
 }
 
+interface RangeSingleflight {
+  readonly key: string;
+  readonly datasetHandle: string;
+  readonly tableId: string;
+  readonly controller: AbortController;
+  readonly callers: Set<symbol>;
+  promise: Promise<BatchBacking>;
+  settled: boolean;
+  bytesRead: number;
+  peakReservationBytes: number;
+}
+
 class Engine implements TabularkEngine {
   readonly #rpc: WorkerRpcClient;
-  readonly #rangeCache: ByteLruCache<WireTableBatch>;
+  readonly #rangeCache: ByteLruCache<BatchBacking>;
+  readonly #rangeSingleflight = new Map<string, RangeSingleflight>();
   readonly #limits: MemoryBudgetLimits;
   readonly #maxArrayBufferBytes: number;
   readonly #adapters: ReadonlyMap<OfficialAdapterId, AdapterRegistration>;
@@ -247,7 +272,13 @@ class Engine implements TabularkEngine {
   ) {
     this.#rpc = rpc;
     this.#limits = limits;
-    this.#rangeCache = new ByteLruCache(limits.mainThreadRangeCacheBytes);
+    this.#rangeCache = new ByteLruCache(limits.mainThreadRangeCacheBytes, {
+      maxEntries: Math.min(
+        MAX_BATCH_CACHE_ENTRIES,
+        Math.max(1, Math.floor(limits.mainThreadRangeCacheBytes / MIN_BATCH_CACHE_ENTRY_BYTES)),
+      ),
+      minimumEntryBytes: MIN_BATCH_CACHE_ENTRY_BYTES,
+    });
     this.#maxArrayBufferBytes = limits.maxArrayBufferBytes;
     this.#adapters = new Map(adapters.map((adapter) => [adapter.id, adapter]));
   }
@@ -395,6 +426,9 @@ class Engine implements TabularkEngine {
       let sourceBytes: number;
       const transfer: Transferable[] = [];
       if (source instanceof ArrayBuffer) {
+        if (normalizedOptions.sourceMode === "large") {
+          throw invalidArgument("sourceMode large requires a local Blob or File source");
+        }
         sourceBytes = source.byteLength;
         if (source.byteLength > this.#maxArrayBufferBytes) {
           throw new TabularkError(
@@ -478,7 +512,6 @@ class Engine implements TabularkEngine {
           createDatasetCapabilitySeed(
             normalizedOptions.adapter.id,
             normalizedOptions.options,
-            sourceBytes,
             tableDescriptors,
             normalizedOptions.sourceMode,
             this.#stagedSourceLimit(normalizedOptions.adapter.id),
@@ -522,6 +555,7 @@ class Engine implements TabularkEngine {
       session.closeLocally();
     }
     this.#sessions.clear();
+    this.#abortRangeSingleflights();
     this.#rangeCache.clear();
     this.#clearOrphanEvents();
     try {
@@ -607,14 +641,7 @@ class Engine implements TabularkEngine {
     let bytesRead = 0;
     let cacheHit = false;
     let peakReservationBytes = 0;
-    const onTelemetry = (telemetry: OperationTelemetry | undefined): void => {
-      if (!telemetry) return;
-      // A single logical range can require several bounded source reads (for
-      // example a footer, index, and page). Report the total bytes observed by
-      // the Worker rather than only the largest individual slice.
-      bytesRead = addPerformanceBytes(bytesRead, telemetry.bytesRead);
-      peakReservationBytes = Math.max(peakReservationBytes, telemetry.peakReservationBytes);
-    };
+    let flight: RangeSingleflight | undefined;
     try {
       const normalized = validateRange(request);
       if (options.signal?.aborted) {
@@ -622,7 +649,8 @@ class Engine implements TabularkEngine {
       }
       const metadata = table.metadata;
       const key = rangeCacheKey(
-        table.handle,
+        table.datasetHandle,
+        metadata.tableId,
         metadata.revision,
         metadata.schema.version,
         normalized,
@@ -630,37 +658,172 @@ class Engine implements TabularkEngine {
       const cached = this.#rangeCache.get(key);
       if (cached) {
         cacheHit = true;
-        return new ColumnarTableBatch(cloneWireTableBatch(cached));
+        return new ColumnarTableBatch(cached);
       }
-      const batch = await this.#rpc.request<WireTableBatch>(
-        "readRange",
-        { tableHandle: table.handle, range: normalized },
-        "batch",
-        {
-          ...(options.signal ? { signal: options.signal } : {}),
-          ...(startedAt === undefined ? {} : { measure: true, onTelemetry }),
-        },
-      );
-      this.#assertOpen();
-      table.assertOpen();
-      // Incomplete batches end at a progressive indexed-prefix boundary. They
-      // are valid results for this instant, but caching them would hide rows
-      // discovered by subsequent Arrow Stream or delimited scan progress.
-      if (batch.complete) {
-        const cachedBatch = cloneWireTableBatch(batch);
-        this.#rangeCache.set(
-          rangeCacheKey(table.handle, batch.revision, batch.schemaVersion, normalized),
-          cachedBatch,
-          wireBatchByteLength(cachedBatch),
+      flight = this.#rangeSingleflight.get(key);
+      if (!flight) {
+        flight = this.#createRangeSingleflight(
+          table,
+          normalized,
+          key,
+          metadata.revision,
+          metadata.schema.version,
+          startedAt !== undefined,
         );
       }
-      return new ColumnarTableBatch(batch);
+      const backing = await this.#joinRangeSingleflight(flight, options.signal);
+      bytesRead = flight.bytesRead;
+      peakReservationBytes = flight.peakReservationBytes;
+      this.#assertOpen();
+      table.assertOpen();
+      return new ColumnarTableBatch(backing);
     } finally {
+      if (flight) {
+        bytesRead = flight.bytesRead;
+        peakReservationBytes = flight.peakReservationBytes;
+      }
       this.#emitPerformanceSample("read-range", startedAt, {
         bytesRead,
         cacheHit,
         peakReservationBytes,
       });
+    }
+  }
+
+  #createRangeSingleflight(
+    table: TableHandleImpl,
+    range: RangeRequest,
+    key: string,
+    revision: number,
+    schemaVersion: number,
+    measure: boolean,
+  ): RangeSingleflight {
+    const controller = new AbortController();
+    const flight: RangeSingleflight = {
+      key,
+      datasetHandle: table.datasetHandle,
+      tableId: table.metadata.tableId,
+      controller,
+      callers: new Set(),
+      promise: undefined as unknown as Promise<BatchBacking>,
+      settled: false,
+      bytesRead: 0,
+      peakReservationBytes: 0,
+    };
+    const onTelemetry = (telemetry: OperationTelemetry | undefined): void => {
+      if (!telemetry) return;
+      flight.bytesRead = addPerformanceBytes(flight.bytesRead, telemetry.bytesRead);
+      flight.peakReservationBytes = Math.max(
+        flight.peakReservationBytes,
+        telemetry.peakReservationBytes,
+      );
+    };
+    flight.promise = this.#rpc.request<WireTableBatch>(
+      "readRange",
+      { tableHandle: table.handle, range },
+      "batch",
+      {
+        signal: controller.signal,
+        ...(measure ? { measure: true, onTelemetry } : {}),
+      },
+    ).then((batch) => {
+      const backing = this.#validateBatchBacking(
+        batch,
+        table.metadata.tableId,
+        revision,
+        schemaVersion,
+        range,
+      );
+      // Incomplete batches end at a progressive indexed-prefix boundary. They
+      // are valid for this instant but must not hide subsequently indexed rows.
+      if (
+        backing.complete
+        && backing.revision === revision
+        && backing.schemaVersion === schemaVersion
+        && table.metadata.revision === revision
+        && table.metadata.schema.version === schemaVersion
+        && !table.datasetClosed
+      ) {
+        this.#rangeCache.set(key, backing, wireBatchByteLength(backing));
+      }
+      return backing;
+    }).finally(() => {
+      flight.settled = true;
+      if (this.#rangeSingleflight.get(key) === flight) {
+        this.#rangeSingleflight.delete(key);
+      }
+    });
+    this.#rangeSingleflight.set(key, flight);
+    return flight;
+  }
+
+  async #joinRangeSingleflight(
+    flight: RangeSingleflight,
+    signal: AbortSignal | undefined,
+  ): Promise<BatchBacking> {
+    if (signal?.aborted) {
+      if (!flight.settled && flight.callers.size === 0) {
+        if (this.#rangeSingleflight.get(flight.key) === flight) {
+          this.#rangeSingleflight.delete(flight.key);
+        }
+        flight.controller.abort();
+      }
+      throw cancelledError();
+    }
+    const caller = Symbol("range-caller");
+    flight.callers.add(caller);
+    let abort: (() => void) | undefined;
+    try {
+      if (!signal) {
+        return await flight.promise;
+      }
+      const cancellation = new Promise<never>((_resolve, reject) => {
+        abort = () => reject(cancelledError());
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
+      });
+      return await Promise.race([flight.promise, cancellation]);
+    } finally {
+      if (abort) signal?.removeEventListener("abort", abort);
+      flight.callers.delete(caller);
+      if (!flight.settled && flight.callers.size === 0) {
+        if (this.#rangeSingleflight.get(flight.key) === flight) {
+          this.#rangeSingleflight.delete(flight.key);
+        }
+        // WorkerRpcClient owns the one protocol cancel message. Aborting this
+        // shared controller is idempotent even when several callers cancel in
+        // the same task turn.
+        flight.controller.abort();
+      }
+    }
+  }
+
+  #validateBatchBacking(
+    batch: WireTableBatch,
+    tableId: string,
+    revision: number,
+    schemaVersion: number,
+    requested: RangeRequest,
+  ): BatchBacking {
+    if (
+      !isRecord(batch)
+      || batch.tableId !== tableId
+      || !Number.isSafeInteger(batch.revision)
+      || batch.revision < revision
+      || !Number.isSafeInteger(batch.schemaVersion)
+      || batch.schemaVersion < schemaVersion
+      || !isReturnedRangeWithin(batch.range, requested)
+    ) {
+      throw this.#terminateForProtocolFailure("Worker returned a stale or out-of-range batch");
+    }
+    try {
+      const backing = createBatchBacking(batch);
+      // Validate every layout descriptor once before the backing can enter the
+      // cache. Subsequent facades reuse the same inaccessible ArrayBuffers.
+      new ColumnarTableBatch(backing);
+      return backing;
+    } catch {
+      throw this.#terminateForProtocolFailure("Worker returned an invalid batch backing");
     }
   }
 
@@ -746,8 +909,34 @@ class Engine implements TabularkEngine {
     }
   }
 
-  clearTableCache(tableHandle: string): void {
-    this.#rangeCache.deleteWhere((key) => rangeCacheKeyBelongsTo(key, tableHandle));
+  clearDatasetCache(datasetHandle: string): void {
+    this.#rangeCache.deleteWhere((key) => rangeCacheKeyBelongsToDataset(key, datasetHandle));
+    for (const flight of [...this.#rangeSingleflight.values()]) {
+      if (flight.datasetHandle !== datasetHandle || flight.settled) continue;
+      if (this.#rangeSingleflight.get(flight.key) === flight) {
+        this.#rangeSingleflight.delete(flight.key);
+      }
+      flight.controller.abort();
+    }
+  }
+
+  updateTableCacheVersion(
+    datasetHandle: string,
+    tableId: string,
+    revision: number,
+    schemaVersion: number,
+  ): void {
+    this.#rangeCache.deleteWhere((key) => (
+      rangeCacheKeyBelongsToTable(key, datasetHandle, tableId)
+      && !rangeCacheKeyMatchesVersion(key, revision, schemaVersion)
+    ));
+  }
+
+  #abortRangeSingleflights(): void {
+    for (const flight of this.#rangeSingleflight.values()) {
+      if (!flight.settled) flight.controller.abort();
+    }
+    this.#rangeSingleflight.clear();
   }
 
   async closeSession(session: DatasetSessionImpl): Promise<void> {
@@ -784,7 +973,7 @@ class Engine implements TabularkEngine {
     }
   }
 
-  /** Mirrors the Worker adapter-runtime split for staged Excel capabilities. */
+  /** Mirrors the Worker's conservative auto-mode Excel source ceiling. */
   #stagedSourceLimit(adapterId: OfficialAdapterId): number {
     if (adapterId !== "tabulark:excel") {
       return this.#maxArrayBufferBytes;
@@ -798,9 +987,8 @@ class Engine implements TabularkEngine {
       1,
       Math.floor(this.#limits.adapterRuntimePoolBytes * weight / Math.max(1, totalWeight)),
     );
-    // `maxArrayBufferBytes` is the public host bound. The Excel WASM wrapper
-    // receives its weighted runtime budget as its staging ceiling, so report
-    // the lower of the two rather than an optimistic unbounded value.
+    // `maxArrayBufferBytes` is the public host bound. Auto mode also respects
+    // the adapter's weighted runtime budget; explicit large mode is range-backed.
     return Math.min(this.#maxArrayBufferBytes, runtimeBudget);
   }
 
@@ -978,6 +1166,7 @@ class Engine implements TabularkEngine {
       return;
     }
     this.#closed = true;
+    this.#abortRangeSingleflights();
     this.#rangeCache.clear();
     this.#clearOrphanEvents();
     for (const session of this.#sessions.values()) {
@@ -1076,6 +1265,7 @@ class DatasetSessionImpl implements DatasetSession {
     if (this.closed) {
       return;
     }
+    this.#engine.clearDatasetCache(this.handle);
     this.closed = true;
     for (const table of this.#tableHandles) {
       table.closeLocally();
@@ -1088,6 +1278,7 @@ class DatasetSessionImpl implements DatasetSession {
     if (this.closed) {
       return;
     }
+    this.#engine.clearDatasetCache(this.handle);
     this.closed = true;
     this.terminalError = error;
     this.#recordDiagnostic(diagnosticFromError(error));
@@ -1236,6 +1427,14 @@ class TableHandleImpl implements TableHandle {
     return this.#metadata;
   }
 
+  get datasetHandle(): string {
+    return this.#session.handle;
+  }
+
+  get datasetClosed(): boolean {
+    return this.#session.closed;
+  }
+
   readRange(request: RangeRequest, options: ReadRangeOptions = {}): Promise<TableBatch> {
     return this.#engine.readRange(this, request, options);
   }
@@ -1304,7 +1503,6 @@ class TableHandleImpl implements TableHandle {
     if (this.closed) {
       return;
     }
-    this.#engine.clearTableCache(this.handle);
     this.closed = true;
     this.#session.removeTableHandle(this);
     this.#emit({ type: "closed" });
@@ -1314,7 +1512,6 @@ class TableHandleImpl implements TableHandle {
     if (this.closed) {
       return;
     }
-    this.#engine.clearTableCache(this.handle);
     this.closed = true;
     this.#session.removeTableHandle(this);
     this.#recordDiagnostic(diagnosticFromError(error, this.metadata.tableId, this.metadata.revision));
@@ -1326,6 +1523,12 @@ class TableHandleImpl implements TableHandle {
     if (this.closed) {
       return;
     }
+    this.#engine.updateTableCacheVersion(
+      this.#session.handle,
+      metadata.tableId,
+      metadata.revision,
+      metadata.schema.version,
+    );
     this.#metadata = metadata;
     this.#emit({ type: "metadata", metadata });
   }
@@ -1962,10 +2165,18 @@ function normalizeWarning(value: unknown): SourceWarning {
   const column = Number.isSafeInteger(raw.column) && (raw.column as number) >= 0
     ? raw.column as number
     : undefined;
+  const tableId = safeDiagnosticTableId(raw.tableId);
+  const resource = safeDiagnosticResource(raw.resource);
+  const requiredBytes = firstNonNegativeSafeInteger(raw.requiredBytes);
+  const availableBytes = firstNonNegativeSafeInteger(raw.availableBytes);
   return {
     handle: typeof raw.handle === "string" ? raw.handle : "",
     kind: typeof raw.kind === "string" ? raw.kind : "warning",
     message: typeof raw.message === "string" ? raw.message : "Source warning",
+    ...(tableId === undefined ? {} : { tableId }),
+    ...(resource === undefined ? {} : { resource }),
+    ...(requiredBytes === undefined ? {} : { requiredBytes }),
+    ...(availableBytes === undefined ? {} : { availableBytes }),
     ...(byteOffset === undefined ? {} : { byteOffset }),
     ...(sourceOffset === undefined ? {} : { sourceOffset }),
     ...(row === undefined ? {} : { row }),
@@ -1998,7 +2209,10 @@ function diagnosticFromWarning(
     ? revision
     : undefined;
   const code = safeDiagnosticCode(warning.kind, "SOURCE_WARNING");
-  const safeTableId = safeDiagnosticTableId(tableId);
+  const safeTableId = safeDiagnosticTableId(tableId ?? warning.tableId);
+  const resource = safeDiagnosticResource(warning.resource);
+  const requiredBytes = firstNonNegativeSafeInteger(warning.requiredBytes);
+  const availableBytes = firstNonNegativeSafeInteger(warning.availableBytes);
   return Object.freeze({
     code,
     severity: "warning" as const,
@@ -2008,6 +2222,9 @@ function diagnosticFromWarning(
     // are not safe to retain in the public diagnostic snapshot.
     message: safeDiagnosticMessage(warning.message, diagnosticFallback(code, "warning"), code),
     recoverable: true,
+    ...(resource === undefined ? {} : { resource }),
+    ...(requiredBytes === undefined ? {} : { requiredBytes }),
+    ...(availableBytes === undefined ? {} : { availableBytes }),
     ...(sourceOffset === undefined ? {} : { sourceOffset }),
     ...(safeTableId === undefined ? {} : { tableId: safeTableId }),
     ...(diagnosticRevision === undefined ? {} : { revision: diagnosticRevision }),
@@ -2089,6 +2306,7 @@ const SAFE_DIAGNOSTIC_CODES = new Set([
   "unterminated-quote",
   "skipped-sheet",
   "missing-formula-cache",
+  "presentation-resource-limit",
   "RESOURCE_LIMIT",
   "CANCELLED",
   "HANDLE_CLOSED",
@@ -2122,6 +2340,8 @@ function diagnosticFallback(code: string | undefined, severity: "warning" | "err
       return "A workbook sheet was skipped";
     case "missing-formula-cache":
       return "A formula has no cached result";
+    case "presentation-resource-limit":
+      return "Spreadsheet presentation exceeded its resource budget";
     case "RESOURCE_LIMIT":
       return "A configured resource limit was reached";
     case "CANCELLED":
@@ -2158,43 +2378,38 @@ function safeDiagnosticTableId(value: unknown): string | undefined {
   return /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u.test(value) ? value : undefined;
 }
 
+function safeDiagnosticResource(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0 || value.length > 96) {
+    return undefined;
+  }
+  return /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$/u.test(value) ? value : undefined;
+}
+
 function createDatasetCapabilitySeed(
   adapterId: OfficialAdapterId,
   options: Readonly<Record<string, unknown>>,
-  sourceBytes: number,
   tables: readonly TableDescriptor[],
   sourceMode: SourceMode = "auto",
   stagedSourceLimit = MAX_ARRAY_BUFFER_BYTES,
 ): DatasetCapabilitySeed {
   const manifest = officialAdapterManifestEntry(adapterId);
-  const largeExcelRange = sourceMode === "large"
-    && adapterId === "tabulark:excel"
-    && (options.format === "xlsx"
-      // Worker auto-detection switches to the range-backed host only when a
-      // source is larger than the staged Excel ceiling. A successfully opened
-      // source in this branch is therefore known to be OOXML.
-      || options.format === "auto" && sourceBytes > stagedSourceLimit);
   // `auto` is intentionally conservative: a File may resolve to an IPC file
   // (non-progressive) or a stream envelope, and the definitive metadata event
   // updates the snapshot once the adapter has inspected its magic bytes.
   const progressive = adapterId === "tabulark:delimited"
     || (adapterId === "tabulark:arrow-ipc" && options.container === "stream");
-  const sourceAccess = largeExcelRange
-    ? "range"
-    : adapterId === "tabulark:arrow-ipc" && options.container === "stream"
+  const sourceAccess = adapterId === "tabulark:arrow-ipc" && options.container === "stream"
       ? "streaming"
       : manifest.resources.sourceAccess;
   const maxSourceBytes = sourceMode === "large"
-    ? adapterId === "tabulark:excel" && !largeExcelRange
-      ? stagedSourceLimit
-      : MAX_LARGE_SOURCE_BYTES
+    ? MAX_LARGE_SOURCE_BYTES
     : adapterId === "tabulark:excel"
       ? stagedSourceLimit
       : adapterId === "tabulark:arrow-ipc" ? 0xffff_ffff : Number.MAX_SAFE_INTEGER;
   return Object.freeze({
     adapterId,
     sourceAccess,
-    progressive: largeExcelRange ? false : progressive,
+    progressive,
     maxSourceBytes,
     multiTable: tables.length > 1 || adapterId === "tabulark:excel",
     presentation: manifest.resources.supportsPresentation,
@@ -2295,6 +2510,24 @@ function asTabularkError(error: unknown, message: string): TabularkError {
 
 function numeric(value: unknown, fallback: number): number {
   return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : fallback;
+}
+
+function isReturnedRangeWithin(value: unknown, requested: RangeRequest): boolean {
+  if (!isRecord(value)) return false;
+  const rowStart = value.rowStart;
+  const rowCount = value.rowCount;
+  const columnStart = value.columnStart;
+  const columnCount = value.columnCount;
+  return Number.isSafeInteger(rowStart)
+    && rowStart === requested.rowStart
+    && Number.isSafeInteger(rowCount)
+    && (rowCount as number) >= 0
+    && (rowCount as number) <= requested.rowCount
+    && Number.isSafeInteger(columnStart)
+    && columnStart === requested.columnStart
+    && Number.isSafeInteger(columnCount)
+    && (columnCount as number) >= 0
+    && (columnCount as number) <= requested.columnCount;
 }
 
 function safelyCall<T>(listener: (value: T) => void, value: T): void {

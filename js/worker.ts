@@ -32,13 +32,15 @@ import {
 } from "./model.js";
 import {
   AsyncPermitQueue,
-  ByteLruCache,
   PermitQueueFullError,
-  cloneWireTableBatch,
-  rangeCacheKey,
-  wireBatchByteLength,
 } from "./range-cache.js";
-import { AdapterRuntime, WasmAdapter } from "./worker/wasm-adapter.js";
+import {
+  WasmAdapter,
+  type AdapterActionResult,
+  type AdapterOperationStep,
+  type AdapterReadAction,
+  type AdapterRuntime,
+} from "./worker/wasm-adapter.js";
 import { ProtocolFault, serializeFault } from "./worker/worker-errors.js";
 import {
   isOfficialAdapterId,
@@ -60,7 +62,6 @@ const MAX_ARROW_SOURCE_BYTES = 0xffff_ffff;
 const INITIAL_READ_LIMIT_BYTES = 8 * CHUNK_BYTES;
 const INITIAL_ROW_TARGET = 256;
 const MAX_IN_FLIGHT_RANGES = MAX_ACTIVE_RANGES + MAX_RANGE_WAITERS;
-const LARGE_EXCEL_MODULE_URL = new URL("./worker/large-excel-adapter.js", import.meta.url).href;
 
 const scope = globalThis as unknown as DedicatedWorkerGlobalScope;
 
@@ -77,17 +78,14 @@ interface DatasetState {
   scanDone: boolean;
   scanError?: ProtocolFault;
   scanPromise?: Promise<void>;
-  /** Pending adapter-v2 open action owned by the background indexer. */
-  scanStep?: Record<string, unknown>;
+  /** Pending adapter-v3 open step owned by the background indexer. */
+  scanStep?: AdapterOperationStep;
   scanOperationHandle?: string | number;
   pendingProgress?: ScanProgress;
   closed: boolean;
   eventsReady: boolean;
   readonly pendingWarnings: unknown[];
   readonly waiters: Set<() => void>;
-  readonly rangeCache: ByteLruCache<CachedRangeBatch>;
-  /** Excel keeps staged or conservatively estimated parsed state after open. */
-  readonly openedWorksheetReservation?: MemoryReservation;
   /** Releases the engine-wide source slot exactly once. */
   readonly releaseSourceSlot: () => void;
 }
@@ -96,6 +94,11 @@ interface ScanProgress {
   readonly bytesScanned: number;
   readonly rowsDiscovered: number;
   readonly done: boolean;
+}
+
+interface PublishedOpenStep {
+  readonly step: AdapterOperationStep;
+  readonly payload: Record<string, unknown>;
 }
 
 interface OpenTableState {
@@ -107,18 +110,13 @@ interface OpenTableState {
   closed: boolean;
 }
 
-interface CachedRangeBatch {
-  readonly batch: WireTableBatch;
-  readonly reservation: MemoryReservation;
-}
-
 interface ActiveOpenRequest {
   readonly requestId: string;
   readonly kind: "open";
   datasetHandle?: string;
   adapter?: AdapterRuntime;
   operationHandle?: string | number;
-  openedWorksheetReservation?: MemoryReservation;
+  operationRevision?: number;
   cancelled: boolean;
   readonly cancellation: RequestCancellation;
 }
@@ -132,6 +130,7 @@ interface ActiveRangeRequest {
   failure?: ProtocolFault;
   adapter?: AdapterRuntime;
   operationHandle?: string | number;
+  operationRevision?: number;
   readonly cancellation: RequestCancellation;
 }
 
@@ -143,6 +142,9 @@ interface ActiveAsyncRequest {
   readonly tableHandle?: string;
   cancelled: boolean;
   failure?: ProtocolFault;
+  adapter?: AdapterRuntime;
+  operationHandle?: string | number;
+  operationRevision?: number;
   readonly cancellation: RequestCancellation;
 }
 
@@ -185,14 +187,9 @@ interface OpenSourcePayload {
   readonly sourceMode?: SourceMode;
 }
 
-interface LargeExcelModule {
-  readonly LargeExcelAdapter: new (config: Readonly<Record<string, number>>) => AdapterRuntime;
-}
-
 let shuttingDown = false;
 let nextDatasetHandle = 1;
 let nextTableHandle = 1;
-let rangeCacheBudgetBytes = 0;
 let memoryLimits: MemoryBudgetLimits | undefined;
 let memoryLedger: MemoryReservationLedger | undefined;
 let peakReservationBytes = 0;
@@ -203,7 +200,6 @@ let adapterRegistrations = new Map<string, AdapterRegistrationPayload>();
 const adapterLoads = new Map<string, Promise<WasmAdapter>>();
 const loadedAdapters = new Map<string, WasmAdapter>();
 const adapterRuntimeReservations = new Map<string, MemoryReservation>();
-let largeExcelModuleLoad: Promise<LargeExcelModule> | undefined;
 const datasets = new Map<string, DatasetState>();
 const tables = new Map<string, OpenTableState>();
 const activeRequests = new Map<string, ActiveRequest>();
@@ -357,7 +353,6 @@ async function hello(value: unknown): Promise<unknown> {
   memoryLimits = limits;
   memoryLedger = new MemoryReservationLedger(payload.memoryBudgetBytes);
   peakReservationBytes = 0;
-  rangeCacheBudgetBytes = limits.workerDatasetRangeCacheBytes;
   return helloResult();
 }
 
@@ -421,10 +416,8 @@ async function openSource(
     if (!isOfficialAdapterId(payload.adapterId)) {
       throw new ProtocolFault("INVALID_ARGUMENT", "openSource adapterId is not registered");
     }
-    // The range-backed Excel host is an internal implementation of the same
-    // official ID, but it must still honor the hello-time adapter allow-list;
-    // otherwise a raw Worker caller could bypass registration by selecting
-    // `sourceMode: "large"` and the XLSX branch below.
+    // Every official runtime must honor the hello-time adapter allow-list so a
+    // raw Worker caller cannot bypass engine registration.
     if (!adapterRegistrations.has(payload.adapterId)) {
       throw new ProtocolFault("INVALID_ARGUMENT", `Adapter ${payload.adapterId} is not registered`);
     }
@@ -439,6 +432,12 @@ async function openSource(
     if (payload.source instanceof Blob) {
       source = payload.source;
     } else if (payload.source instanceof ArrayBuffer) {
+      if (sourceMode === "large") {
+        throw new ProtocolFault(
+          "INVALID_ARGUMENT",
+          "sourceMode large requires a local Blob or File source",
+        );
+      }
       if (payload.source.byteLength > limits.maxArrayBufferBytes) {
         throw new ProtocolFault(
           "RESOURCE_LIMIT",
@@ -458,36 +457,16 @@ async function openSource(
     assertSourceSize(source, sourceMode);
     releaseSourceSlot = reserveSourceSlot();
 
-    // The legacy Excel WASM runtime stages the complete workbook. For a
-    // large `format: auto` source, inspect only its eight-byte signature before
-    // choosing the range-backed OOXML host; this keeps format auto-detection
-    // useful without ever staging the source. Small auto/XLS inputs retain the
-    // compatibility WASM path. The threshold mirrors the weighted Excel
-    // runtime staging budget used by the wrapper.
-    let largeExcelRange = sourceMode === "large"
-      && payload.adapterId === "tabulark:excel"
-      && payload.options.format === "xlsx";
+    // Auto mode retains its conservative staging ceiling. Explicit large mode
+    // is range-backed by the Rust Excel runtime for both XLS and XLSX.
     if (
-      sourceMode === "large"
+      sourceMode === "auto"
       && payload.adapterId === "tabulark:excel"
-      && payload.options.format === "auto"
-      && source.size > adapterRuntimeBudget("tabulark:excel", limits)
-    ) {
-      largeExcelRange = await isZipSourceSignature(source, active, measurement);
-    }
-    // Keep the compatibility path available for small XLS/auto inputs, but
-    // reject a large staged workbook before loading WASM when no range-backed
-    // OOXML signature was selected. The caller receives a deterministic,
-    // capacity-shaped RESOURCE_LIMIT rather than a late adapter failure.
-    if (
-      sourceMode === "large"
-      && payload.adapterId === "tabulark:excel"
-      && !largeExcelRange
       && source.size > adapterRuntimeBudget("tabulark:excel", limits)
     ) {
       throw new ProtocolFault(
         "RESOURCE_LIMIT",
-        "Large-mode Excel requires a range-backed XLSX source; staged XLS/auto input exceeds the working-set limit",
+        "Excel auto mode exceeds the source staging limit; use a local Blob with sourceMode: large",
         false,
         {
           resource: "source-staging",
@@ -497,16 +476,7 @@ async function openSource(
       );
     }
 
-    let runtime: AdapterRuntime;
-    if (
-      largeExcelRange
-    ) {
-      const module = await awaitOperationStep(loadLargeExcelModule(), active);
-      throwIfCancelled(active);
-      runtime = new module.LargeExcelAdapter(largeExcelAdapterConfig(limits));
-    } else {
-      runtime = await awaitOperationStep(loadAdapter(payload.adapterId), active);
-    }
+    const runtime = await awaitOperationStep(loadAdapter(payload.adapterId), active);
     active.adapter = runtime;
 
     const beginningOpen = Promise.resolve().then(() =>
@@ -522,7 +492,7 @@ async function openSource(
       () => {},
     );
     const initialStep = await awaitOperationStep(beginningOpen, active);
-    const openRaw = await runOpenUntilPublished(
+    const publishedOpen = await runOpenUntilPublished(
       runtime,
       source,
       initialStep,
@@ -530,23 +500,13 @@ async function openSource(
       payload.adapterId,
       measurement,
     );
-    const progressiveOpen = isProgressiveOpenStep(openRaw);
+    const openRaw = publishedOpen.payload;
+    const progressiveOpen = publishedOpen.step.kind === "progress";
     if (openRaw.sourceHandle === undefined || openRaw.sourceHandle === null) {
       throw new ProtocolFault("RUNTIME_FAILURE", "Adapter open did not return a sourceHandle");
     }
     sourceHandle = operationHandle(openRaw.sourceHandle, "sourceHandle");
     throwIfCancelled(active);
-    if (largeExcelRange) {
-      const retainedBytes = nonNegativeSafeInteger(
-        openRaw.retainedBytes,
-        "large Excel retainedBytes",
-      );
-      active.openedWorksheetReservation = reserveMemory(
-        "opened-worksheet",
-        retainedBytes,
-      );
-    }
-
     const datasetHandle = `d${nextDatasetHandle++}`;
     const initialMetadata = normalizeMetadata(
       openRaw.metadata,
@@ -574,20 +534,15 @@ async function openSource(
         ? []
         : Array.isArray(openRaw.warnings) ? [...openRaw.warnings] : [],
       waiters: new Set(),
-      rangeCache: createRangeCache(),
-      ...(active.openedWorksheetReservation === undefined
-        ? {}
-        : { openedWorksheetReservation: active.openedWorksheetReservation }),
       releaseSourceSlot,
     };
     dataset = openedDataset;
-    delete active.openedWorksheetReservation;
     datasets.set(datasetHandle, openedDataset);
     releaseSourceSlot = undefined;
     active.datasetHandle = datasetHandle;
 
     if (progressiveOpen) {
-      applyProgressiveOpenStep(openedDataset, openRaw, false);
+      applyProgressiveOpenStep(openedDataset, publishedOpen.step, false);
       await scanInitialPrefix(openedDataset, active);
       throwIfCancelled(active);
       delete active.operationHandle;
@@ -614,7 +569,6 @@ async function openSource(
         }
       }
     }
-    active.openedWorksheetReservation?.release();
     releaseSourceSlot?.();
   }
 }
@@ -723,10 +677,12 @@ async function openTable(requestId: string, value: unknown): Promise<unknown> {
   }
 
   const active = createActiveAsyncRequest(requestId, dataset.handle);
+  active.adapter = dataset.adapter;
   activeRequests.set(requestId, active);
   let adapterTableHandle: string | number | undefined;
   let adapterTableClosed = false;
   let published = false;
+  const warnings: unknown[] = [];
   const closeAdapterTable = (handle: string | number): void => {
     if (adapterTableClosed) return;
     adapterTableClosed = true;
@@ -742,7 +698,7 @@ async function openTable(requestId: string, value: unknown): Promise<unknown> {
     // the public race immediately, but an asynchronous host can still finish
     // constructing its private table afterwards.
     const opening = Promise.resolve().then(() =>
-      dataset.adapter.openTable(dataset.sourceHandle, payload.tableId as string),
+      dataset.adapter.beginOpenTable(dataset.sourceHandle, payload.tableId as string),
     );
     void opening.then(
       (lateResult) => {
@@ -754,37 +710,68 @@ async function openTable(requestId: string, value: unknown): Promise<unknown> {
         ) {
           return;
         }
+        cleanupLateAdapterStep(dataset.adapter, lateResult, false);
         const lateHandle = adapterTableHandleFromOpenResult(lateResult);
         if (lateHandle !== undefined) closeAdapterTable(lateHandle);
       },
       () => {},
     );
 
-    const result = await awaitOperationStep(opening, active);
+    const initial = await awaitOperationStep(opening, active);
+    const completed = await runAdapterValueOperation(
+      dataset.adapter,
+      dataset.source,
+      initial,
+      active,
+      dataset.adapterId,
+      "open-table",
+    );
     assertAsyncRequestOpen(active, dataset);
+    const result = completed.table;
     const raw = isRecord(result) ? result : {};
+    appendOperationWarnings(warnings, completed, raw);
     adapterTableHandle = operationHandle(
       raw.tableHandle ?? raw.handle ?? result,
       "openTable tableHandle",
     );
     const descriptor = dataset.tables.find((candidate) => candidate.id === payload.tableId)
       ?? { id: payload.tableId as string, name: payload.tableId as string };
-    const metadataValue = raw.metadata ?? await awaitOperationStep(
-      Promise.resolve().then(() => dataset.adapter.metadata(adapterTableHandle!)),
-      active,
-    );
+    let metadataValue = raw.metadata;
+    if (metadataValue === undefined) {
+      const metadataInitial = await beginTrackedAdapterOperation(
+        dataset.adapter,
+        active,
+        () => dataset.adapter.beginMetadata(adapterTableHandle!),
+      );
+      const metadataCompleted = await runAdapterValueOperation(
+        dataset.adapter,
+        dataset.source,
+        metadataInitial,
+        active,
+        dataset.adapterId,
+        "metadata",
+      );
+      appendOperationWarnings(warnings, metadataCompleted);
+      metadataValue = metadataCompleted.metadata;
+    }
     assertAsyncRequestOpen(active, dataset);
     const metadata = normalizeMetadata(metadataValue, descriptor);
     const tableHandle = `t${nextTableHandle++}`;
-    tables.set(tableHandle, {
+    const openedTableState: OpenTableState = {
       handle: tableHandle,
       datasetHandle: dataset.handle,
       tableId: payload.tableId,
       adapterTableHandle,
       metadata,
       closed: false,
-    });
+    };
+    tables.set(tableHandle, openedTableState);
     published = true;
+    emitWarnings(dataset, warnings, {
+      tableHandle,
+      tableId: payload.tableId as string,
+      revision: metadata.revision,
+    });
     return {
       id: payload.tableId,
       name: dataset.tables.find((candidate) => candidate.id === payload.tableId)?.name ?? payload.tableId,
@@ -803,18 +790,29 @@ async function getMetadata(requestId: string, value: unknown): Promise<unknown> 
   const table = requireTable(payload.tableHandle);
   const dataset = requireDataset(table.datasetHandle);
   const active = createActiveAsyncRequest(requestId, dataset.handle, table.handle);
+  active.adapter = dataset.adapter;
   activeRequests.set(requestId, active);
   try {
-    const value = await awaitOperationStep(
-      Promise.resolve().then(() => dataset.adapter.metadata(table.adapterTableHandle)),
+    const initial = await beginTrackedAdapterOperation(
+      dataset.adapter,
       active,
+      () => dataset.adapter.beginMetadata(table.adapterTableHandle),
+    );
+    const completed = await runAdapterValueOperation(
+      dataset.adapter,
+      dataset.source,
+      initial,
+      active,
+      dataset.adapterId,
+      "metadata",
     );
     assertAsyncRequestOpen(active, dataset, table);
     const metadata = normalizeMetadata(
-      value,
+      completed.metadata,
       { id: table.tableId, name: table.metadata.name },
     );
     table.metadata = metadata;
+    emitOperationWarnings(dataset, completed, table);
     return metadata;
   } finally {
     activeRequests.delete(requestId);
@@ -826,14 +824,26 @@ async function getPresentation(requestId: string, value: unknown): Promise<unkno
   const table = requireTable(payload.tableHandle);
   const dataset = requireDataset(table.datasetHandle);
   const active = createActiveAsyncRequest(requestId, dataset.handle, table.handle);
+  active.adapter = dataset.adapter;
   activeRequests.set(requestId, active);
   try {
-    const value = await awaitOperationStep(
-      Promise.resolve().then(() => dataset.adapter.presentation(table.adapterTableHandle)),
+    const initial = await beginTrackedAdapterOperation(
+      dataset.adapter,
       active,
+      () => dataset.adapter.beginPresentation(table.adapterTableHandle),
+    );
+    const completed = await runAdapterValueOperation(
+      dataset.adapter,
+      dataset.source,
+      initial,
+      active,
+      dataset.adapterId,
+      "presentation",
     );
     assertAsyncRequestOpen(active, dataset, table);
-    return normalizePresentationResult(value, table);
+    const presentation = normalizePresentationResult(completed.presentation, table);
+    emitOperationWarnings(dataset, completed, table);
+    return presentation;
   } finally {
     activeRequests.delete(requestId);
   }
@@ -845,14 +855,26 @@ async function readPresentationRange(requestId: string, value: unknown): Promise
   const dataset = requireDataset(table.datasetHandle);
   const range = normalizeRange(payload.range);
   const active = createActiveAsyncRequest(requestId, dataset.handle, table.handle);
+  active.adapter = dataset.adapter;
   activeRequests.set(requestId, active);
   try {
-    const result = await awaitOperationStep(
-      Promise.resolve(dataset.adapter.readPresentationRange(table.adapterTableHandle, range)),
+    const initial = await beginTrackedAdapterOperation(
+      dataset.adapter,
       active,
+      () => dataset.adapter.beginPresentationRange(table.adapterTableHandle, range),
+    );
+    const completed = await runAdapterValueOperation(
+      dataset.adapter,
+      dataset.source,
+      initial,
+      active,
+      dataset.adapterId,
+      "presentation-range",
     );
     assertAsyncRequestOpen(active, dataset, table);
-    return normalizePresentationRangeResult(result, table, range);
+    const presentation = normalizePresentationRangeResult(completed.presentation, table, range);
+    emitOperationWarnings(dataset, completed, table);
+    return presentation;
   } finally {
     activeRequests.delete(requestId);
   }
@@ -909,28 +931,24 @@ function normalizePresentationRangeResult(
   };
 }
 
-/** Adapter ABI v2 may publish a readable indexed prefix beside its next byte action. */
-function isProgressiveOpenStep(value: unknown): boolean {
-  if (!isRecord(value) || value.kind !== "open-progress" || !isRecord(value.action)) {
-    return false;
-  }
-  return value.action.kind === "read-bytes"
-    && value.sourceHandle !== undefined
-    && value.metadata !== undefined
-    && isRecord(value.progress);
-}
-
 function applyProgressiveOpenStep(
   dataset: DatasetState,
-  value: Record<string, unknown>,
+  step: AdapterOperationStep,
   emitEvents: boolean,
 ): void {
+  const value = operationPayload(step, "adapter open progress");
+  if (value.operationKind !== "open") {
+    throw new ProtocolFault(
+      "PROTOCOL_INCOMPATIBLE",
+      "Adapter changed the operation kind while scanning a source",
+    );
+  }
   const sourceHandle = operationHandle(value.sourceHandle, "sourceHandle");
   if (sourceHandle !== dataset.sourceHandle) {
     throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter open changed its sourceHandle");
   }
   const metadata = normalizeMetadata(value.metadata, dataset.tables[0]);
-  const progress = value.progress === undefined && value.kind === "open-complete"
+  const progress = value.progress === undefined && step.kind === "complete"
     ? Object.freeze({
         bytesScanned: dataset.source.size,
         rowsDiscovered: discoveredRows(metadata),
@@ -947,7 +965,7 @@ function applyProgressiveOpenStep(
     value.table,
     metadata,
   );
-  const complete = value.kind === "open-complete";
+  const complete = step.kind === "complete";
   if (complete !== progress.done) {
     throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter completion and progress disagree");
   }
@@ -955,27 +973,20 @@ function applyProgressiveOpenStep(
     throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter progress and metadata row counts disagree");
   }
 
-  const action = isRecord(value.action) ? value.action : undefined;
-  if (!progress.done && !action) {
-    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter scan returned neither progress action nor completion");
+  if (!progress.done && step.kind === "complete") {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter scan completed before progress reached EOF");
   }
-  if (progress.done && action) {
+  if (progress.done && step.kind !== "complete") {
     throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Completed adapter scan returned another read action");
-  }
-  if (
-    action
-    && nonNegativeSafeInteger(action.offset, "read-bytes offset") !== progress.bytesScanned
-  ) {
-    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter action does not begin at the scanned prefix");
   }
 
   dataset.metadata = metadata;
   dataset.tables = tableDescriptors;
   dataset.scanOffset = progress.bytesScanned;
   dataset.scanDone = progress.done;
-  if (action) {
-    dataset.scanOperationHandle = operationHandle(value.operationHandle, "operationHandle");
-    dataset.scanStep = value;
+  if (step.kind !== "complete") {
+    dataset.scanOperationHandle = step.operationHandle;
+    dataset.scanStep = step;
   } else {
     delete dataset.scanOperationHandle;
     delete dataset.scanStep;
@@ -1030,8 +1041,6 @@ async function scanOpenToEnd(dataset: DatasetState): Promise<void> {
       : new ProtocolFault("RUNTIME_FAILURE", "Background source scanning failed", false, undefined, error);
     dataset.scanError = failure;
     dataset.scanDone = true;
-    delete dataset.scanStep;
-    delete dataset.scanOperationHandle;
     notifyScanWaiters(dataset);
     try {
       emit({
@@ -1061,76 +1070,39 @@ async function scanOpenNextChunk(
   if (!step) {
     throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter scan has no pending read action");
   }
-  if (step.kind !== "open-progress") {
-    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter scan did not return an open-progress step");
-  }
-  const action = isRecord(step.action) ? step.action : undefined;
-  if (!action || action.kind !== "read-bytes") {
-    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter scan requested an unsupported action");
-  }
-  const operation = operationHandle(step.operationHandle, "operationHandle");
-  const offset = nonNegativeSafeInteger(action.offset, "read-bytes offset");
-  const length = nonNegativeSafeInteger(action.length, "read-bytes length");
-  const limits = requireMemoryLimits();
-  const readLimit = operationReadLimit(dataset.adapterId, limits);
-  const end = checkedSourceRangeEnd(offset, length, dataset.source.size);
-  if (
-    length > readLimit
-    || end === undefined
-  ) {
-    throw new ProtocolFault(
-      "RESOURCE_LIMIT",
-      "Adapter scan read-bytes action exceeds the source or engine memory budget",
-      false,
-      {
-        resource: operationResource(dataset.adapterId),
-        requiredBytes: length,
-        availableBytes: readLimit,
-        offset,
-        sourceLength: dataset.source.size,
-      },
-    );
-  }
-  dataset.scanOperationHandle = operation;
+  dataset.scanOperationHandle = step.operationHandle;
   if (active) {
-    active.operationHandle = operation;
+    active.operationHandle = step.operationHandle;
+    active.operationRevision = step.operationRevision;
     throwIfCancelled(active);
   }
-  const reservation = reserveOperationMemory(dataset.adapterId, length);
-  const read = await acquireReservedBlobRead(
-    sliceReservedSource(dataset.source, offset, end, reservation),
-    reservation,
+  let next = await advanceAdapterOperationStep(
+    dataset.adapter,
+    dataset.source,
+    step,
     active,
-    length,
+    dataset.adapterId,
   );
-  let next: Record<string, unknown>;
-  try {
-    const bytes = new Uint8Array(read.buffer);
-    if (dataset.closed) {
-      return;
-    }
-    if (active) {
-      throwIfCancelled(active);
-    }
-    const continuation = Promise.resolve().then(() => dataset.adapter.continueOperation(
-      operation,
-      offset,
-      bytes,
-      end >= dataset.source.size,
-    ));
-    next = expectRecord(
-      active === undefined ? await continuation : await awaitOperationStep(continuation, active),
-      "adapter scan result",
+  while (!dataset.closed && next.kind === "pending") {
+    next = await advanceAdapterOperationStep(
+      dataset.adapter,
+      dataset.source,
+      next,
+      active,
+      dataset.adapterId,
     );
-  } finally {
-    read.release();
   }
   if (dataset.closed) {
     return;
   }
+  if (next.kind !== "progress" && next.kind !== "complete") {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter scan did not publish progress");
+  }
   applyProgressiveOpenStep(dataset, next, emitEvents);
   if (active) {
     active.operationHandle = dataset.scanOperationHandle;
+    if (dataset.scanStep) active.operationRevision = dataset.scanStep.operationRevision;
+    else delete active.operationRevision;
   }
 }
 
@@ -1244,31 +1216,6 @@ async function readRange(
   const dataset = requireDataset(table.datasetHandle);
   const runtime = dataset.adapter;
   const request = normalizeRange(payload.range);
-  const key = rangeCacheKey(
-    table.tableId,
-    table.metadata.revision,
-    table.metadata.schema.version,
-    request,
-  );
-  const cached = dataset.rangeCache.get(key);
-  if (cached) {
-    const reservation = reserveMemory(
-      "batch",
-      wireBatchByteLength(cached.batch),
-    );
-    try {
-      const batch = cloneWireTableBatch(cached.batch);
-      return {
-        kind: "batch",
-        data: batch,
-        transfer: collectBatchTransfers(batch),
-        release: reservation.release,
-      };
-    } catch (error) {
-      reservation.release();
-      throw error;
-    }
-  }
   if (rangeRequestsInFlight >= MAX_IN_FLIGHT_RANGES) {
     throw new ProtocolFault(
       "RESOURCE_LIMIT",
@@ -1347,12 +1294,6 @@ async function readRange(
     } catch (error) {
       batchReservation.release();
       throw error;
-    }
-    // A range truncated at the current indexed prefix must be re-read after
-    // the Stream grows; retaining it under the original request would turn a
-    // transient prefix boundary into a stale permanent cache hit.
-    if (batch.complete) {
-      cacheBatch(dataset, table, request, batch);
     }
     const transfer = collectBatchTransfers(batch);
     return { kind: "batch", data: batch, transfer, release: batchReservation.release };
@@ -1543,6 +1484,27 @@ function awaitOperationStep<T>(operation: Promise<T>, active: ActiveRequest): Pr
   ]);
 }
 
+/**
+ * Starts one of the ABI-v3 table operations while retaining a late-result
+ * cleanup. Cancellation can win before an async adapter publishes its first
+ * operation handle; when that handle eventually arrives it must still be
+ * reclaimed exactly once.
+ */
+function beginTrackedAdapterOperation(
+  adapter: AdapterRuntime,
+  active: ActiveAsyncRequest,
+  begin: () => unknown | Promise<unknown>,
+): Promise<unknown> {
+  const beginning = Promise.resolve().then(begin);
+  void beginning.then(
+    (lateStep) => {
+      if (active.cancelled) cleanupLateAdapterStep(adapter, lateStep, false);
+    },
+    () => {},
+  );
+  return awaitOperationStep(beginning, active);
+}
+
 function assertAsyncRequestOpen(
   active: ActiveAsyncRequest,
   dataset: DatasetState,
@@ -1564,8 +1526,10 @@ function assertAsyncRequestOpen(
 
 function adapterTableHandleFromOpenResult(value: unknown): string | number | undefined {
   const raw = isRecord(value) ? value : {};
+  const payload = isRecord(raw.payload) ? raw.payload : raw;
+  const table = isRecord(payload.table) ? payload.table : payload;
   try {
-    return operationHandle(raw.tableHandle ?? raw.handle ?? value, "openTable tableHandle");
+    return operationHandle(table.tableHandle ?? table.handle ?? value, "openTable tableHandle");
   } catch {
     return undefined;
   }
@@ -1577,6 +1541,7 @@ function cleanupLateAdapterStep(
   closeSource: boolean,
 ): void {
   const raw = isRecord(value) ? value : {};
+  const payload = isRecord(raw.payload) ? raw.payload : raw;
   if (raw.operationHandle !== undefined && raw.operationHandle !== null) {
     try {
       adapter.cancelOperation(operationHandle(raw.operationHandle, "operationHandle"));
@@ -1584,45 +1549,12 @@ function cleanupLateAdapterStep(
       // Cancellation is best effort after the owning request has terminated.
     }
   }
-  if (closeSource && raw.sourceHandle !== undefined && raw.sourceHandle !== null) {
+  if (closeSource && payload.sourceHandle !== undefined && payload.sourceHandle !== null) {
     try {
-      adapter.closeSource(operationHandle(raw.sourceHandle, "sourceHandle"));
+      adapter.closeSource(operationHandle(payload.sourceHandle, "sourceHandle"));
     } catch {
       // A late, malformed or already-closed source cannot be retained here.
     }
-  }
-}
-
-/** Reads only the local ZIP signature used to resolve large Excel `auto`. */
-async function isZipSourceSignature(
-  source: Blob,
-  active: ActiveOpenRequest,
-  measurement?: OperationMeasurement,
-): Promise<boolean> {
-  const length = Math.min(8, source.size);
-  if (length < 4) {
-    return false;
-  }
-  const reservation = reserveMemory("source-staging", length);
-  const read = await acquireReservedBlobRead(
-    sliceReservedSource(source, 0, length, reservation),
-    reservation,
-    active,
-    length,
-  );
-  try {
-    const bytes = new Uint8Array(read.buffer);
-    recordSourceRead(measurement, bytes.byteLength);
-    return bytes.byteLength >= 4
-      && bytes[0] === 0x50
-      && bytes[1] === 0x4b
-      && (
-        bytes[2] === 0x03 && bytes[3] === 0x04
-        || bytes[2] === 0x05 && bytes[3] === 0x06
-        || bytes[2] === 0x07 && bytes[3] === 0x08
-      );
-  } finally {
-    read.release();
   }
 }
 
@@ -1777,20 +1709,68 @@ function flushPendingDatasetEvents(value: unknown): void {
   }
 }
 
-function emitWarnings(dataset: DatasetState, warnings: readonly unknown[]): void {
+interface WarningScope {
+  readonly tableHandle?: string;
+  readonly tableId?: string;
+  readonly revision?: number;
+}
+
+function appendOperationWarnings(
+  target: unknown[],
+  ...payloads: readonly unknown[]
+): void {
+  const seen = new Set(target);
+  for (const payload of payloads) {
+    if (!isRecord(payload)) continue;
+    const warnings = Array.isArray(payload.warnings)
+      ? payload.warnings
+      : payload.warning === undefined ? [] : [payload.warning];
+    for (const warning of warnings) {
+      if (seen.has(warning)) continue;
+      seen.add(warning);
+      target.push(warning);
+    }
+  }
+}
+
+function emitOperationWarnings(
+  dataset: DatasetState,
+  payload: Record<string, unknown>,
+  table: OpenTableState,
+): void {
+  const warnings: unknown[] = [];
+  appendOperationWarnings(warnings, payload);
+  emitWarnings(dataset, warnings, {
+    tableHandle: table.handle,
+    tableId: table.tableId,
+    revision: table.metadata.revision,
+  });
+}
+
+function emitWarnings(
+  dataset: DatasetState,
+  warnings: readonly unknown[],
+  scope: WarningScope = {},
+): void {
   for (const warning of warnings) {
     const raw = isRecord(warning) ? warning : undefined;
-    const warningTableId = typeof raw?.tableId === "string"
+    const warningTableId = typeof scope.tableId === "string"
+      && dataset.tables.some((table) => table.id === scope.tableId)
+      ? scope.tableId
+      : typeof raw?.tableId === "string"
       && dataset.tables.some((table) => table.id === raw.tableId)
       ? raw.tableId
       : dataset.metadata.tableId;
     emit({
       event: "warning",
       datasetHandle: dataset.handle,
+      ...(scope.tableHandle === undefined ? {} : { tableHandle: scope.tableHandle }),
       tableId: warningTableId,
+      ...(scope.revision === undefined ? {} : { revision: scope.revision }),
       payload: {
-        handle: dataset.handle,
         ...(raw ?? { kind: "warning", message: String(warning) }),
+        handle: scope.tableHandle ?? dataset.handle,
+        tableId: warningTableId,
       },
     });
   }
@@ -1817,9 +1797,7 @@ function cancelActive(active: ActiveRequest, failure?: ProtocolFault): void {
       delete active.operationHandle;
     }
   }
-  if (active.kind !== "async") {
-    cancelOwnedOperation(active);
-  }
+  cancelOwnedOperation(active);
   active.cancellation.resolve();
   if (active.kind === "open") {
     if (active.datasetHandle) {
@@ -1833,9 +1811,7 @@ function cancelActive(active: ActiveRequest, failure?: ProtocolFault): void {
   if (failure !== undefined) {
     active.failure = failure;
   }
-  if (active.kind === "async") {
-    return;
-  }
+  if (active.kind === "async") return;
   rangePermits.cancel(
     active.requestId,
     failure ?? new ProtocolFault("CANCELLED", "The range request was cancelled"),
@@ -1903,8 +1879,6 @@ function closeDatasetState(
   dataset.pendingWarnings.length = 0;
   delete dataset.pendingProgress;
   openedDatasetsByRequest.delete(dataset.openRequestId);
-  dataset.rangeCache.clear();
-  dataset.openedWorksheetReservation?.release();
   notifyScanWaiters(dataset);
   if (dataset.scanOperationHandle !== undefined) {
     const scanOperationHandle = dataset.scanOperationHandle;
@@ -1979,7 +1953,7 @@ function copyBatch(
       `Adapter returned batch layout ${String(raw.layoutVersion)}; expected ${BATCH_LAYOUT_VERSION}`,
     );
   }
-  const buffers = copyBufferPool(raw.buffers);
+  const buffers = adoptTransferBufferPool(raw.buffers);
   const columns = raw.columns.map((column, index) =>
     copyGenericColumn(column, range.rowCount, index));
   const batch: WireTableBatch = {
@@ -2027,48 +2001,41 @@ function rawBatchByteLength(value: unknown): number {
   return total;
 }
 
-function createRangeCache(): ByteLruCache<CachedRangeBatch> {
-  return new ByteLruCache(rangeCacheBudgetBytes, {
-    onRemove: (_key, entry) => entry.reservation.release(),
-  });
-}
-
-function cacheBatch(
-  dataset: DatasetState,
-  table: OpenTableState,
-  request: RangeRequest,
-  batch: WireTableBatch,
-): void {
-  const byteLength = wireBatchByteLength(batch);
-  if (byteLength > dataset.rangeCache.maxBytes) {
-    return;
-  }
-  let reservation: MemoryReservation;
-  try {
-    reservation = reserveMemory("range-cache", byteLength);
-  } catch {
-    // Cache admission is optional; the completed read remains usable even
-    // when live adapter, staging and batch reservations consume the budget.
-    return;
-  }
-  try {
-    const cachedBatch = cloneWireTableBatch(batch);
-    dataset.rangeCache.set(
-      rangeCacheKey(table.tableId, batch.revision, batch.schemaVersion, request),
-      Object.freeze({ batch: cachedBatch, reservation }),
-      byteLength,
-    );
-  } catch (error) {
-    reservation.release();
-    throw error;
-  }
-}
-
-function copyBufferPool(value: unknown): ArrayBuffer[] {
+/**
+ * Adopts adapter-produced output buffers without another JS-to-JS copy.
+ * ABI-v3 requires each pool entry to own its complete, independently
+ * transferable ArrayBuffer; Rust creates that backing during its sole
+ * WASM-to-JS output copy.
+ */
+function adoptTransferBufferPool(value: unknown): ArrayBuffer[] {
   if (!Array.isArray(value)) {
     throw new ProtocolFault("RUNTIME_FAILURE", "Layout-v1 batch buffers must be an array");
   }
-  return value.map((entry, index) => copyBytes(entry, `batch buffer ${index}`).buffer as ArrayBuffer);
+  const seen = new Set<ArrayBuffer>();
+  return value.map((entry, index) => {
+    const backing = entry instanceof ArrayBuffer
+      ? entry
+      : ArrayBuffer.isView(entry)
+        && entry.buffer instanceof ArrayBuffer
+        && entry.byteOffset === 0
+        && entry.byteLength === entry.buffer.byteLength
+        ? entry.buffer
+        : undefined;
+    if (!backing) {
+      throw new ProtocolFault(
+        "PROTOCOL_INCOMPATIBLE",
+        `batch buffer ${index} must own a complete transferable ArrayBuffer`,
+      );
+    }
+    if (seen.has(backing)) {
+      throw new ProtocolFault(
+        "PROTOCOL_INCOMPATIBLE",
+        `batch buffer ${index} aliases another pool entry`,
+      );
+    }
+    seen.add(backing);
+    return backing;
+  });
 }
 
 function copyGenericColumn(
@@ -2221,16 +2188,6 @@ function copyRegion(
     ...(raw.byteLength === undefined ? {} : { byteLength: numberOr(raw.byteLength, 0) }),
     ...(wrapper.bitOffset === undefined ? {} : { bitOffset: numberOr(wrapper.bitOffset, 0) }),
   });
-}
-
-function copyBytes(value: unknown, name: string): Uint8Array {
-  if (value instanceof ArrayBuffer) {
-    return Uint8Array.from(new Uint8Array(value));
-  }
-  if (ArrayBuffer.isView(value)) {
-    return Uint8Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
-  }
-  throw new ProtocolFault("RUNTIME_FAILURE", `${name} must be a Uint8Array`);
 }
 
 function collectBatchTransfers(batch: WireTableBatch): Transferable[] {
@@ -2457,41 +2414,6 @@ async function loadAdapter(id: string): Promise<WasmAdapter> {
   return loading;
 }
 
-/** Loads the optional range-backed OOXML runtime only for an explicit large XLSX open. */
-async function loadLargeExcelModule(): Promise<LargeExcelModule> {
-  if (largeExcelModuleLoad) {
-    return largeExcelModuleLoad;
-  }
-  const loading = import(/* @vite-ignore */ LARGE_EXCEL_MODULE_URL)
-    .then((module: unknown) => {
-      if (
-        !isRecord(module)
-        || typeof module.LargeExcelAdapter !== "function"
-      ) {
-        throw new ProtocolFault(
-          "PROTOCOL_INCOMPATIBLE",
-          "The range-backed Excel runtime does not export its official host class",
-        );
-      }
-      return module as unknown as LargeExcelModule;
-    })
-    .catch((error) => {
-      largeExcelModuleLoad = undefined;
-      if (error instanceof ProtocolFault) {
-        throw error;
-      }
-      throw new ProtocolFault(
-        "RUNTIME_FAILURE",
-        "Failed to initialize the range-backed Excel runtime",
-        false,
-        { moduleUrl: LARGE_EXCEL_MODULE_URL },
-        error,
-      );
-    });
-  largeExcelModuleLoad = loading;
-  return loading;
-}
-
 function adapterRuntimeBudget(id: OfficialAdapterId, limits: MemoryBudgetLimits): number {
   const registrations = [...adapterRegistrations.keys()].filter(isOfficialAdapterId);
   const totalWeight = registrations.reduce(
@@ -2502,45 +2424,12 @@ function adapterRuntimeBudget(id: OfficialAdapterId, limits: MemoryBudgetLimits)
   return Math.max(1, Math.floor(limits.adapterRuntimePoolBytes * weight / Math.max(1, totalWeight)));
 }
 
-/**
- * Keeps the range-backed XLSX parser inside the same operation budget as the
- * compiled adapters.  These are parser/index limits, not source-size
- * reservations: a two-GiB File still contributes only the bounded ranges
- * actually read from it.
- */
-function largeExcelAdapterConfig(limits: MemoryBudgetLimits): Readonly<Record<string, number>> {
-  const operation = limits.operationBudgetBytes;
-  const quarter = Math.max(1, Math.floor(operation / 4));
-  const half = Math.max(1, Math.floor(operation / 2));
-  return Object.freeze({
-    chunkBytes: Math.min(CHUNK_BYTES, operation),
-    tailBytes: Math.min(128 * 1024, operation),
-    maxEntries: 16_384,
-    maxCentralDirectoryBytes: Math.min(8 * 1024 * 1024, quarter),
-    maxCompressedEntryBytes: Math.min(16 * 1024 * 1024, half),
-    maxExpandedEntryBytes: Math.min(16 * 1024 * 1024, half),
-    maxTotalExpandedBytes: Math.min(24 * 1024 * 1024, Math.max(1, operation - quarter)),
-    maxXmlBytes: Math.min(8 * 1024 * 1024, quarter),
-    maxWorksheetCells: Math.min(250_000, Math.max(1_024, Math.floor(operation / 256))),
-    maxRangeCells: Math.min(MAX_RANGE_CELLS, Math.max(1, Math.floor(operation / 128))),
-    maxColumns: 16_384,
-    maxRows: 1_048_576,
-    maxSheets: Math.min(1_024, Math.max(1, Math.floor(operation / 4_096))),
-    maxStyles: Math.min(16_384, Math.max(256, Math.floor(operation / 64))),
-    maxMergedRegions: Math.min(100_000, Math.max(1_024, Math.floor(operation / 128))),
-    maxLayoutEntries: Math.min(100_000, Math.max(1_024, Math.floor(operation / 128))),
-    maxWarnings: Math.min(1_000, Math.max(16, Math.floor(operation / 4_096))),
-  });
-}
-
 function operationResource(id: OfficialAdapterId): "source-staging" | "compressed-page" {
   return id === "tabulark:parquet" ? "compressed-page" : "source-staging";
 }
 
-function operationReadLimit(id: OfficialAdapterId, limits: MemoryBudgetLimits): number {
-  return id === "tabulark:excel"
-    ? adapterRuntimeBudget(id, limits)
-    : limits.operationBudgetBytes;
+function operationReadLimit(_id: OfficialAdapterId, limits: MemoryBudgetLimits): number {
+  return limits.operationBudgetBytes;
 }
 
 function reserveOperationMemory(id: OfficialAdapterId, bytes: number): MemoryReservation {
@@ -2575,93 +2464,47 @@ async function runOpenUntilPublished(
   active: ActiveOpenRequest,
   adapterId: OfficialAdapterId,
   measurement?: OperationMeasurement,
-): Promise<Record<string, unknown>> {
-  let step = initial;
+): Promise<PublishedOpenStep> {
+  let step = expectAdapterOperationStep(initial, "adapter open result");
   let complete = false;
   let published = false;
   try {
     for (;;) {
       throwIfCancelled(active);
-      const raw = expectRecord(step, "adapter open result");
-      if (isProgressiveOpenStep(raw)) {
+      active.operationHandle = step.operationHandle;
+      active.operationRevision = step.operationRevision;
+      if (step.kind === "progress") {
+        const payload = operationPayload(step, "adapter open progress");
+        if (payload.operationKind !== "open") {
+          throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter published progress for another operation");
+        }
         published = true;
-        return raw;
+        return Object.freeze({
+          step,
+          payload,
+        });
       }
-      if (raw.kind === "open-complete") {
+      if (step.kind === "complete") {
         complete = true;
         delete active.operationHandle;
-        return raw;
-      }
-      if (raw.kind !== "read-bytes") {
-        throw new ProtocolFault(
-          "PROTOCOL_INCOMPATIBLE",
-          "Adapter open returned an invalid discriminated step",
-        );
-      }
-      const action = isRecord(raw.action) ? raw.action : undefined;
-      if (!action) {
-        throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter read-bytes step has no action");
-      }
-      if (action.kind !== "read-bytes") {
-        throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter requested an unsupported action");
-      }
-      active.operationHandle = operationHandle(raw.operationHandle, "operationHandle");
-      const offset = nonNegativeSafeInteger(action.offset, "read-bytes offset");
-      const length = nonNegativeSafeInteger(action.length, "read-bytes length");
-      const limits = requireMemoryLimits();
-      const readLimit = operationReadLimit(adapterId, limits);
-      const end = checkedSourceRangeEnd(offset, length, source.size);
-      if (
-        length > readLimit
-        || end === undefined
-      ) {
-        throw new ProtocolFault(
-          "RESOURCE_LIMIT",
-          "Adapter read-bytes action exceeds the source or engine memory budget",
-          false,
-          {
-            resource: operationResource(adapterId),
-            requiredBytes: length,
-            availableBytes: readLimit,
-            offset,
-            sourceLength: source.size,
-          },
-        );
-      }
-      const reservation = reserveOperationMemory(adapterId, length);
-      const read = await acquireReservedBlobRead(
-        sliceReservedSource(source, offset, end, reservation),
-        reservation,
-        active,
-        length,
-      );
-      try {
-        const bytes = new Uint8Array(read.buffer);
-        recordSourceRead(measurement, bytes.byteLength);
-        throwIfCancelled(active);
-        if (
-          adapterId === "tabulark:excel"
-          && adapter.retainsSourceBytes === true
-          && active.openedWorksheetReservation === undefined
-        ) {
-          // Excel retains the staged workbook after the one-shot source read;
-          // keep that ownership visible to the same global ledger after the
-          // transient source-staging reservation is released.
-          active.openedWorksheetReservation = reserveMemory(
-            "opened-worksheet",
-            source.size,
-          );
+        delete active.operationRevision;
+        const payload = operationPayload(step, "adapter open completion");
+        if (payload.operationKind !== "open") {
+          throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter completed another operation during open");
         }
-        const continuation = Promise.resolve().then(() => adapter.continueOperation(
-          active.operationHandle!,
-          offset,
-          bytes,
-          end >= source.size,
-        ));
-        step = await awaitOperationStep(continuation, active);
-      } finally {
-        read.release();
+        return Object.freeze({
+          step,
+          payload,
+        });
       }
+      step = await advanceAdapterOperationStep(
+        adapter,
+        source,
+        step,
+        active,
+        adapterId,
+        measurement,
+      );
     }
   } finally {
     if (!complete && !published && active.operationHandle !== undefined) {
@@ -2678,74 +2521,31 @@ async function runAdapterOperation(
   adapterId: OfficialAdapterId,
   measurement?: OperationMeasurement,
 ): Promise<unknown> {
-  let step = initial;
+  let step = expectAdapterOperationStep(initial, "adapter range result");
   let complete = false;
   try {
     for (;;) {
       throwIfCancelled(active);
-      const raw = expectRecord(step, "adapter operation result");
-      if (raw.kind === "read-complete") {
+      active.operationHandle = step.operationHandle;
+      active.operationRevision = step.operationRevision;
+      if (step.kind === "complete") {
         complete = true;
         delete active.operationHandle;
-        return raw.batch;
+        delete active.operationRevision;
+        const payload = operationPayload(step, "adapter range completion");
+        if (payload.operationKind !== "read") {
+          throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter completed another operation during read");
+        }
+        return payload.batch ?? payload;
       }
-      if (raw.kind !== "read-bytes") {
-        throw new ProtocolFault(
-          "PROTOCOL_INCOMPATIBLE",
-          "Adapter read returned an invalid discriminated step",
-        );
-      }
-      const action = isRecord(raw.action) ? raw.action : undefined;
-      if (!action) {
-        throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter read-bytes step has no action");
-      }
-      if (action.kind !== "read-bytes") {
-        throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "Adapter requested an unsupported action");
-      }
-      active.operationHandle = operationHandle(raw.operationHandle, "operationHandle");
-      const offset = nonNegativeSafeInteger(action.offset, "read-bytes offset");
-      const length = nonNegativeSafeInteger(action.length, "read-bytes length");
-      const limits = requireMemoryLimits();
-      const readLimit = operationReadLimit(adapterId, limits);
-      const end = checkedSourceRangeEnd(offset, length, source.size);
-      if (
-        length > readLimit
-        || end === undefined
-      ) {
-        throw new ProtocolFault(
-          "RESOURCE_LIMIT",
-          "Adapter read-bytes action exceeds the source or engine memory budget",
-          false,
-          {
-            resource: operationResource(adapterId),
-            requiredBytes: length,
-            availableBytes: readLimit,
-            offset,
-            sourceLength: source.size,
-          },
-        );
-      }
-      const reservation = reserveOperationMemory(adapterId, length);
-      const read = await acquireReservedBlobRead(
-        sliceReservedSource(source, offset, end, reservation),
-        reservation,
+      step = await advanceAdapterOperationStep(
+        adapter,
+        source,
+        step,
         active,
-        length,
+        adapterId,
+        measurement,
       );
-      try {
-        const bytes = new Uint8Array(read.buffer);
-        recordSourceRead(measurement, bytes.byteLength);
-        throwIfCancelled(active);
-        const continuation = Promise.resolve().then(() => adapter.continueOperation(
-          active.operationHandle!,
-          offset,
-          bytes,
-          end >= source.size,
-        ));
-        step = await awaitOperationStep(continuation, active);
-      } finally {
-        read.release();
-      }
     }
   } finally {
     if (!complete && active.operationHandle !== undefined) {
@@ -2754,8 +2554,230 @@ async function runAdapterOperation(
   }
 }
 
+async function runAdapterValueOperation(
+  adapter: AdapterRuntime,
+  source: Blob,
+  initial: unknown,
+  active: ActiveAsyncRequest,
+  adapterId: OfficialAdapterId,
+  operationKind: string,
+): Promise<Record<string, unknown>> {
+  let step = expectAdapterOperationStep(initial, `adapter ${operationKind} result`);
+  let complete = false;
+  try {
+    for (;;) {
+      throwIfCancelled(active);
+      active.adapter = adapter;
+      active.operationHandle = step.operationHandle;
+      active.operationRevision = step.operationRevision;
+      if (step.kind === "complete") {
+        complete = true;
+        delete active.operationHandle;
+        delete active.operationRevision;
+        const payload = operationPayload(step, `adapter ${operationKind} completion`);
+        if (payload.operationKind !== operationKind) {
+          throw new ProtocolFault(
+            "PROTOCOL_INCOMPATIBLE",
+            `Adapter completed ${String(payload.operationKind)} while ${operationKind} was active`,
+          );
+        }
+        return payload;
+      }
+      step = await advanceAdapterOperationStep(
+        adapter,
+        source,
+        step,
+        active,
+        adapterId,
+      );
+    }
+  } finally {
+    if (!complete && active.operationHandle !== undefined) {
+      cancelOwnedOperation(active, adapter);
+    }
+  }
+}
+
+async function advanceAdapterOperationStep(
+  adapter: AdapterRuntime,
+  source: Blob,
+  value: AdapterOperationStep,
+  active: ActiveOpenRequest | ActiveRangeRequest | ActiveAsyncRequest | undefined,
+  adapterId: OfficialAdapterId,
+  measurement?: OperationMeasurement,
+): Promise<AdapterOperationStep> {
+  const step = expectAdapterOperationStep(value, "adapter operation step");
+  if (step.kind === "complete") {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", "A completed adapter operation was continued");
+  }
+  if (active) {
+    active.operationHandle = step.operationHandle;
+    active.operationRevision = step.operationRevision;
+    throwIfCancelled(active);
+  }
+
+  const limits = requireMemoryLimits();
+  const readLimit = operationReadLimit(adapterId, limits);
+  let totalBytes = 0;
+  const ranges = step.actions.map((action) => {
+    const end = checkedSourceRangeEnd(action.offset, action.length, source.size);
+    totalBytes += action.length;
+    if (!Number.isSafeInteger(totalBytes) || end === undefined) {
+      throw new ProtocolFault(
+        "RESOURCE_LIMIT",
+        "Adapter source action exceeds the source or safe integer range",
+        false,
+        {
+          resource: operationResource(adapterId),
+          requiredBytes: Number.isSafeInteger(totalBytes) ? totalBytes : Number.MAX_SAFE_INTEGER,
+          availableBytes: readLimit,
+          offset: action.offset,
+          sourceLength: source.size,
+        },
+      );
+    }
+    return Object.freeze({ action, end });
+  });
+  if (totalBytes > readLimit) {
+    throw new ProtocolFault(
+      "RESOURCE_LIMIT",
+      "Adapter operation actions exceed the operation memory budget",
+      false,
+      {
+        resource: operationResource(adapterId),
+        requiredBytes: totalBytes,
+        availableBytes: readLimit,
+        actionCount: ranges.length,
+      },
+    );
+  }
+
+  const reads: ReservedBlobRead[] = [];
+  const results: AdapterActionResult[] = [];
+  try {
+    if (ranges.length === 0) {
+      const yielded = new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0));
+      if (active) await awaitOperationStep(yielded, active);
+      else await yielded;
+    } else {
+      for (const { action, end } of ranges) {
+        const reservation = reserveOperationMemory(adapterId, action.length);
+        const read = await acquireReservedBlobRead(
+          sliceReservedSource(source, action.offset, end, reservation),
+          reservation,
+          active,
+          action.length,
+        );
+        reads.push(read);
+        const bytes = new Uint8Array(read.buffer);
+        recordSourceRead(measurement, bytes.byteLength);
+        results.push(Object.freeze({
+          actionIndex: action.actionIndex,
+          offset: action.offset,
+          bytes,
+          eof: end === source.size,
+        }));
+        if (active) throwIfCancelled(active);
+      }
+    }
+    const continuation = Promise.resolve().then(() => adapter.continueOperation(
+      step.operationHandle,
+      step.operationRevision,
+      results,
+    ));
+    const rawNext = active
+      ? await awaitOperationStep(continuation, active)
+      : await continuation;
+    const next = expectAdapterOperationStep(rawNext, "adapter continuation result");
+    if (
+      next.operationHandle !== step.operationHandle
+      || next.operationRevision !== step.operationRevision + 1
+    ) {
+      throw new ProtocolFault(
+        "PROTOCOL_INCOMPATIBLE",
+        "Adapter continuation returned a missing, duplicate, or stale operation revision",
+      );
+    }
+    if (active) {
+      active.operationRevision = next.operationRevision;
+    }
+    return next;
+  } finally {
+    for (const read of reads) read.release();
+  }
+}
+
+function expectAdapterOperationStep(value: unknown, name: string): AdapterOperationStep {
+  const raw = expectRecord(value, name);
+  if (raw.kind !== "pending" && raw.kind !== "progress" && raw.kind !== "complete") {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", `${name} has an invalid kind`);
+  }
+  const handle = operationHandle(raw.operationHandle, `${name} operationHandle`);
+  const revision = nonNegativeSafeInteger(raw.operationRevision, `${name} operationRevision`);
+  if (revision === 0) {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", `${name} operationRevision must be positive`);
+  }
+  if (!Array.isArray(raw.actions) || raw.actions.length > 32) {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", `${name} may request at most 32 ranges`);
+  }
+  const indexes = new Set<number>();
+  const actions = raw.actions.map((value, index): AdapterReadAction => {
+    const action = expectRecord(value, `${name} action ${index}`);
+    if (action.kind !== "read-bytes") {
+      throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", `${name} requested an unsupported action`);
+    }
+    const actionIndex = nonNegativeSafeInteger(action.actionIndex, `${name} actionIndex`);
+    if (actionIndex > 0xffff_ffff || indexes.has(actionIndex)) {
+      throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", `${name} action indexes must be unique u32 values`);
+    }
+    indexes.add(actionIndex);
+    const offset = nonNegativeSafeInteger(action.offset, `${name} action offset`);
+    const length = nonNegativeSafeInteger(action.length, `${name} action length`);
+    return Object.freeze({ kind: "read-bytes", actionIndex, offset, length });
+  });
+  const cooperativeYield = raw.cooperativeYield === true;
+  if (raw.kind === "complete" && (actions.length !== 0 || cooperativeYield)) {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", `${name} completion requested more work`);
+  }
+  if (raw.kind !== "complete" && actions.length === 0 && !cooperativeYield) {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", `${name} omitted both actions and a yield`);
+  }
+  if (actions.length !== 0 && cooperativeYield) {
+    throw new ProtocolFault("PROTOCOL_INCOMPATIBLE", `${name} combined actions and a yield`);
+  }
+  return Object.freeze({
+    kind: raw.kind,
+    operationHandle: handle,
+    operationRevision: revision,
+    actions: Object.freeze(actions),
+    cooperativeYield,
+    ...adapterStepPayload(raw),
+  });
+}
+
+function adapterStepPayload(raw: Record<string, unknown>): Readonly<{ payload?: unknown }> {
+  if (raw.payload !== undefined) return Object.freeze({ payload: raw.payload });
+  const payload = Object.fromEntries(Object.entries(raw).filter(([key]) => (
+    key !== "kind"
+    && key !== "operationHandle"
+    && key !== "operationRevision"
+    && key !== "actions"
+    && key !== "cooperativeYield"
+  )));
+  return Object.keys(payload).length === 0
+    ? Object.freeze({})
+    : Object.freeze({ payload: Object.freeze(payload) });
+}
+
+function operationPayload(
+  step: AdapterOperationStep,
+  name: string,
+): Record<string, unknown> {
+  return expectRecord(step.payload, `${name} payload`);
+}
+
 function cancelOwnedOperation(
-  active: ActiveOpenRequest | ActiveRangeRequest,
+  active: ActiveRequest,
   adapter = active.adapter,
 ): void {
   const handle = active.operationHandle;
@@ -2763,6 +2785,7 @@ function cancelOwnedOperation(
   // Take ownership before invoking an adapter: cancellation failures and
   // outer finally blocks must not retry a non-idempotent private operation.
   delete active.operationHandle;
+  delete active.operationRevision;
   try {
     adapter?.cancelOperation(handle);
   } catch {

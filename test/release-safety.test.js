@@ -9,7 +9,7 @@ test("release tags cannot bypass main, prerequisite runs, or protected environme
   assert.match(workflow, /actions: read/u);
   assert.match(workflow, /git rev-parse "\$\{GITHUB_REF_NAME\}\^\{commit\}"/u);
   assert.match(workflow, /git ls-remote origin refs\/heads\/main/u);
-  assert.match(workflow, /for workflow in "CI" "GitHub Pages"/u);
+  assert.match(workflow, /for workflow in "CI" "GitHub Pages" "M6 Large Files"/u);
   assert.match(workflow, /\.head_sha == \$sha/u);
   assert.match(workflow, /\.conclusion == "success"/u);
   assert.match(workflow, /grep -Fx "## \$\{version\}" CHANGELOG\.md/u);
@@ -102,6 +102,7 @@ test("pre-tag checks require a finalized clean candidate and external release fa
     "owners",
     'assertSuccessfulWorkflow("CI", head)',
     'assertSuccessfulWorkflow("GitHub Pages", head)',
+    'assertSuccessfulWorkflow("M6 Large Files", head)',
     "GH_TOKEN",
   ]) {
     assert.ok(preflight.includes(required), `preflight must retain ${required}`);
@@ -109,4 +110,23 @@ test("pre-tag checks require a finalized clean candidate and external release fa
   assert.match(preflight, /\^## \$\{escapeRegExp\(cargoVersion\)\}\$/u);
   assert.match(preflight, /has \*\*not\*\* been published/u);
   assert.doesNotMatch(preflight, /\(\?: — unreleased\)\?/u);
+});
+
+test("M6 generates and deletes five exact 2 GiB containers without artifacting fixtures", async () => {
+  const workflow = await readFile(
+    new URL("../.github/workflows/large-files.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(workflow, /^name: M6 Large Files$/mu);
+  assert.match(workflow, /timeout-minutes: 240/u);
+  assert.match(workflow, /for format in csv arrow parquet xlsx xls; do/u);
+  assert.match(workflow, /available_kib < 4 \* 1024 \* 1024/u);
+  assert.match(workflow, /--size 2147483648/u);
+  assert.match(workflow, /test "\$apparent" -eq 2147483648/u);
+  assert.match(workflow, /timeout --signal=TERM 45m/u);
+  assert.match(workflow, /--project=chromium --workers=1 --retries=0/u);
+  assert.match(workflow, /rm -f -- "\$fixture"/u);
+  assert.doesNotMatch(workflow, /path:[^\n]*tabulark-m6-/u);
+  assert.match(workflow, /target\/m6-generator\/tabulark-large-fixture-generator/u);
+  assert.doesNotMatch(workflow, /tools\/large-fixture-generator\/target\/$/mu);
 });

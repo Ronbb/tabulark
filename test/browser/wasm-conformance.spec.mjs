@@ -187,7 +187,7 @@ test("four real WASM adapters share successful, failed, recovered, and cascading
   });
 });
 
-test("four real WASM runtimes conform to ABI v2 cancellation and idempotent cleanup", async ({
+test("four real WASM runtimes conform to ABI v3 cancellation and idempotent cleanup", async ({
   page,
 }) => {
   await page.goto("/target/pages/index.html");
@@ -227,7 +227,7 @@ test("four real WASM runtimes conform to ABI v2 cancellation and idempotent clea
 
       let illegalHandleCode;
       try {
-        runtime.continueOperation(0, 0, new Uint8Array(), false);
+        runtime.continueOperation(0, 1, []);
       } catch (error) {
         illegalHandleCode = error?.code;
       }
@@ -242,7 +242,11 @@ test("four real WASM runtimes conform to ABI v2 cancellation and idempotent clea
         adapterApiVersion: runtime.adapterApiVersion(),
         batchLayoutVersion: runtime.batchLayoutVersion(),
         firstKind: first.kind,
+        firstRevision: first.operationRevision,
+        firstActionCount: first.actions.length,
         secondKind: second.kind,
+        secondRevision: second.operationRevision,
+        secondActionCount: second.actions.length,
         firstCancelled,
         firstCancelledAgain,
         secondCancelled,
@@ -258,9 +262,13 @@ test("four real WASM runtimes conform to ABI v2 cancellation and idempotent clea
   expect(results.map(({ id }) => id)).toEqual(runtimes.map(({ id }) => id));
   for (const result of results) {
     expect(result).toMatchObject({
-      protocolVersion: 3,
-      adapterApiVersion: 2,
+      protocolVersion: 4,
+      adapterApiVersion: 3,
       batchLayoutVersion: 1,
+      firstRevision: 1,
+      firstActionCount: 1,
+      secondRevision: 1,
+      secondActionCount: 1,
       firstCancelled: true,
       firstCancelledAgain: false,
       secondCancelled: true,
@@ -269,8 +277,8 @@ test("four real WASM runtimes conform to ABI v2 cancellation and idempotent clea
       closedUnknownTable: false,
       closedUnknownSource: false,
     });
-    expect(["read-bytes", "open-progress"]).toContain(result.firstKind);
-    expect(["read-bytes", "open-progress"]).toContain(result.secondKind);
+    expect(["pending", "progress"]).toContain(result.firstKind);
+    expect(["pending", "progress"]).toContain(result.secondKind);
   }
 });
 
@@ -302,26 +310,49 @@ test("real WASM operations reject invalid steps, cancel pending reads, and relea
       return new Uint8Array(await response.arrayBuffer());
     };
 
-    const drive = (runtime, initial, source) => {
+    const drive = (runtime, initial, source, operationKind) => {
       let step = initial;
       for (let index = 0; index < 1_024; index += 1) {
-        if (step.kind === "open-complete" || step.kind === "read-complete") return step;
-        if (
-          (step.kind !== "read-bytes" && step.kind !== "open-progress")
-          || step.action?.kind !== "read-bytes"
-        ) {
+        if (step.kind === "complete") {
+          if (step.operationKind !== operationKind) {
+            throw new Error(`expected ${operationKind}, received ${String(step.operationKind)}`);
+          }
+          return step;
+        }
+        if (step.kind !== "pending" && step.kind !== "progress") {
           throw new Error(`unexpected ${String(step.kind)} operation step`);
         }
-        const { offset, length } = step.action;
-        const end = offset + length;
-        if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || end > source.length) {
-          throw new Error(`invalid adapter byte request ${String(offset)}+${String(length)}`);
+        if (!Array.isArray(step.actions)) {
+          throw new Error("adapter operation actions must be an array");
         }
+        if (step.actions.length === 0 && step.cooperativeYield !== true) {
+          throw new Error("empty adapter operation step did not request a cooperative yield");
+        }
+        const results = step.actions.map((action) => {
+          if (action.kind !== "read-bytes") {
+            throw new Error(`unexpected ${String(action.kind)} adapter action`);
+          }
+          const { actionIndex, offset, length } = action;
+          const end = offset + length;
+          if (
+            !Number.isSafeInteger(actionIndex)
+            || !Number.isSafeInteger(offset)
+            || !Number.isSafeInteger(length)
+            || end > source.length
+          ) {
+            throw new Error(`invalid adapter byte request ${String(offset)}+${String(length)}`);
+          }
+          return {
+            actionIndex,
+            offset,
+            bytes: source.slice(offset, end),
+            eof: end === source.length,
+          };
+        });
         step = runtime.continueOperation(
           step.operationHandle,
-          offset,
-          source.slice(offset, end),
-          end === source.length,
+          step.operationRevision,
+          results,
         );
       }
       throw new Error("adapter operation exceeded the conformance step limit");
@@ -348,34 +379,44 @@ test("real WASM operations reject invalid steps, cancel pending reads, and relea
           cancelledOpenCycles += 1;
         }
 
-        // Feed an incorrect offset to a valid operation handle. The failed
-        // operation must be consumed so its source/parser reservation cannot
-        // survive into the recovery open.
+        // Feed an incorrect offset to a valid operation handle. ABI-v3 rejects
+        // the result set without consuming the valid revision, so explicitly
+        // cancel the still-owned operation before the recovery open.
         const invalid = runtime.beginOpen({}, source.length);
-        const invalidAction = invalid.action;
         let invalidStepCode = "resolved";
         try {
           runtime.continueOperation(
             invalid.operationHandle,
-            invalidAction.offset + 1,
-            source.slice(invalidAction.offset, invalidAction.offset + invalidAction.length),
-            false,
+            invalid.operationRevision,
+            invalid.actions.map((action, index) => ({
+              actionIndex: action.actionIndex,
+              offset: action.offset + (index === 0 ? 1 : 0),
+              bytes: source.slice(action.offset, action.offset + action.length),
+              eof: action.offset + action.length === source.length,
+            })),
           );
         } catch (error) {
           invalidStepCode = error?.code ?? error?.name ?? "unknown";
         }
-        const invalidOperationStillOpen = runtime.cancelOperation(invalid.operationHandle);
+        const invalidOperationCancelled = runtime.cancelOperation(invalid.operationHandle);
+        const invalidOperationCancelledAgain = runtime.cancelOperation(invalid.operationHandle);
 
-        const opened = drive(runtime, runtime.beginOpen({}, source.length), source);
+        const opened = drive(runtime, runtime.beginOpen({}, source.length), source, "open");
         const tableDescriptor = opened.tables[0];
-        const openedTable = runtime.openTable(opened.sourceHandle, tableDescriptor.id);
+        const openedTableStep = drive(
+          runtime,
+          runtime.beginOpenTable(opened.sourceHandle, tableDescriptor.id),
+          source,
+          "open-table",
+        );
+        const openedTable = openedTableStep.table;
         const request = { rowStart: 0, rowCount: 1, columnStart: 0, columnCount: 1 };
 
         const cancellableRead = runtime.beginRead(openedTable.tableHandle, request);
         const readStepKind = cancellableRead.kind;
         let readCancelled = null;
         let readCancelledAgain = null;
-        if (cancellableRead.kind === "read-bytes") {
+        if (cancellableRead.kind !== "complete") {
           readCancelled = runtime.cancelOperation(cancellableRead.operationHandle);
           readCancelledAgain = runtime.cancelOperation(cancellableRead.operationHandle);
         }
@@ -384,6 +425,7 @@ test("real WASM operations reject invalid steps, cancel pending reads, and relea
           runtime,
           runtime.beginRead(openedTable.tableHandle, request),
           source,
+          "read",
         );
         const closedTable = runtime.closeTable(openedTable.tableHandle);
         const closedTableAgain = runtime.closeTable(openedTable.tableHandle);
@@ -394,7 +436,8 @@ test("real WASM operations reject invalid steps, cancel pending reads, and relea
           id: runtime.adapterId(),
           cancelledOpenCycles,
           invalidStepCode,
-          invalidOperationStillOpen,
+          invalidOperationCancelled,
+          invalidOperationCancelledAgain,
           readStepKind,
           readCancelled,
           readCancelledAgain,
@@ -417,22 +460,96 @@ test("real WASM operations reject invalid steps, cancel pending reads, and relea
     expect(result).toMatchObject({
       cancelledOpenCycles: 12,
       invalidStepCode: "INVALID_ARGUMENT",
-      invalidOperationStillOpen: false,
-      recoveredReadKind: "read-complete",
+      invalidOperationCancelled: true,
+      invalidOperationCancelledAgain: false,
+      recoveredReadKind: "complete",
       closedTable: true,
       closedTableAgain: false,
       closedSource: true,
       closedSourceAgain: false,
     });
-    if (result.readStepKind === "read-bytes") {
+    if (result.readStepKind !== "complete") {
+      expect(["pending", "progress"]).toContain(result.readStepKind);
       expect(result.readCancelled).toBe(true);
       expect(result.readCancelledAgain).toBe(false);
     } else {
-      // Staged adapters may satisfy a small range synchronously and therefore
-      // have no in-flight read handle to cancel.
-      expect(result.readStepKind).toBe("read-complete");
+      // An adapter may satisfy a small indexed range synchronously and
+      // therefore have no in-flight read handle to cancel.
+      expect(result.readStepKind).toBe("complete");
       expect(result.readCancelled).toBeNull();
       expect(result.readCancelledAgain).toBeNull();
     }
   }
+});
+
+test("Excel presentation over-budget degrades to null while table data remains readable", async ({
+  page,
+}) => {
+  await page.goto("/target/pages/index.html");
+  const result = await page.evaluate(async () => {
+    const module = await import("/target/pages/dist/wasm/excel/tabulark_excel.js");
+    await module.default();
+    const response = await fetch("/test/fixtures/excel/v1/tabulark-ooxml.xlsx");
+    if (!response.ok) throw new Error(`fixture returned HTTP ${response.status}`);
+    const source = new Uint8Array(await response.arrayBuffer());
+    const runtime = new module.WasmRuntime({
+      memoryBudgetBytes: 8 * 1024 * 1024,
+      maxBatchBytes: 512,
+      maxRangeCells: 250_000,
+      maxSources: 2,
+    });
+    const drive = (initial, operationKind) => {
+      let step = initial;
+      for (let count = 0; count < 256; count += 1) {
+        if (step.kind === "complete") {
+          if (step.operationKind !== operationKind) throw new Error("operation kind mismatch");
+          return step;
+        }
+        const results = step.actions.map((action) => {
+          const end = action.offset + action.length;
+          return {
+            actionIndex: action.actionIndex,
+            offset: action.offset,
+            bytes: source.slice(action.offset, end),
+            eof: end === source.length,
+          };
+        });
+        step = runtime.continueOperation(step.operationHandle, step.operationRevision, results);
+      }
+      throw new Error("Excel operation did not converge");
+    };
+    try {
+      const opened = drive(runtime.beginOpen({ format: "xlsx" }, source.length), "open");
+      const table = drive(
+        runtime.beginOpenTable(opened.sourceHandle, opened.tables[0].id),
+        "open-table",
+      ).table;
+      const presentation = runtime.beginPresentation(table.tableHandle);
+      const batch = runtime.beginRead(table.tableHandle, {
+        rowStart: 0,
+        rowCount: 1,
+        columnStart: 0,
+        columnCount: 1,
+      });
+      return {
+        presentation: presentation.presentation,
+        warning: presentation.warnings?.[0],
+        readKind: batch.kind,
+        buffers: batch.batch?.buffers?.length,
+      };
+    } finally {
+      runtime.shutdown();
+    }
+  });
+
+  expect(result).toMatchObject({
+    presentation: null,
+    warning: {
+      kind: "presentation-resource-limit",
+      resource: "presentation-output",
+    },
+    readKind: "complete",
+  });
+  expect(result.warning.requiredBytes).toBeGreaterThan(result.warning.availableBytes);
+  expect(result.buffers).toBeGreaterThan(0);
 });

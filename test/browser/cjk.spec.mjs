@@ -2,6 +2,8 @@ import { readFile } from "node:fs/promises";
 
 import { expect, test } from "@playwright/test";
 
+import { installClipboardContract, readClipboardText } from "./clipboard.mjs";
+
 const corpusRoot = new URL("../fixtures/csv/v1/", import.meta.url);
 const manifest = JSON.parse(await readFile(new URL("manifest.json", corpusRoot), "utf8"));
 const cjkCase = manifest.cases.find(({ id }) => id === "tsv-cjk-crlf-bom");
@@ -37,10 +39,11 @@ const expectedSemanticRows = [
 ];
 
 test("preserves CJK text from BOM/CRLF TSV through Canvas and clipboard", async ({
+  browserName,
   context,
   page,
 }) => {
-  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await installClipboardContract({ browserName, context, page });
   await page.goto("/test/browser/harness.html");
 
   const opened = await page.evaluate(
@@ -202,9 +205,7 @@ test("preserves CJK text from BOM/CRLF TSV through Canvas and clipboard", async 
 
     await page.keyboard.press("Control+C");
     await expect
-      .poll(async () =>
-        (await page.evaluate(() => navigator.clipboard.readText())).replaceAll("\r\n", "\n"),
-      )
+      .poll(async () => readClipboardText(page))
       .toBe(expectedClipboardText);
     await expect(view.locator("[data-tabulark-status]")).toHaveText(
       "Selection copied to clipboard.",

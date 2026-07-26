@@ -21,6 +21,7 @@ use tabulark::{ErrorCode, Result, TabularkError};
 use zip::ZipArchive;
 
 mod presentation;
+mod range;
 mod wasm;
 
 use presentation::{TablePresentation, TablePresentationRange, WorkbookPresentation};

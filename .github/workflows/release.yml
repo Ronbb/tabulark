@@ -40,7 +40,7 @@ jobs:
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2022-11-28' \
             "/repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${candidate}&per_page=100")"
-          for workflow in "CI" "GitHub Pages"; do
+          for workflow in "CI" "GitHub Pages" "M6 Large Files"; do
             if ! jq -e --arg workflow "$workflow" --arg sha "$candidate" \
               '[.workflow_runs[] | select(
                 .name == $workflow
@@ -188,22 +188,24 @@ jobs:
           npm run package:check
           npm run pages:check
 
-      - name: Install Chromium
-        run: npx --no-install playwright install --with-deps chromium
+      - name: Install pinned desktop browsers
+        run: npx --no-install playwright install --with-deps chromium firefox webkit
 
-      - name: Record exact Chromium version
+      - name: Record exact browser versions
         shell: bash
         run: |
           mkdir -p target/release
-          node --input-type=module <<'NODE' > target/release/chromium-version.txt
-          import { chromium } from "@playwright/test";
-          const browser = await chromium.launch({ headless: true });
-          console.log(`Playwright 1.61.1 / Chromium ${await browser.version()}`);
-          await browser.close();
+          node --input-type=module <<'NODE' > target/release/browser-versions.txt
+          import { chromium, firefox, webkit } from "@playwright/test";
+          for (const [name, type] of Object.entries({ Chromium: chromium, Firefox: firefox, WebKit: webkit })) {
+            const browser = await type.launch({ headless: true });
+            console.log(`Playwright 1.61.1 / ${name} ${await browser.version()}`);
+            await browser.close();
+          }
           NODE
-          cat target/release/chromium-version.txt
+          cat target/release/browser-versions.txt
 
-      - name: Run Chromium release gate
+      - name: Run three-browser release gate without retries
         run: npm run test:browser
 
       - name: Run performance and size gates
@@ -254,7 +256,7 @@ jobs:
           name: release-bundle-${{ github.ref_name }}
           path: |
             target/release/SHA256SUMS
-            target/release/chromium-version.txt
+            target/release/browser-versions.txt
             target/release/*.crate
             target/release/*.spdx.json
             target/release/*.tgz

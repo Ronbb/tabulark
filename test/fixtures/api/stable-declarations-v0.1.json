@@ -17,8 +17,8 @@
       "sha256": "38bac185d689852de466d1053b537d305f348145996bd58915c776fe20b22658"
     },
     "dist/client.d.ts": {
-      "bytes": 5524,
-      "sha256": "a1ae1b034d4f66dde70b0f0c7a5714edbe9298953cc3c31f6b91336c5d730d0e"
+      "bytes": 3020,
+      "sha256": "32c145a9bca20331f6bd70607a875aab8f22751a9be93f479d57cab573087278"
     },
     "dist/errors.d.ts": {
       "bytes": 1171,
@@ -29,8 +29,8 @@
       "sha256": "0e1fcf6c5e156a1cad4c30ea132ce4f1969dab0fea0825023381e87921cbb035"
     },
     "dist/index.d.ts": {
-      "bytes": 1488,
-      "sha256": "9d2439341e7cde6ae9eadb0c454c85b471a532b53e86506fe3dcdf0b877c438d"
+      "bytes": 1416,
+      "sha256": "6708023b53132b824fefd508ff649ab4e0df2791a7b3bf9801f26837c3fae247"
     },
     "dist/model.d.ts": {
       "bytes": 14898,
@@ -48,13 +48,9 @@
       "bytes": 2514,
       "sha256": "62f580a31cbfc61840ff06c2270e6b2440a0176efb2bd43b5f020af9833a76a6"
     },
-    "dist/source.d.ts": {
-      "bytes": 557,
-      "sha256": "2d5b3f47630a24af5ab32feec9680f8aaec7e7ff7e6a2dbeb382e9cb6cc6622a"
-    },
     "dist/view/canvas-table-view-public.d.ts": {
-      "bytes": 2735,
-      "sha256": "d1500f3855954ea59ee71dd6c8a9a8812290b5c178063548ae2144e329c94fbc"
+      "bytes": 2452,
+      "sha256": "8b0c81bc8af0deb119fb1b81b4fee065d6be6a67c42434c6f1bfff080afe815e"
     }
   }
 }

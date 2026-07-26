@@ -76,6 +76,7 @@ await assertNpmOwner();
 await assertCratesOwner();
 await assertSuccessfulWorkflow("CI", head);
 await assertSuccessfulWorkflow("GitHub Pages", head);
+await assertSuccessfulWorkflow("M6 Large Files", head);
 
 const deployed = await fetch("https://ronbb.github.io/tabulark/", {
   headers: { "user-agent": "tabulark-release-preflight" },
@@ -86,7 +87,7 @@ if (!deployed.ok) {
 }
 
 console.log(`Release preflight passed for ${requestedTag} at ${head}.`);
-console.log("Registry versions are unused, owners are correct, trusted publishers were confirmed, and CI/Pages are green.");
+console.log("Registry versions are unused, owners are correct, trusted publishers were confirmed, and CI/Pages/M6 are green for one SHA.");
 
 function requireConfirmation(flag, environmentName, message) {
   if (!process.argv.includes(flag) && process.env[environmentName] !== "1") {

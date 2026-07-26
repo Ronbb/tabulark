@@ -70,9 +70,6 @@ const requiredFiles = [
   "dist/worker.js",
   "dist/worker.js.map",
   "dist/worker.d.ts",
-  "dist/worker/large-excel-adapter.js",
-  "dist/worker/large-excel-adapter.js.map",
-  "dist/worker/large-excel-adapter.d.ts",
   ...officialManifest.adapters.flatMap(({ wasm }) => [
     `${wasm.outputDirectory}/${wasm.outputName}.js`.replace(/^dist\//u, "dist/"),
     `${wasm.outputDirectory}/${wasm.outputName}.d.ts`.replace(/^dist\//u, "dist/"),

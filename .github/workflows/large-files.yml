@@ -1,0 +1,158 @@
+name: M6 Large Files
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m6-large-files-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-runtime:
+    name: Build native generator and browser runtime
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust and WebAssembly target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install matching wasm-bindgen CLI
+        shell: bash
+        run: |
+          version="$(cargo metadata --format-version 1 --locked --no-default-features --features wasm | jq -er '[.packages[] | select(.name == "wasm-bindgen") | .version][0]')"
+          target="x86_64-unknown-linux-musl"
+          archive="wasm-bindgen-${version}-${target}.tar.gz"
+          checksum="${archive}.sha256sum"
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
+            --output "$RUNNER_TEMP/$archive" \
+            "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/${archive}"
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
+            --output "$RUNNER_TEMP/$checksum" \
+            "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/${checksum}"
+          expected="$(awk '{ print $1 }' "$RUNNER_TEMP/$checksum")"
+          printf '%s  %s\n' "$expected" "$RUNNER_TEMP/$archive" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/wasm-bindgen-${version}-${target}" >> "$GITHUB_PATH"
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build shipped browser runtime and native generator
+        run: |
+          npm run build:pages
+          cargo build --release --manifest-path tools/large-fixture-generator/Cargo.toml
+          mkdir -p target/m6-generator
+          cp tools/large-fixture-generator/target/release/tabulark-large-fixture-generator target/m6-generator/
+
+      - name: Upload only runnable M6 assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: m6-runtime-${{ github.sha }}
+          path: |
+            target/m6-generator/tabulark-large-fixture-generator
+            target/pages/
+          if-no-files-found: error
+          retention-days: 3
+
+  exact-two-gib:
+    name: Five exact 2 GiB containers in Chromium
+    needs: build-runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install JavaScript test dependencies
+        run: npm ci
+
+      - name: Install pinned Chromium
+        run: npx --no-install playwright install --with-deps chromium
+
+      - name: Download native generator and prebuilt browser runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: m6-runtime-${{ github.sha }}
+          path: target
+
+      - name: Generate, test, and remove each exact container
+        shell: bash
+        run: |
+          set -euo pipefail
+          generator="target/m6-generator/tabulark-large-fixture-generator"
+          chmod +x "$generator"
+          mkdir -p target/bench/m6
+
+          cleanup_fixture() {
+            if [[ -n "${fixture:-}" ]]; then
+              rm -f -- "$fixture"
+            fi
+          }
+          trap cleanup_fixture EXIT
+
+          for format in csv arrow parquet xlsx xls; do
+            available_kib="$(df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }')"
+            if (( available_kib < 4 * 1024 * 1024 )); then
+              echo "M6 requires at least 4 GiB free before $format; found ${available_kib} KiB" >&2
+              exit 1
+            fi
+
+            fixture="$RUNNER_TEMP/tabulark-m6-${format}.${format}"
+            input=()
+            case "$format" in
+              arrow) input=(--input test/fixtures/arrow/v1/m4-sample.arrow) ;;
+              parquet) input=(--input test/fixtures/parquet/v1/tabulark-rust.parquet) ;;
+              xlsx) input=(--input test/fixtures/excel/v1/tabulark-ooxml.xlsx) ;;
+              xls) input=(--input test/fixtures/excel/v1/tabulark-biff8.xls) ;;
+            esac
+
+            "$generator" generate --format "$format" "${input[@]}" --output "$fixture" --size 2147483648 \
+              | tee "target/bench/m6/${format}-generator.json"
+            apparent="$(stat --format='%s' "$fixture")"
+            allocated="$(du --block-size=1 "$fixture" | awk '{ print $1 }')"
+            printf '{"format":"%s","apparentBytes":%s,"allocatedBytes":%s}\n' \
+              "$format" "$apparent" "$allocated" \
+              | tee "target/bench/m6/${format}-disk.json"
+            test "$apparent" -eq 2147483648
+
+            TABULARK_LARGE_FIXTURE_PATH="$fixture" \
+            TABULARK_LARGE_FIXTURE_FORMAT="$format" \
+              timeout --signal=TERM 45m npx --no-install playwright test \
+                test/browser/m6-large-file.spec.mjs \
+                --project=chromium --workers=1 --retries=0
+
+            rm -f -- "$fixture"
+            fixture=""
+          done
+
+      - name: Upload M6 evidence without generated fixtures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m6-evidence-${{ github.sha }}
+          path: |
+            target/bench/m6/
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore
+          retention-days: 14

@@ -694,6 +694,24 @@
         font-weight: 700;
       }
 
+      /* Firefox can report a 44 CSS px flex target fractionally below 44
+         after font/device rounding. Give only Gecko one physical CSS pixel
+         of guard room without changing Chromium's pixel snapshots. */
+      @supports (-moz-appearance: none) {
+        button,
+        input[type="text"],
+        select,
+        .file-label,
+        summary,
+        .skip-link,
+        .brand,
+        .header-nav a,
+        .header-github,
+        .footer-link {
+          min-height: calc(2.75rem + 1px);
+        }
+      }
+
       @media (max-width: 48rem) {
         .hero { grid-template-columns: 1fr; min-height: auto; }
         .flow-card { max-width: 35rem; }
@@ -946,10 +964,10 @@
     </style>
   </head>
   <body id="top">
-    <a class="skip-link" href="#playground">Skip to playground</a>
+    <a class="skip-link" href="#playground" tabindex="0">Skip to playground</a>
     <header class="app-header">
       <div class="header-inner">
-        <a class="brand" href="#top" aria-label="Tabulark home">
+        <a class="brand" href="#top" aria-label="Tabulark home" tabindex="0">
           <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
             <rect x="3.5" y="4.5" width="25" height="23" rx="5" fill="none" stroke="currentColor" stroke-width="2" />
             <path d="M4.5 12h23M12 5.5v21M20 5.5v21" fill="none" stroke="currentColor" stroke-width="2" />

@@ -1,8 +1,8 @@
-/** Version 3 introduces multi-table presentation and discriminated adapter steps. */
-export const PROTOCOL_VERSION = 3 as const;
+/** Version 4 introduces resumable, revisioned operations and main-thread batch ownership. */
+export const PROTOCOL_VERSION = 4 as const;
 
 /** Version of the private, built-in Rust adapter contract. */
-export const ADAPTER_API_VERSION = 2 as const;
+export const ADAPTER_API_VERSION = 3 as const;
 
 /** Version of the descriptor + deduplicated-buffer batch transport. */
 export const BATCH_LAYOUT_VERSION = 1 as const;

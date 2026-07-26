@@ -4,11 +4,11 @@ const localPages = "/target/pages/index.html";
 
 test.setTimeout(120_000);
 
-test("playground auto-selects XLSX adapter when an uploaded file has no manual format choice", async ({ page }) => {
-  const wasmRequests = [];
-  page.on("request", (request) => {
-    if (isOfficialAdapterArtifact(request.url())) wasmRequests.push(request.url());
-  });
+test("playground auto-selects XLSX adapter when an uploaded file has no manual format choice", async (
+  { page },
+  testInfo,
+) => {
+  const requestScope = await beginRequestLedger(page, testInfo, "xlsx-auto");
   await page.goto(localPages);
   await expect(page.getByTestId("app")).toHaveAttribute("data-state", "idle");
 
@@ -35,45 +35,55 @@ test("playground auto-selects XLSX adapter when an uploaded file has no manual f
   const grid = page.locator("[data-tabulark-a11y-grid]");
   await expect(grid).toContainText("城市数据");
   await expect(grid).toContainText("上海");
-  // Explicit large-mode OOXML is served by the bounded range-backed host
-  // parser, so it does not need to fetch the staged Excel WASM artifact.
-  expectRequests(wasmRequests, { delimited: 0, arrow: 0, parquet: 0, excel: 0 });
+  // Explicit large-mode OOXML is served by the bounded Rust range runtime.
+  expectRequests(await scopedRequests(page, requestScope), {
+    delimited: 0, arrow: 0, parquet: 0, excel: 1,
+  });
 });
 
-test("all five supported local formats use only their requested lazy adapter artifacts", async ({ page }) => {
-  const wasmRequests = [];
+test("all five supported local formats use only their requested lazy adapter artifacts", async (
+  { page },
+  testInfo,
+) => {
+  const requestScope = await beginRequestLedger(page, testInfo, "all-formats");
   const errors = [];
-  page.on("request", (request) => {
-    if (isOfficialAdapterArtifact(request.url())) wasmRequests.push(request.url());
-  });
   page.on("console", (message) => {
     if (message.type() === "error") errors.push(message.text());
   });
   page.on("pageerror", (error) => errors.push(error.message));
-
   await page.goto(localPages);
   await expect(page.getByTestId("app")).toHaveAttribute("data-state", "idle");
-  expect(wasmRequests).toEqual([]);
+  expectRequests(await scopedRequests(page, requestScope), {
+    delimited: 0, arrow: 0, parquet: 0, excel: 0,
+  });
 
   await page.getByTestId("sample-button").click();
   await expectReady(page, "2,000 rows are ready");
-  expectRequests(wasmRequests, { delimited: 1, arrow: 0, parquet: 0, excel: 0 });
+  expectRequests(await scopedRequests(page, requestScope), {
+    delimited: 1, arrow: 0, parquet: 0, excel: 0,
+  });
 
   await page.getByTestId("arrow-sample-button").click();
   await expectReady(page, "4 rows are ready");
   await expect(page.locator("[data-tabulark-a11y-grid]")).toContainText("你好，Arrow");
-  expectRequests(wasmRequests, { delimited: 1, arrow: 1, parquet: 0, excel: 0 });
+  expectRequests(await scopedRequests(page, requestScope), {
+    delimited: 1, arrow: 1, parquet: 0, excel: 0,
+  });
 
   await openFixture(page, "parquet", "tabulark-rust.parquet", "application/vnd.apache.parquet");
   await expectReady(page, "4 rows are ready");
   await expect(page.locator("[data-tabulark-a11y-grid]")).toContainText("上海");
   await expect(page.locator("[data-tabulark-a11y-grid]")).toContainText("São Paulo");
-  expectRequests(wasmRequests, { delimited: 1, arrow: 1, parquet: 1, excel: 0 });
+  expectRequests(await scopedRequests(page, requestScope), {
+    delimited: 1, arrow: 1, parquet: 1, excel: 0,
+  });
 
   await openFixture(page, "xls", "tabulark-biff8.xls", "application/vnd.ms-excel");
   await expectReady(page, "1 rows are ready");
   await expect(page.locator("[data-tabulark-a11y-grid]")).toContainText("BIFF8 smoke");
-  expectRequests(wasmRequests, { delimited: 1, arrow: 1, parquet: 1, excel: 1 });
+  expectRequests(await scopedRequests(page, requestScope), {
+    delimited: 1, arrow: 1, parquet: 1, excel: 1,
+  });
 
   await openFixture(
     page,
@@ -95,7 +105,9 @@ test("all five supported local formats use only their requested lazy adapter art
   await expect(view).toHaveAttribute("data-tabulark-frozen-rows", "1");
   await expect(view).toHaveAttribute("data-tabulark-frozen-columns", "1");
   // XLS and XLSX share one official lazy runtime and therefore do not fetch it twice.
-  expectRequests(wasmRequests, { delimited: 1, arrow: 1, parquet: 1, excel: 1 });
+  expectRequests(await scopedRequests(page, requestScope), {
+    delimited: 1, arrow: 1, parquet: 1, excel: 1,
+  });
 
   await openFixture(
     page,
@@ -105,7 +117,9 @@ test("all five supported local formats use only their requested lazy adapter art
   );
   await expectReady(page, "2 rows are ready");
   await expect(page.locator("[data-tabulark-a11y-grid]")).toContainText("Foo");
-  expectRequests(wasmRequests, { delimited: 1, arrow: 1, parquet: 1, excel: 1 });
+  expectRequests(await scopedRequests(page, requestScope), {
+    delimited: 1, arrow: 1, parquet: 1, excel: 1,
+  });
   expect(errors).toEqual([]);
 });
 
@@ -214,14 +228,43 @@ async function expectReady(page, message) {
 }
 
 function expectRequests(requests, expected) {
+  // Firefox may satisfy the generated JS binding from its module map without
+  // issuing another scoped HTTP request. The .wasm fetch is the stable,
+  // cross-engine proof that a runtime family was actually instantiated.
   for (const [adapter, count] of Object.entries(expected)) {
     expect(requests.filter((url) => (
-      url.includes(`/wasm/${adapter}/tabulark_${adapter}.js`)
-      || url.includes(`/wasm/${adapter}/tabulark_${adapter}_bg.wasm`)
-    ))).toHaveLength(count * 2);
+      url.includes(`/wasm/${adapter}/tabulark_${adapter}_bg.wasm`)
+    ))).toHaveLength(count);
   }
 }
 
 function isOfficialAdapterArtifact(url) {
   return /\/wasm\/(?:delimited|arrow|parquet|excel)\/tabulark_(?:delimited|arrow|parquet|excel)(?:\.js|_bg\.wasm)(?:[?#]|$)/u.test(url);
+}
+
+async function beginRequestLedger(page, testInfo, label) {
+  const scope = [
+    label,
+    testInfo.project.name,
+    testInfo.workerIndex,
+    testInfo.retry,
+    Date.now(),
+  ].join("-");
+  await page.context().setExtraHTTPHeaders({ "x-tabulark-test-scope": scope });
+  const response = await page.request.delete(
+    `/__tabulark-test/requests?scope=${encodeURIComponent(scope)}`,
+  );
+  expect(response.ok()).toBe(true);
+  return scope;
+}
+
+async function scopedRequests(page, scope) {
+  const response = await page.request.get(
+    `/__tabulark-test/requests?scope=${encodeURIComponent(scope)}`,
+  );
+  expect(response.ok()).toBe(true);
+  const entries = await response.json();
+  return entries
+    .map(({ path }) => new URL(path, "http://tabulark.test").href)
+    .filter(isOfficialAdapterArtifact);
 }

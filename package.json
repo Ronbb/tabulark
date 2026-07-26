@@ -48,6 +48,7 @@
     "build:wasm": "node scripts/build-wasm.mjs",
     "benchmark:arrow": "node test/performance/run-arrow-matrix.mjs",
     "benchmark:canonical": "node test/performance/run-browser.mjs --scenario canonical --output test/performance/baselines/windows-chromium-16mib.json",
+    "benchmark:compare": "node scripts/run-performance-gate.mjs",
     "benchmark:formats": "node test/performance/run-format-smoke.mjs",
     "benchmark:size": "node test/performance/measure-sizes.mjs",
     "benchmark:smoke": "node test/performance/run-browser.mjs --scenario smoke --output target/bench/performance-smoke.json",

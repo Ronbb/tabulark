@@ -1,11 +1,15 @@
-import { defineConfig, devices } from "@playwright/test";
+import { defineConfig } from "@playwright/test";
 
 const host = process.env.TABULARK_TEST_HOST ?? "127.0.0.1";
 const port = Number(process.env.TABULARK_TEST_PORT ?? 4173);
 const deployedBaseURL = process.env.TABULARK_DEPLOYED_BASE_URL?.trim();
 const baseURL = deployedBaseURL || `http://${host}:${port}`;
 const browserChannel = process.env.TABULARK_BROWSER_CHANNEL?.trim();
-const localBrowser = browserChannel ? { channel: browserChannel } : {};
+const chromiumChannel = browserChannel ? { channel: browserChannel } : {};
+const chromiumOnly = [
+  "**/visual.spec.mjs",
+  "**/m6-large-file.spec.mjs",
+];
 
 export default defineConfig({
   testDir: "./test/browser",
@@ -13,7 +17,9 @@ export default defineConfig({
   globalSetup: deployedBaseURL ? undefined : "./test/browser/global-setup.mjs",
   fullyParallel: false,
   forbidOnly: Boolean(process.env.CI),
-  retries: process.env.CI ? 1 : 0,
+  // Release evidence must be a clean pass. A retry can still be requested
+  // explicitly while diagnosing a local failure, but CI never masks one.
+  retries: Number(process.env.TABULARK_PLAYWRIGHT_RETRIES ?? 0),
   reporter: process.env.CI ? "github" : "list",
   expect: {
     toHaveScreenshot: {
@@ -25,7 +31,6 @@ export default defineConfig({
     },
   },
   use: {
-    ...devices["Desktop Chrome"],
     baseURL,
     colorScheme: "light",
     deviceScaleFactor: 1,
@@ -39,7 +44,17 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      use: localBrowser,
+      use: { browserName: "chromium", ...chromiumChannel },
+    },
+    {
+      name: "firefox",
+      testIgnore: chromiumOnly,
+      use: { browserName: "firefox" },
+    },
+    {
+      name: "webkit",
+      testIgnore: chromiumOnly,
+      use: { browserName: "webkit" },
     },
   ],
 });

@@ -8,7 +8,7 @@ export const DEFAULT_TO_ROWS_CELL_LIMIT = 10_000;
 export const MAX_NESTING_DEPTH = 64;
 
 const INDEX_BUDGET_MAX_BYTES = 64 * 1024 * 1024;
-const WORKER_RANGE_CACHE_MAX_BYTES = 96 * 1024 * 1024;
+const ADAPTER_TILE_CACHE_MAX_BYTES = 96 * 1024 * 1024;
 const MAIN_THREAD_RANGE_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const FIELD_AND_BATCH_MAX_BYTES = 8 * 1024 * 1024;
 
@@ -24,8 +24,6 @@ export interface MemoryBudgetLimits {
   readonly operationBudgetBytes: number;
   readonly indexBudgetBytes: number;
   readonly adapterTileCacheBudgetBytes: number;
-  readonly workerRangeCacheBytes: number;
-  readonly workerDatasetRangeCacheBytes: number;
   readonly mainThreadRangeCacheBytes: number;
   readonly maxFieldBytes: number;
   readonly maxBatchBytes: number;
@@ -45,18 +43,12 @@ export function deriveMemoryBudgetLimits(memoryBudgetBytes: number): MemoryBudge
   // hard-coded split based on a historic number of built-in adapters.
   const adapterRuntimePoolBytes = Math.max(1, Math.floor(memoryBudgetBytes / 2));
   const operationBudgetBytes = Math.max(1, Math.floor(memoryBudgetBytes / 8));
-  const workerRangeCacheBytes = Math.min(
-    WORKER_RANGE_CACHE_MAX_BYTES,
-    Math.floor((memoryBudgetBytes / 8) * 3),
-  );
   return Object.freeze({
     memoryBudgetBytes,
     adapterRuntimePoolBytes,
     operationBudgetBytes,
     indexBudgetBytes: Math.min(INDEX_BUDGET_MAX_BYTES, oneEighth),
-    adapterTileCacheBudgetBytes: Math.min(WORKER_RANGE_CACHE_MAX_BYTES, operationBudgetBytes),
-    workerRangeCacheBytes,
-    workerDatasetRangeCacheBytes: Math.floor(workerRangeCacheBytes / MAX_SOURCES),
+    adapterTileCacheBudgetBytes: Math.min(ADAPTER_TILE_CACHE_MAX_BYTES, operationBudgetBytes),
     mainThreadRangeCacheBytes: Math.min(MAIN_THREAD_RANGE_CACHE_MAX_BYTES, oneEighth),
     maxFieldBytes: Math.min(FIELD_AND_BATCH_MAX_BYTES, oneThirtySecond),
     maxBatchBytes: Math.min(FIELD_AND_BATCH_MAX_BYTES, oneThirtySecond),
@@ -72,9 +64,7 @@ export type MemoryResourceKind =
   | "source-staging"
   | "compressed-page"
   | "decompression"
-  | "opened-worksheet"
-  | "batch"
-  | "range-cache";
+  | "batch";
 
 export interface MemoryReservation {
   readonly resource: MemoryResourceKind;

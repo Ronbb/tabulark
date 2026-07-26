@@ -195,6 +195,48 @@ test("committed M3 performance baseline records required memory evidence", async
   }
 });
 
+test("0.2 P0 gates keep paired medians, JavaScript shrinkage, and the frozen SHA", async () => {
+  const [baseline, gate, sizes, workflow] = await Promise.all([
+    readJson("./performance/baselines/v0.2-p0.json"),
+    readFile(new URL("../scripts/run-performance-gate.mjs", import.meta.url), "utf8"),
+    readFile(new URL("./performance/measure-sizes.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8"),
+  ]);
+
+  assert.equal(baseline.schemaVersion, 1);
+  assert.match(baseline.baselineSha, /^[0-9a-f]{40}$/u);
+  assert.equal(baseline.fixtureSeed, "tabulark-0.2-p0-2026-07-26");
+  assert.equal(
+    baseline.shippedJavaScript.candidateMaximumBytes,
+    Math.floor(baseline.shippedJavaScript.brotliBytes * 0.9),
+  );
+  assert.equal(
+    baseline.shippedJavaScript.workerMaximumBytes,
+    baseline.shippedJavaScript.workerBrotliBytes,
+  );
+  assert.equal(
+    baseline.shippedJavaScript.removedArtifact,
+    "dist/worker/large-excel-adapter.js",
+  );
+  for (const metric of [
+    "workerWasmStartupMs",
+    "firstUsablePaintMs",
+    "rangeReadMedianMs",
+    "cacheHitMs",
+    "lifecycleCloseMs",
+  ]) {
+    assert.ok(gate.includes(`"${metric}"`), `${metric} must stay in the paired gate`);
+  }
+  assert.match(gate, /pairs: 5, warmups: 1/u);
+  assert.match(gate, /pairs: 9, warmups: 2/u);
+  assert.match(gate, /baseline \* 1\.1/u);
+  assert.match(sizes, /candidateMaximumBytes/u);
+  assert.match(sizes, /workerMaximumBytes/u);
+  assert.match(sizes, /removedArtifact/u);
+  assert.match(workflow, /git worktree add --detach "\$baseline" "\$baseline_sha"/u);
+  assert.match(workflow, /node scripts\/run-performance-gate\.mjs --baseline-root/u);
+});
+
 async function readJson(relativePath) {
   return JSON.parse(await readFile(new URL(relativePath, import.meta.url), "utf8"));
 }

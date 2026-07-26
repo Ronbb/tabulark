@@ -80,7 +80,7 @@
         "allowedKeys": ["format", "sourceName"]
       },
       "resources": {
-        "sourceAccess": "staged",
+        "sourceAccess": "range",
         "supportsPresentation": true,
         "runtimeWeight": 2
       }

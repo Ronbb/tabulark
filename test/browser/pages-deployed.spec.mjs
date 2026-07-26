@@ -1,5 +1,7 @@
 import { expect, test } from "@playwright/test";
 
+import { installClipboardContract, readClipboardText } from "./clipboard.mjs";
+
 test.skip(
   !process.env.TABULARK_DEPLOYED_BASE_URL,
   "This smoke runs only after the GitHub Pages deployment step.",
@@ -8,10 +10,11 @@ test.skip(
 test.setTimeout(120_000);
 
 test("deployed Pages opens all supported local formats and stays console-clean", async ({
+  browserName,
   context,
   page,
 }) => {
-  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await installClipboardContract({ browserName, context, page });
   const browserErrors = [];
   const failedRequests = [];
   const wasmRequests = [];
@@ -125,7 +128,7 @@ test("deployed Pages opens all supported local formats and stays console-clean",
 });
 
 async function navigatorText(page) {
-  return (await page.evaluate(() => navigator.clipboard.readText())).replaceAll("\r\n", "\n");
+  return readClipboardText(page);
 }
 
 function expectAdapterRequests(requests, adapter, count) {

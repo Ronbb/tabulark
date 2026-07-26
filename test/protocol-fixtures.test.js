@@ -6,8 +6,8 @@ import { fileURLToPath } from "node:url";
 
 // Worker protocol and adapter ABI are intentionally private; the golden tests
 // pin them without creating a package export for their implementation module.
-const PROTOCOL_VERSION = 3;
-const ADAPTER_API_VERSION = 2;
+const PROTOCOL_VERSION = 4;
+const ADAPTER_API_VERSION = 3;
 const BATCH_LAYOUT_VERSION = 1;
 
 const protocolRoot = join(
@@ -18,6 +18,7 @@ const protocolRoot = join(
 const v1Directory = join(protocolRoot, "v1");
 const v2Directory = join(protocolRoot, "v2");
 const v3Directory = join(protocolRoot, "v3");
+const v4Directory = join(protocolRoot, "v4");
 const operations = new Set([
   "hello",
   "openSource",
@@ -49,7 +50,7 @@ test("protocol v1 fixtures remain immutable historical evidence", async () => {
   for (const file of files) {
     const payload = await fixture(v1Directory, file);
     assert.equal(payload.protocolVersion, 1, `${file} remains v1`);
-    assert.notEqual(payload.protocolVersion, PROTOCOL_VERSION, `${file} must be rejected by v3`);
+    assert.notEqual(payload.protocolVersion, PROTOCOL_VERSION, `${file} must be rejected by v4`);
   }
 });
 
@@ -65,7 +66,7 @@ test("protocol v2 fixtures remain immutable M4 evidence", async () => {
   for (const file of files) {
     const payload = await fixture(v2Directory, file);
     assert.equal(payload.protocolVersion, 2, `${file} protocolVersion`);
-    assert.notEqual(payload.protocolVersion, PROTOCOL_VERSION, `${file} must be rejected by v3`);
+    assert.notEqual(payload.protocolVersion, PROTOCOL_VERSION, `${file} must be rejected by v4`);
     validateEnvelope(payload, file);
   }
 
@@ -98,7 +99,7 @@ test("protocol v2 fixtures remain immutable M4 evidence", async () => {
   });
 });
 
-test("protocol v3 golden fixtures lock four adapters and presentation envelopes", async () => {
+test("protocol v3 fixtures remain immutable presentation-era evidence", async () => {
   const files = (await readdir(v3Directory)).sort();
   assert.deepEqual(files, [
     "hello-request.json",
@@ -112,7 +113,8 @@ test("protocol v3 golden fixtures lock four adapters and presentation envelopes"
 
   for (const file of files) {
     const payload = await fixture(v3Directory, file);
-    assert.equal(payload.protocolVersion, PROTOCOL_VERSION, `${file} protocolVersion`);
+    assert.equal(payload.protocolVersion, 3, `${file} protocolVersion`);
+    assert.notEqual(payload.protocolVersion, PROTOCOL_VERSION, `${file} must be rejected by v4`);
     validateEnvelope(payload, file);
   }
 
@@ -130,7 +132,7 @@ test("protocol v3 golden fixtures lock four adapters and presentation envelopes"
   );
 
   const helloResponse = await fixture(v3Directory, "hello-response.json");
-  assert.equal(helloResponse.result.data.adapterApiVersion, ADAPTER_API_VERSION);
+  assert.equal(helloResponse.result.data.adapterApiVersion, 2);
   assert.equal(helloResponse.result.data.batchLayoutVersion, BATCH_LAYOUT_VERSION);
 
   const rangeRequest = await fixture(v3Directory, "presentation-range-request.json");
@@ -167,6 +169,44 @@ test("protocol v3 golden fixtures lock four adapters and presentation envelopes"
   assert.deepEqual(presentationRange.result.data.mergedCells, [
     { rowStart: 4, rowCount: 2, columnStart: 1, columnCount: 2 },
   ]);
+});
+
+test("protocol v4 and adapter ABI v3 fixtures lock revisions, batches, and yields", async () => {
+  const files = (await readdir(v4Directory)).sort();
+  assert.deepEqual(files, [
+    "adapter-complete-step.json",
+    "adapter-pending-step.json",
+    "adapter-progress-step.json",
+    "hello-request.json",
+    "hello-response.json",
+  ]);
+
+  for (const file of ["hello-request.json", "hello-response.json"]) {
+    const payload = await fixture(v4Directory, file);
+    assert.equal(payload.protocolVersion, PROTOCOL_VERSION, `${file} protocolVersion`);
+    validateEnvelope(payload, file);
+  }
+  const helloResponse = await fixture(v4Directory, "hello-response.json");
+  assert.equal(helloResponse.result.data.adapterApiVersion, ADAPTER_API_VERSION);
+  assert.equal(helloResponse.result.data.batchLayoutVersion, BATCH_LAYOUT_VERSION);
+
+  const pending = await fixture(v4Directory, "adapter-pending-step.json");
+  assert.equal(pending.kind, "pending");
+  assert.equal(pending.operationRevision, 1);
+  assert.equal(pending.actions.length, 2);
+  assert.deepEqual(pending.actions.map(({ actionIndex }) => actionIndex), [0, 1]);
+  assert.ok(pending.actions.every(({ offset, length }) => Number.isSafeInteger(offset + length)));
+
+  const progress = await fixture(v4Directory, "adapter-progress-step.json");
+  assert.equal(progress.kind, "progress");
+  assert.equal(progress.operationRevision, 2);
+  assert.equal(progress.cooperativeYield, true);
+  assert.deepEqual(progress.actions, []);
+
+  const complete = await fixture(v4Directory, "adapter-complete-step.json");
+  assert.equal(complete.kind, "complete");
+  assert.equal(complete.operationRevision, 3);
+  assert.deepEqual(complete.actions, []);
 });
 
 function validateEnvelope(payload, file) {

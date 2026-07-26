@@ -201,8 +201,8 @@ class AdapterCaptureWorker {
     const kind = request.op === "hello" ? "hello" : "acknowledged";
     const data = request.op === "hello"
       ? {
-          protocolVersion: 3,
-          adapterApiVersion: 2,
+          protocolVersion: 4,
+          adapterApiVersion: 3,
           batchLayoutVersion: 1,
           adapters: request.payload.adapters.map((adapter) => adapter.id),
           transferableBatches: true,
@@ -210,7 +210,7 @@ class AdapterCaptureWorker {
       : undefined;
     queueMicrotask(() => {
       const response = {
-        protocolVersion: 3,
+        protocolVersion: 4,
         requestId: request.requestId,
         status: "success",
         result: data === undefined ? { kind } : { kind, data },

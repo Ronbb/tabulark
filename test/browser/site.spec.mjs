@@ -1,5 +1,7 @@
 import { expect, test } from "@playwright/test";
 
+import { installClipboardContract, readClipboardText } from "./clipboard.mjs";
+
 async function expectLandingReady(page) {
   await expect(page).toHaveTitle(/Tabulark · Local table preview infrastructure/);
   await expect(
@@ -71,10 +73,11 @@ test("assembled Pages artifact keeps both adapter artifacts lazy and single-load
 });
 
 test("built Pages artifact opens and switches CSV, TSV, and Arrow with relative assets", async ({
+  browserName,
   context,
   page,
 }) => {
-  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await installClipboardContract({ browserName, context, page });
   await page.goto("/target/pages/index.html");
   await expectLandingReady(page);
 
@@ -229,7 +232,7 @@ test.describe("mobile landscape landing page", () => {
 });
 
 async function navigatorText(page) {
-  return (await page.evaluate(() => navigator.clipboard.readText())).replaceAll("\r\n", "\n");
+  return readClipboardText(page);
 }
 
 async function expectFocusedOutline(page, selector) {

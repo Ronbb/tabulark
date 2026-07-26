@@ -20,6 +20,7 @@ const contentTypes = new Map([
 ]);
 
 function createTestServer({ crossOriginIsolated = false } = {}) {
+  const requestLedger = [];
   const isolationHeaders = crossOriginIsolated
     ? {
         "cross-origin-embedder-policy": "require-corp",
@@ -38,6 +39,45 @@ function createTestServer({ crossOriginIsolated = false } = {}) {
         response.end("ok");
         return;
       }
+      if (url.pathname === "/__tabulark-test/requests") {
+        const requestedScope = url.searchParams.get("scope");
+        if (request.method === "DELETE") {
+          if (requestedScope === null) {
+            requestLedger.length = 0;
+          } else {
+            for (let index = requestLedger.length - 1; index >= 0; index -= 1) {
+              if (requestLedger[index].scope === requestedScope) requestLedger.splice(index, 1);
+            }
+          }
+          response.writeHead(204, isolationHeaders);
+          response.end();
+          return;
+        }
+        if (request.method === "GET") {
+          const body = JSON.stringify(requestedScope === null
+            ? requestLedger
+            : requestLedger.filter(({ scope }) => scope === requestedScope));
+          response.writeHead(200, {
+            ...isolationHeaders,
+            "cache-control": "no-store",
+            "content-length": Buffer.byteLength(body),
+            "content-type": "application/json; charset=utf-8",
+          });
+          response.end(body);
+          return;
+        }
+        response.writeHead(405, { allow: "DELETE, GET" });
+        response.end();
+        return;
+      }
+
+      const scopeHeader = request.headers["x-tabulark-test-scope"];
+      requestLedger.push(Object.freeze({
+        method: request.method ?? "GET",
+        path: `${url.pathname}${url.search}`,
+        range: request.headers.range ?? null,
+        scope: typeof scopeHeader === "string" ? scopeHeader.slice(0, 128) : null,
+      }));
 
       const relativePath = decodeURIComponent(url.pathname).replace(/^\/+/, "");
       let requestedPath = resolve(

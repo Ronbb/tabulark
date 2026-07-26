@@ -85,6 +85,7 @@ let completedRowCount = 0;
 let lastSource;
 let lastDisplayName = "";
 let lastSourceSize = 0;
+let actualCapabilitySummary = "";
 let retrySource;
 let activeSource;
 let warningCount = 0;
@@ -122,6 +123,7 @@ sourceInput.addEventListener("change", () => {
 
 formatInput.addEventListener("change", () => {
   formatSelectionRevision += 1;
+  actualCapabilitySummary = "";
   updateSourceOptions();
   updateSourceSummary();
 });
@@ -330,6 +332,7 @@ async function openSource(source, displayName) {
     }
 
     dataset = openedDataset;
+    renderActualCapabilities();
     transition("indexing", `Preparing the first rows from ${displayName}…`);
     showEmptyState(
       "Preparing table preview",
@@ -350,6 +353,7 @@ async function openSource(source, displayName) {
     }
 
     table = openedTable;
+    renderActualCapabilities();
     view = createCanvasTableView({
       container: preview,
       table,
@@ -479,6 +483,8 @@ function handleDatasetEvent(event, operation, operationEngine, sourceSnapshot) {
     warningCount += 1;
     latestWarning = event.warning.message;
     renderWarnings();
+  } else if (event.type === "metadata") {
+    renderActualCapabilities();
   } else if (event.type === "runtimeError") {
     void handleDatasetFailure(event.error, operation, operationEngine);
   }
@@ -651,6 +657,9 @@ function showEmptyState(title, message) {
 }
 
 function rememberSource(source, displayName) {
+  if (source !== lastSource) {
+    actualCapabilitySummary = "";
+  }
   lastSource = source;
   lastDisplayName = displayName || source.name || "local source";
   lastSourceSize = typeof source.size === "number" ? source.size : source.byteLength;
@@ -848,7 +857,24 @@ function updateSourceSummary() {
   const modeLabel = isLocalFile
     ? `2 GiB local-file mode · ${lastSourceSize <= MAX_LARGE_SOURCE_BYTES ? "within limit" : "over limit"}`
     : "bounded source mode";
-  fileSummary.textContent = `${lastDisplayName} · ${formatBytes(lastSourceSize)} · ${formatLabel} · ${modeLabel} · estimated ${estimateCapability(formatInput.value, isLocalFile, lastSourceSize)}`;
+  const capability = actualCapabilitySummary || `estimated ${estimateCapability(formatInput.value, isLocalFile, lastSourceSize)}`;
+  fileSummary.textContent = `${lastDisplayName} · ${formatBytes(lastSourceSize)} · ${formatLabel} · ${modeLabel} · ${formatCount(lastSourceSize)} bytes exact · ${capability}`;
+}
+
+function renderActualCapabilities() {
+  if (dataset === undefined) {
+    return;
+  }
+  const datasetCapabilities = dataset.getCapabilities();
+  const tableCapabilities = table?.getCapabilities();
+  actualCapabilitySummary = [
+    `actual ${datasetCapabilities.sourceAccess}`,
+    tableCapabilities?.randomAccess,
+    datasetCapabilities.progressive ? "progressive" : "indexed open",
+    datasetCapabilities.multiTable ? "multi-table" : "single-table",
+    datasetCapabilities.presentation ? "presentation" : "data only",
+  ].filter(Boolean).join(" · ");
+  updateSourceSummary();
 }
 
 function estimateCapability(format, isLocalFile, sourceSize) {
@@ -864,9 +890,9 @@ function estimateCapability(format, isLocalFile, sourceSize) {
     case "parquet":
       return "footer and row-group ranges";
     case "xlsx":
-      return isLocalFile ? "range-backed OOXML (prototype)" : "bounded workbook staging";
+      return isLocalFile ? "range-backed OOXML" : "bounded workbook staging";
     case "xls":
-      return "bounded BIFF8 staging";
+      return isLocalFile ? "range-backed BIFF8/CFB" : "bounded BIFF8 staging";
     default:
       return "bounded adapter access";
   }

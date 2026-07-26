@@ -353,6 +353,15 @@ impl Runtime {
         self.sources.len()
     }
 
+    /// Returns the aggregate scanner/index allocation estimate retained by all
+    /// open sources. This excludes active range decoders and output buffers.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.sources.values().fold(0_usize, |total, scanner| {
+            total.saturating_add(scanner.estimated_index_bytes())
+        })
+    }
+
     /// Returns the number of active range decoders.
     #[must_use]
     pub fn active_range_count(&self) -> usize {

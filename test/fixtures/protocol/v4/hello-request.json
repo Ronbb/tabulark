@@ -1,0 +1,14 @@
+{
+  "protocolVersion": 4,
+  "requestId": "hello-v4",
+  "op": "hello",
+  "payload": {
+    "memoryBudgetBytes": 268435456,
+    "adapters": [
+      { "id": "tabulark:delimited" },
+      { "id": "tabulark:arrow-ipc" },
+      { "id": "tabulark:parquet" },
+      { "id": "tabulark:excel" }
+    ]
+  }
+}

@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 
 test.setTimeout(120_000);
 
-test("large-mode XLSX uses bounded range reads without loading the WASM Excel adapter", async ({ page }) => {
+test("large-mode XLSX uses bounded range reads through the Rust/WASM Excel adapter", async ({ page }) => {
   const wasmRequests = [];
   page.on("request", (request) => {
     if (request.url().includes("tabulark_excel")) wasmRequests.push(request.url());
@@ -63,7 +63,7 @@ test("large-mode XLSX uses bounded range reads without loading the WASM Excel ad
   expect(result.sourceBytes).toBeGreaterThan(0);
   expect(result.capabilities.sourceAccess).toBe("range");
   expect(result.capabilities.maxSourceBytes).toBe(2 * 1024 * 1024 * 1024);
-  expect(wasmRequests).toEqual([]);
+  expect(wasmRequests.length).toBeGreaterThan(0);
 });
 
 test("large-mode XLSX accepts a ZIP64 central-directory envelope", async ({ page }) => {

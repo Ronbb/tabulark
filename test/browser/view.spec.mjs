@@ -1,5 +1,7 @@
 import { expect, test } from "@playwright/test";
 
+import { installClipboardContract, readClipboardText } from "./clipboard.mjs";
+
 async function openSample(page) {
   await page.goto("/examples/csv-preview/");
   await page.getByRole("button", { name: "Try CSV sample" }).click();
@@ -142,8 +144,8 @@ test.describe("Canvas table view", () => {
     });
   });
 
-  test("supports keyboard range selection and copy as TSV", async ({ context, page }) => {
-    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  test("supports keyboard range selection and copy as TSV", async ({ browserName, context, page }) => {
+    await installClipboardContract({ browserName, context, page });
     const { grid } = await openSample(page);
 
     await grid.focus();
@@ -158,9 +160,7 @@ test.describe("Canvas table view", () => {
 
     await page.keyboard.press("Control+C");
     await expect
-      .poll(async () =>
-        (await page.evaluate(() => navigator.clipboard.readText())).replaceAll("\r\n", "\n"),
-      )
+      .poll(async () => readClipboardText(page))
       .toBe("Record 1\nRecord 2");
 
     await page.keyboard.press("Escape");
