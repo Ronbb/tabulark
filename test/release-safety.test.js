@@ -20,10 +20,24 @@ test("release tags cannot bypass main, prerequisite runs, or protected environme
   assert.match(workflow, /name: npm-release/u);
   assert.match(workflow, /TABULARK_NPM_TRUSTED_PUBLISHER_CONFIRMED/u);
   assert.match(workflow, /needs: \[verify, publish-crate\]/u);
+  assert.match(workflow, /needs: \[verify, publish-crate, approve-npm\]/u);
   assert.match(workflow, /needs: \[verify, publish-npm\]/u);
   assert.match(workflow, /registry-crate-smoke:/u);
   assert.match(workflow, /cargo add "tabulark@=\$\{VERSION\}" --features parquet,wasm/u);
   assert.match(workflow, /cargo check --locked/u);
+
+  const approvalJob = workflow.slice(
+    workflow.indexOf("  approve-npm:"),
+    workflow.indexOf("  publish-npm:"),
+  );
+  const publishJob = workflow.slice(
+    workflow.indexOf("  publish-npm:"),
+    workflow.indexOf("  github-release:"),
+  );
+  assert.match(approvalJob, /environment:\s*\n\s+name: npm-release/u);
+  assert.match(approvalJob, /TABULARK_NPM_TRUSTED_PUBLISHER_CONFIRMED/u);
+  assert.doesNotMatch(publishJob, /^\s+environment:/mu);
+  assert.match(publishJob, /id-token: write/u);
 });
 
 test("pre-tag checks require a finalized clean candidate and external release facts", async () => {

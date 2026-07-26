@@ -335,20 +335,28 @@ jobs:
             exit 1
           }
 
-  publish-npm:
-    name: Publish verified npm tarball
+  approve-npm:
+    name: Approve npm publish
     needs: [verify, publish-crate]
     runs-on: ubuntu-latest
     environment:
       name: npm-release
     permissions:
       contents: read
-      id-token: write
     steps:
       - name: Require protected-environment confirmation
         env:
           CONFIRMED: ${{ vars.TABULARK_NPM_TRUSTED_PUBLISHER_CONFIRMED }}
         run: test "$CONFIRMED" = "1"
+
+  publish-npm:
+    name: Publish verified npm tarball
+    needs: [verify, publish-crate, approve-npm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
 
       - name: Download verified release bundle
         uses: actions/download-artifact@v4

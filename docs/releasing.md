@@ -48,9 +48,11 @@ contents. Publishing is then serialized:
 1. `publish-crate` waits for the protected `cratesio-release` Environment.
    It checks registry availability again and uses the crates.io OIDC trusted
    publisher.
-2. `publish-npm` waits for the protected `npm-release` Environment and for the
-   crate job. It publishes the verified tarball with npm provenance rather than
-   rebuilding a different archive.
+2. `approve-npm` waits for the protected `npm-release` Environment and for the
+   crate job. After approval, `publish-npm` uses the established repository and
+   `release.yml` OIDC identity (without a GitHub Environment claim) to publish
+   the verified tarball with npm provenance rather than rebuilding a different
+   archive.
 3. `github-release` waits for npm. It attaches the recorded tarball checksum
    and SPDX SBOM to the GitHub Release.
 4. `registry-smoke` installs the published npm package into a clean consumer,
@@ -64,6 +66,11 @@ Repository administrators must configure both named Environments with required
 reviewers before enabling release tags. The workflow intentionally fails if the
 environment has not supplied `TABULARK_NPM_TRUSTED_PUBLISHER_CONFIRMED=1` or
 `TABULARK_CRATES_TRUSTED_PUBLISHER_CONFIRMED=1`.
+
+The npm Environment is deliberately an approval-only gate. The downstream
+publisher job has no Environment so its OIDC identity continues to match the
+trusted publisher established by the successful 0.0.x releases. No local npm
+login or long-lived npm token participates in publication.
 
 ## Immutable release semantics
 
