@@ -153,6 +153,9 @@ test("Pages waits for the exact deployed revision before its browser smoke", asy
   assert.match(workflow, /revision_url="\$\{TABULARK_DEPLOYED_BASE_URL%\/\}\/revision\.txt"/u);
   assert.match(workflow, /\$\{revision_url\}\?candidate=\$\{TABULARK_EXPECTED_REVISION\}/u);
   assert.match(workflow, /for attempt in \$\(seq 1 30\)/u);
+  assert.match(workflow, /actions\/configure-pages@v6/u);
+  assert.match(workflow, /actions\/upload-pages-artifact@v5/u);
+  assert.match(workflow, /actions\/deploy-pages@v5/u);
   assert.ok(readiness >= 0 && readiness < smoke, "revision readiness must precede smoke");
 });
 

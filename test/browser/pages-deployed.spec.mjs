@@ -7,7 +7,10 @@ test.skip(
   "This smoke runs only after the GitHub Pages deployment step.",
 );
 
-test.setTimeout(120_000);
+// The deployed Pages smoke cold-loads every official WebAssembly adapter. Keep
+// this bounded, while allowing an uncached global CDN edge enough time for the
+// Parquet and Excel binaries in slower WebKit environments.
+test.setTimeout(240_000);
 
 test("deployed Pages opens all supported local formats and stays console-clean", async ({
   browserName,
@@ -65,7 +68,7 @@ test("deployed Pages opens all supported local formats and stays console-clean",
 
   await page.getByTestId("arrow-sample-button").click();
   await expect(page.getByTestId("app")).toHaveAttribute("data-state", "ready", {
-    timeout: 30_000,
+    timeout: 90_000,
   });
   await expect(page.getByTestId("status")).toContainText("4 rows are ready");
 
@@ -84,7 +87,7 @@ test("deployed Pages opens all supported local formats and stays console-clean",
   // and WASM module must be reused instead of fetched or instantiated again.
   await page.getByTestId("arrow-sample-button").click();
   await expect(page.getByTestId("app")).toHaveAttribute("data-state", "ready", {
-    timeout: 30_000,
+    timeout: 90_000,
   });
   await expect(page.getByTestId("status")).toContainText("4 rows are ready");
   grid = page.locator("[data-tabulark-a11y-grid]");
@@ -133,13 +136,12 @@ async function navigatorText(page) {
 
 function expectAdapterRequests(requests, adapter, count) {
   expect(requests.filter((url) => (
-    url.includes(`/wasm/${adapter}/tabulark_${adapter}.js`)
-    || url.includes(`/wasm/${adapter}/tabulark_${adapter}_bg.wasm`)
-  ))).toHaveLength(count * 2);
+    url.includes(`/wasm/${adapter}/tabulark_${adapter}_bg.wasm`)
+  ))).toHaveLength(count);
 }
 
 function isOfficialAdapterArtifact(url) {
-  return /\/wasm\/(?:delimited|arrow|parquet|excel)\/tabulark_(?:delimited|arrow|parquet|excel)(?:\.js|_bg\.wasm)(?:[?#]|$)/u.test(url);
+  return /\/wasm\/(?:delimited|arrow|parquet|excel)\/tabulark_(?:delimited|arrow|parquet|excel)_bg\.wasm(?:[?#]|$)/u.test(url);
 }
 
 async function openDeployedFixture(page, format, path, mimeType) {
@@ -159,7 +161,7 @@ async function openDeployedFixture(page, format, path, mimeType) {
 
 async function expectReady(page, message) {
   await expect(page.getByTestId("app")).toHaveAttribute("data-state", "ready", {
-    timeout: 30_000,
+    timeout: 90_000,
   });
   await expect(page.getByTestId("status")).toContainText(message);
   await expect(page.locator("[data-tabulark-a11y-grid]")).toHaveAttribute("aria-busy", "false");

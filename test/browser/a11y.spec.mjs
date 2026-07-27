@@ -21,6 +21,19 @@ async function openParsingOptions(page) {
   }
 }
 
+async function openSample(page, { forceDomClick = false } = {}) {
+  const sample = page.getByTestId("sample-button");
+  await expect(sample).toBeEnabled();
+  if (forceDomClick) {
+    // WebKit can acknowledge a synthetic pointer click while forced-colors is
+    // emulated without delivering the activation. This is setup only; normal
+    // pointer and keyboard activation remain covered by the interaction suite.
+    await sample.evaluate((element) => { element.click(); });
+    return;
+  }
+  await sample.click();
+}
+
 async function expectReady(page) {
   await expect(page.getByTestId("app")).toHaveAttribute("data-state", "ready", {
     timeout: 15_000,
@@ -71,7 +84,7 @@ test.describe("CSV preview accessibility", () => {
 
   test("ready light state has no WCAG 2.1 A or AA violations", async ({ page }, testInfo) => {
     await openExample(page, "light");
-    await page.getByTestId("sample-button").click();
+    await openSample(page);
     await expectReady(page);
     await expect(page.getByTestId("state-label")).toHaveText("Ready");
 
@@ -103,7 +116,7 @@ test.describe("CSV preview accessibility", () => {
 
   test("ready dark state has no WCAG 2.1 A or AA violations", async ({ page }, testInfo) => {
     await openExample(page, "dark");
-    await page.getByTestId("sample-button").click();
+    await openSample(page);
     await expectReady(page);
     await expect(page.getByTestId("state-label")).toHaveText("Ready");
     expect(await page.evaluate(() => matchMedia("(prefers-color-scheme: dark)").matches)).toBe(true);
@@ -116,7 +129,7 @@ test.describe("CSV preview accessibility", () => {
     testInfo,
   ) => {
     await openExample(page, "light", "active");
-    await page.getByTestId("sample-button").click();
+    await openSample(page, { forceDomClick: true });
     await expectReady(page);
     await expect(page.getByTestId("state-label")).toHaveText("Ready");
     expect(await page.evaluate(() => matchMedia("(forced-colors: active)").matches)).toBe(true);
