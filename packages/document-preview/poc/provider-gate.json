@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "rwml": {
+    "revision": "bae267050947200223cf82a0bf350ff8db72d958",
+    "status": "bridge-compiles-gates-not-run",
+    "bridgeCompilesWasm32UnknownUnknown": true,
+    "requiredGates": [
+      "fixed-corpus-fidelity",
+      "warnings-for-unsupported-content",
+      "zip-cfb-xml-resource-limits",
+      "fixed-font-determinism",
+      "chromium-firefox-webkit-offline",
+      "lifecycle-high-water-mark",
+      "lazy-assets-under-100-mib"
+    ]
+  },
+  "betterOffice": {
+    "status": "not-run"
+  },
+  "publish": {
+    "docxProvider": false,
+    "legacyDoc": false,
+    "reason": "No DOCX implementation has passed every required proof-of-concept gate."
+  }
+}

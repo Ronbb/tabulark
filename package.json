@@ -50,6 +50,7 @@
     "build": "npm run build:js && npm run build:wasm",
     "build:js": "node scripts/build.mjs",
     "build:pages": "npm run build && node scripts/build-pages.mjs",
+    "build:document-preview-pages": "node scripts/build-document-preview-pages.mjs",
     "build:wasm": "node scripts/build-wasm.mjs",
     "benchmark:arrow": "node test/performance/run-arrow-matrix.mjs",
     "benchmark:canonical": "node test/performance/run-browser.mjs --scenario canonical --output test/performance/baselines/windows-chromium-16mib.json",

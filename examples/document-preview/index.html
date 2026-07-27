@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Tabulark document preview</title>
+  <style>
+    :root{font-family:system-ui,sans-serif;color-scheme:light dark;--bg:#f4f6f9;--surface:#fff;--text:#17202a;--muted:#566373;--border:#c7d0db;--accent:#1769e0}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text)}main{display:grid;grid-template-rows:auto minmax(0,1fr);min-height:100dvh}.intro{padding:24px clamp(16px,4vw,48px);background:var(--surface);border-bottom:1px solid var(--border)}.intro-inner{max-width:1120px;margin:auto}.eyebrow{margin:0;color:var(--accent);font-weight:700;letter-spacing:.08em;text-transform:uppercase}.intro h1{margin:4px 0 8px;font-size:clamp(28px,4vw,44px);line-height:1.15}.intro p{max-width:72ch;margin:0 0 16px;color:var(--muted);line-height:1.6}.picker{display:flex;align-items:center;flex-wrap:wrap;gap:12px}.picker label{display:inline-flex;align-items:center;min-height:44px;padding:0 18px;border-radius:9px;background:var(--accent);color:#fff;font-weight:700;cursor:pointer}.picker label:focus-within{outline:3px solid #74a9ff;outline-offset:3px}.picker input{position:absolute;width:1px;height:1px;clip-path:inset(50%)}#status{min-height:24px;color:var(--muted)}#viewer{height:calc(100dvh - 238px);min-height:420px}.empty{display:grid;place-content:center;height:100%;padding:32px;text-align:center;color:var(--muted)}.empty strong{color:var(--text);font-size:20px}@media(prefers-color-scheme:dark){:root{--bg:#171b20;--surface:#252b33;--text:#f2f5f8;--muted:#b8c1cc;--border:#4b5663;--accent:#74a9ff}.picker label{background:#3980e6;color:#fff}}@media(max-width:640px){.intro{padding-block:16px}#viewer{height:calc(100dvh - 230px)}}
+  </style>
+</head>
+<body>
+  <main>
+    <header class="intro">
+      <div class="intro-inner">
+        <p class="eyebrow">Experimental · local only</p>
+        <h1>Document preview</h1>
+        <p>PDFium WebAssembly renders temporary page pixels in a dedicated Worker. Files stay on this device. Encrypted PDFs and legacy Word documents are not accepted.</p>
+        <div class="picker">
+          <label for="document-file">Choose PDF</label>
+          <input id="document-file" type="file" accept=".pdf,application/pdf">
+          <span id="status" role="status" aria-live="polite">No document selected.</span>
+        </div>
+      </div>
+    </header>
+    <section id="viewer" aria-label="Preview workspace"><div class="empty"><strong>No document open</strong><span>Choose a local PDF to begin.</span></div></section>
+  </main>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

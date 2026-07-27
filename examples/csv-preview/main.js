@@ -7,6 +7,7 @@ import {
 import { arrowIpcAdapter } from "../../dist/arrow.js";
 import { parquetAdapter } from "../../dist/parquet.js";
 import { excelAdapter } from "../../dist/excel.js";
+import { detectLocalFormat } from "./format-routing.js";
 
 const ARROW_SAMPLE_URL = new URL(
   "../../test/fixtures/arrow/v1/m4-sample.arrow",
@@ -99,6 +100,7 @@ let lastProgressAnnouncementAt = 0;
 let sourceSelectionRevision = 0;
 let formatSelectionRevision = 0;
 let pendingFormatDetection = Promise.resolve();
+let detectedRoute;
 
 sourceInput.addEventListener("change", () => {
   const source = sourceInput.files?.[0];
@@ -107,6 +109,7 @@ sourceInput.addEventListener("change", () => {
   }
   const selectionRevision = ++sourceSelectionRevision;
   const formatRevision = formatSelectionRevision;
+  detectedRoute = undefined;
   rememberSource(source, source.name);
   pendingFormatDetection = selectDetectedFormat(source, selectionRevision, formatRevision);
   updateSourceOptions();
@@ -123,6 +126,7 @@ sourceInput.addEventListener("change", () => {
 
 formatInput.addEventListener("change", () => {
   formatSelectionRevision += 1;
+  detectedRoute = formatInput.value;
   actualCapabilitySummary = "";
   updateSourceOptions();
   updateSourceSummary();
@@ -153,6 +157,7 @@ sampleButton.addEventListener("click", () => {
   const source = new Blob([sample], { type: "text/csv" });
   sourceSelectionRevision += 1;
   pendingFormatDetection = Promise.resolve();
+  detectedRoute = "csv";
   sourceInput.value = "";
   formatInput.value = "csv";
   headerInput.value = "first-row";
@@ -166,6 +171,7 @@ sampleButton.addEventListener("click", () => {
 arrowSampleButton.addEventListener("click", () => {
   sourceSelectionRevision += 1;
   pendingFormatDetection = Promise.resolve();
+  detectedRoute = "arrow";
   void openArrowSample();
 });
 
@@ -255,6 +261,10 @@ async function openArrowSample() {
 }
 
 async function openSource(source, displayName) {
+  if (detectedRoute === "pdf" || detectedRoute === "docx" || detectedRoute === "doc" || detectedRoute === "unknown-binary") {
+    showRoutedFormat(detectedRoute, displayName);
+    return;
+  }
   rememberSource(source, displayName);
   const sourceSnapshot = Object.freeze({
     source,
@@ -656,6 +666,39 @@ function showEmptyState(title, message) {
   emptyState.hidden = false;
 }
 
+function showRoutedFormat(format, displayName) {
+  activeOperation += 1;
+  activeAbort?.abort();
+  activeAbort = undefined;
+  void closeCurrentSession();
+  if (format === "pdf") {
+    transition("error", `${displayName} is a PDF document, not tabular data.`, { focus: status });
+    showEmptyState(
+      "Use document preview",
+      "Open the separate experimental document preview and choose this PDF there. The table playground will not treat it as CSV.",
+    );
+    return;
+  }
+  if (format === "docx") {
+    transition("error", `${displayName} is a DOCX document, not an XLSX workbook.`, { focus: status });
+    showEmptyState(
+      "DOCX preview is gated",
+      "The local WASM DOCX provider is not published until its fixed corpus passes. Save as PDF to use document preview today.",
+    );
+    return;
+  }
+  if (format === "doc") {
+    transition("error", `${displayName} is a legacy Word document and is not supported.`, { focus: status });
+    showEmptyState("Legacy DOC is unsupported", "Save the document as DOCX or PDF, then open the converted local file.");
+    return;
+  }
+  transition("error", `${displayName} is an unrecognized binary file.`, { focus: status });
+  showEmptyState(
+    "Binary format not recognized",
+    "Choose a supported table or document format. Unknown binary files are never passed to the CSV parser.",
+  );
+}
+
 function rememberSource(source, displayName) {
   if (source !== lastSource) {
     actualCapabilitySummary = "";
@@ -668,157 +711,25 @@ function rememberSource(source, displayName) {
   updateSourceSummary();
 }
 
-const FORMAT_BY_EXTENSION = Object.freeze({
-  csv: "csv",
-  tsv: "tsv",
-  arrow: "arrow",
-  arrows: "arrow",
-  feather: "arrow",
-  parquet: "parquet",
-  xls: "xls",
-  xlsx: "xlsx",
-});
-
-const FORMAT_BY_MIME = Object.freeze({
-  "text/csv": "csv",
-  "text/tab-separated-values": "tsv",
-  "application/vnd.apache.arrow.file": "arrow",
-  "application/vnd.apache.arrow.stream": "arrow",
-  "application/vnd.apache.arrow.feather": "arrow",
-  "application/vnd.apache.arrow": "arrow",
-  "application/vnd.apache.parquet": "parquet",
-  "application/x-parquet": "parquet",
-  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
-});
-
 /**
- * Select the adapter as soon as the browser gives us a reliable name or MIME
- * hint. A signature fallback below handles files renamed without an extension
- * (a common result of drag/drop and desktop cache exports).
+ * Inspect the bounded local container structure before selecting a route.
+ * Structure wins over misleading names and MIME hints.
  */
 async function selectDetectedFormat(source, selectionRevision, formatRevision) {
-  const metadataFormat = inferFormatFromMetadata(source);
-  if (metadataFormat !== undefined) {
-    applyDetectedFormat(metadataFormat, selectionRevision, formatRevision);
-    // Confirm the hint from the first bytes as well. This keeps a stale or
-    // misleading filename from sending an OOXML workbook through CSV/XLS.
-    const signatureFormat = await inferFormatFromSignature(source);
-    if (signatureFormat !== undefined) {
-      applyDetectedFormat(signatureFormat, selectionRevision, formatRevision);
-      return signatureFormat;
-    }
-    return metadataFormat;
-  }
-
-  const signatureFormat = await inferFormatFromSignature(source);
-  if (signatureFormat !== undefined) {
-    applyDetectedFormat(signatureFormat, selectionRevision, formatRevision);
-    return signatureFormat;
-  }
-  // Do not carry a previous workbook/Arrow choice into an unlabelled text
-  // file. CSV is the least-surprising local fallback and remains overridable.
-  applyDetectedFormat("csv", selectionRevision, formatRevision);
-  return "csv";
-}
-
-function inferFormatFromMetadata(source) {
-  const name = typeof source?.name === "string" ? source.name : "";
-  const extensionStart = name.lastIndexOf(".");
-  if (extensionStart >= 0 && extensionStart < name.length - 1) {
-    const extension = name.slice(extensionStart + 1).toLowerCase();
-    if (Object.hasOwn(FORMAT_BY_EXTENSION, extension)) {
-      return FORMAT_BY_EXTENSION[extension];
-    }
-  }
-
-  const mime = typeof source?.type === "string"
-    ? source.type.split(";", 1)[0].trim().toLowerCase()
-    : "";
-  return Object.hasOwn(FORMAT_BY_MIME, mime) ? FORMAT_BY_MIME[mime] : undefined;
-}
-
-async function inferFormatFromSignature(source) {
-  if (typeof source?.slice !== "function" || typeof source?.size !== "number") {
-    return undefined;
-  }
+  let format;
   try {
-    const head = await readBlobRange(source, 0, Math.min(16, source.size));
-    if (head === undefined) {
-      return undefined;
-    }
-    if (hasBytesAt(head, [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])) {
-      return "xls";
-    }
-    if (hasAsciiAt(head, "PAR1")) {
-      return "parquet";
-    }
-    if (hasAsciiAt(head, "ARROW1")) {
-      return "arrow";
-    }
-    // OOXML workbooks are ZIP containers. The accepted playground formats do
-    // not include arbitrary ZIP archives, so a ZIP signature is a safe enough
-    // fallback when the filename and MIME type are both absent.
-    if (head[0] === 0x50 && head[1] === 0x4B) {
-      return "xlsx";
-    }
-
-    // Arrow IPC files repeat ARROW1 in their footer; the stream variant has
-    // no fixed header and is therefore identified by its MIME/extension.
-    if (source.size >= 6) {
-      const tail = await readBlobRange(source, Math.max(0, source.size - 6), source.size);
-      if (tail === undefined) {
-        return undefined;
-      }
-      if (hasAsciiAt(tail, "ARROW1")) {
-        return "arrow";
-      }
-    }
+    format = await detectLocalFormat(source);
   } catch {
-    // Detection is a convenience. If a browser refuses a tiny Blob read,
-    // leave the current selection in place so the user can still override it.
+    format = "unknown-binary";
   }
-  return undefined;
-}
-
-/**
- * Reads only a requested Blob slice through its stream. This helper is used
- * for format hints, never for opening a source; the original File/Blob is
- * passed directly to the Worker afterwards.
- */
-async function readBlobRange(source, start, end) {
-  if (typeof source?.slice !== "function" || typeof source?.stream !== "function") {
-    return undefined;
+  if (selectionRevision !== sourceSelectionRevision || formatRevision !== formatSelectionRevision) return format;
+  detectedRoute = format;
+  if (format !== undefined && !["pdf", "docx", "doc", "unknown-binary"].includes(format)) {
+    applyDetectedFormat(format, selectionRevision, formatRevision);
+  } else {
+    updateSourceSummary();
   }
-  const length = end - start;
-  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || length < 0) {
-    return undefined;
-  }
-  const reader = source.slice(start, end).stream().getReader();
-  const chunks = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!(value instanceof Uint8Array)) {
-        return undefined;
-      }
-      total += value.byteLength;
-      if (total > length) {
-        return undefined;
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const result = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return result;
+  return format;
 }
 
 function applyDetectedFormat(format, selectionRevision, formatRevision) {
@@ -833,31 +744,18 @@ function applyDetectedFormat(format, selectionRevision, formatRevision) {
   updateSourceSummary();
 }
 
-function hasBytesAt(bytes, expected) {
-  if (bytes.length < expected.length) {
-    return false;
-  }
-  return expected.every((value, index) => bytes[index] === value);
-}
-
-function hasAsciiAt(bytes, text) {
-  if (bytes.length < text.length) {
-    return false;
-  }
-  return [...text].every((character, index) => bytes[index] === character.charCodeAt(0));
-}
-
 function updateSourceSummary() {
   if (lastSource === undefined) {
     fileSummary.textContent = "No source selected.";
     return;
   }
-  const formatLabel = formatInput.value === "arrow" ? "ARROW IPC" : formatInput.value.toUpperCase();
+  const routedFormat = detectedRoute ?? formatInput.value;
+  const formatLabel = routedFormat === "arrow" ? "ARROW IPC" : routedFormat.toUpperCase();
   const isLocalFile = typeof File !== "undefined" && lastSource instanceof File;
   const modeLabel = isLocalFile
     ? `2 GiB local-file mode · ${lastSourceSize <= MAX_LARGE_SOURCE_BYTES ? "within limit" : "over limit"}`
     : "bounded source mode";
-  const capability = actualCapabilitySummary || `estimated ${estimateCapability(formatInput.value, isLocalFile, lastSourceSize)}`;
+  const capability = actualCapabilitySummary || `estimated ${estimateCapability(routedFormat, isLocalFile, lastSourceSize)}`;
   fileSummary.textContent = `${lastDisplayName} · ${formatBytes(lastSourceSize)} · ${formatLabel} · ${modeLabel} · ${formatCount(lastSourceSize)} bytes exact · ${capability}`;
 }
 

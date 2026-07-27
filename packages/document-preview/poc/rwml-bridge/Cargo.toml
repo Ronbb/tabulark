@@ -1,0 +1,18 @@
+[package]
+name = "tabulark-document-rwml-bridge"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Keep the PoC's Rust 1.92 dependency graph independent from Tabulark's root
+# workspace and MSRV.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rwml = { git = "https://github.com/HyunjoJung/rwml.git", rev = "bae267050947200223cf82a0bf350ff8db72d958", default-features = false, features = ["docx", "render"] }
+rwml-fonts = { git = "https://github.com/HyunjoJung/rwml.git", rev = "bae267050947200223cf82a0bf350ff8db72d958", package = "rwml-fonts" }
+wasm-bindgen = "0.2.100"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
