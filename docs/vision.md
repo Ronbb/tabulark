@@ -136,9 +136,9 @@ measurements, clean packed consumers, an assembled package and Pages site, and
 a real deployed-URL smoke attributable to the same revision.
 
 The M4 record is frozen at `1d79837`; the completed 0.1.0 artifact record is
-separate and immutable. The 0.2.0 preflight requires CI, Pages, and M6 Large
-Files evidence for the same SHA. A patch release must use a new tag and the
-protected OIDC delivery process.
+separate and immutable. The 0.2.0 preflight requires CI, Pages, M6 Large Files,
+and Remote RangeSource evidence for the same SHA. A patch release must use a new
+tag and the protected OIDC delivery process.
 
 ## Direction after 0.2.0
 

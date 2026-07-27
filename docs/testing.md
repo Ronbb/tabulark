@@ -254,10 +254,12 @@ Network tests establish observable delivery behavior:
 5. XLS and XLSX share one Excel WASM load and do not request it twice.
 
 The assertions run against the assembled `target/pages` directory before
-upload. After deployment, `pages-deployed.spec.mjs` receives the actual URL from
-the Pages action and opens CSV, TSV, Arrow, Parquet, XLS, and XLSX. It verifies
-data/ARIA/copy behavior, single lazy artifact requests, and a clean console,
-page, and network. A skipped test, local server, or guessed URL is not deployed
+upload. The Pages artifact also carries `revision.txt`; after deployment the
+workflow waits until that file exposes the exact candidate SHA before starting
+`pages-deployed.spec.mjs` against the URL returned by the Pages action. The smoke
+opens CSV, TSV, Arrow, Parquet, XLS, and XLSX and verifies data/ARIA/copy
+behavior, single lazy artifact requests, and a clean console, page, and network.
+A skipped test, stale revision, local server, or guessed URL is not deployed
 evidence.
 
 ## Performance and delivery size

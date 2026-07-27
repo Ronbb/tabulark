@@ -139,6 +139,23 @@ test("Remote RangeSource gate covers contracts, package size, and all desktop br
   assert.match(workflow, /--workers=1 --retries=0/u);
 });
 
+test("Pages waits for the exact deployed revision before its browser smoke", async () => {
+  const workflow = await readFile(
+    new URL("../.github/workflows/pages.yml", import.meta.url),
+    "utf8",
+  );
+  const marker = 'printf \'%s\\n\' "$GITHUB_SHA" > target/pages/revision.txt';
+  const readiness = workflow.indexOf("- name: Wait for exact deployed revision");
+  const smoke = workflow.indexOf("- name: Smoke-test the deployed Pages URL");
+
+  assert.ok(workflow.includes(marker));
+  assert.match(workflow, /TABULARK_EXPECTED_REVISION: \$\{\{ github\.sha \}\}/u);
+  assert.match(workflow, /revision_url="\$\{TABULARK_DEPLOYED_BASE_URL%\/\}\/revision\.txt"/u);
+  assert.match(workflow, /\$\{revision_url\}\?candidate=\$\{TABULARK_EXPECTED_REVISION\}/u);
+  assert.match(workflow, /for attempt in \$\(seq 1 30\)/u);
+  assert.ok(readiness >= 0 && readiness < smoke, "revision readiness must precede smoke");
+});
+
 test("M6 generates and deletes five exact 2 GiB containers without artifacting fixtures", async () => {
   const workflow = await readFile(
     new URL("../.github/workflows/large-files.yml", import.meta.url),

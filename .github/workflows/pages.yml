@@ -57,7 +57,9 @@ jobs:
         run: npm ci
 
       - name: Build static site
-        run: npm run build:pages
+        run: |
+          npm run build:pages
+          printf '%s\n' "$GITHUB_SHA" > target/pages/revision.txt
 
       - name: Install pinned desktop browsers
         run: npx --no-install playwright install --with-deps chromium firefox webkit
@@ -97,6 +99,28 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: Wait for exact deployed revision
+        shell: bash
+        env:
+          TABULARK_DEPLOYED_BASE_URL: ${{ steps.deployment.outputs.page_url }}
+          TABULARK_EXPECTED_REVISION: ${{ github.sha }}
+        run: |
+          revision_url="${TABULARK_DEPLOYED_BASE_URL%/}/revision.txt"
+          for attempt in $(seq 1 30); do
+            deployed_revision="$(curl --fail --location --silent \
+              --header 'Cache-Control: no-cache' \
+              "${revision_url}?candidate=${TABULARK_EXPECTED_REVISION}" || true)"
+            if [ "$deployed_revision" = "$TABULARK_EXPECTED_REVISION" ]; then
+              echo "Deployed revision ${TABULARK_EXPECTED_REVISION} is visible."
+              exit 0
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "Pages did not expose revision ${TABULARK_EXPECTED_REVISION} after ${attempt} attempts." >&2
+              exit 1
+            fi
+            sleep 5
+          done
 
       - name: Install Node.js
         uses: actions/setup-node@v6
