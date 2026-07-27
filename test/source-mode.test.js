@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createEngine, delimitedAdapter } from "../dist/index.js";
+import { arrowIpcAdapter } from "../dist/arrow.js";
+import { excelAdapter } from "../dist/excel.js";
 
 const TWO_GIB = 2 * 1024 * 1024 * 1024;
 
@@ -87,6 +89,44 @@ test("large mode is reserved for local Blob or File sources", async () => {
       SourceModeWorker.latest.requests.some((request) => request.op === "openSource"),
       false,
     );
+  } finally {
+    await engine?.close();
+    restoreWorker(originalWorker);
+  }
+});
+
+test("local Arrow and Excel Blobs retain the exact 2 GiB limit in auto mode", async () => {
+  const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  Object.defineProperty(globalThis, "Worker", {
+    configurable: true,
+    writable: true,
+    value: SourceModeWorker,
+  });
+  let engine;
+  try {
+    engine = await createEngine({
+      adapters: [delimitedAdapter, arrowIpcAdapter, excelAdapter],
+    });
+    for (const adapter of [arrowIpcAdapter, excelAdapter]) {
+      await assert.rejects(
+        engine.open(new SizedBlob(TWO_GIB + 1), { adapter }),
+        (error) => {
+          assert.equal(error.code, "RESOURCE_LIMIT");
+          assert.equal(error.details.requiredBytes, TWO_GIB + 1);
+          assert.equal(error.details.availableBytes, TWO_GIB);
+          return true;
+        },
+      );
+    }
+    assert.equal(
+      SourceModeWorker.latest.requests.some((request) => request.op === "openSource"),
+      false,
+    );
+
+    const exact = await engine.open(new SizedBlob(TWO_GIB), {
+      adapter: arrowIpcAdapter,
+    });
+    await exact.close();
   } finally {
     await engine?.close();
     restoreWorker(originalWorker);

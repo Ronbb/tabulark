@@ -37,11 +37,13 @@ const excelRuntimePaths = [
   entrypointBundle(excelArtifact),
   ...wasmRuntimePaths(excelArtifact),
 ];
+const httpRuntimePaths = ["dist/http.js"];
 
 const coreRuntimeFiles = await measurePaths(coreRuntimePaths);
 const arrowRuntimeFiles = await measurePaths(arrowRuntimePaths);
 const parquetRuntimeFiles = await measurePaths(parquetRuntimePaths);
 const excelRuntimeFiles = await measurePaths(excelRuntimePaths);
+const httpRuntimeFiles = await measurePaths(httpRuntimePaths);
 const runtimeFiles = [
   ...coreRuntimeFiles,
   ...arrowRuntimeFiles,
@@ -50,7 +52,11 @@ const runtimeFiles = [
 ];
 const shippedJavaScriptFiles = [];
 for (const path of await walkFiles(resolve(repositoryRoot, "dist"))) {
-  if (path.endsWith(".js")) {
+  // `tabulark/http` has its own exact raw/Brotli gate below. Excluding that
+  // optional entrypoint here prevents double-charging it against the frozen
+  // pre-HTTP shipped-JavaScript ceiling; the lazy Worker range module remains
+  // in this aggregate because it is part of the core RangeSource capability.
+  if (path.endsWith(".js") && relative(repositoryRoot, path).replaceAll("\\", "/") !== "dist/http.js") {
     shippedJavaScriptFiles.push(await measureFile(path, repositoryRoot));
   }
 }
@@ -79,6 +85,7 @@ const report = {
   arrow: measuredGroup(arrowRuntimeFiles),
   parquet: measuredGroup(parquetRuntimeFiles),
   excel: measuredGroup(excelRuntimeFiles),
+  http: measuredGroup(httpRuntimeFiles),
   runtime: {
     rawBytes: sum(runtimeFiles, "rawBytes"),
     brotliBytes: sum(runtimeFiles, "brotliBytes"),
@@ -103,6 +110,8 @@ const actual = {
   parquetBrotli: report.parquet.brotliBytes,
   excelRaw: report.excel.rawBytes,
   excelBrotli: report.excel.brotliBytes,
+  httpRaw: report.http.rawBytes,
+  httpBrotli: report.http.brotliBytes,
   npmPacked: report.npm.packedBytes,
   npmUnpacked: report.npm.unpackedBytes,
   pagesRaw: report.pages.rawBytes,

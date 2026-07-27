@@ -13,6 +13,21 @@ All notable changes to Tabulark are documented here. The project follows
 - Add opt-in `sourceMode: "large"` for local Blob/File inputs through exactly
   `2^31` bytes across CSV, Arrow File, Parquet, XLSX, and XLS; ArrayBuffer and
   automatic-mode limits remain unchanged.
+- Add the stable `RangeSource` capability to every official format. Readers
+  validate exact lengths and snapshots, support independent reopen/close
+  lifecycles, and address at most `4,294,967,295` bytes (`2^32 - 1`).
+- Add `tabulark/http` with a `GET Range: bytes=0-0` capability probe, strict
+  `Content-Range` and validator checks, bounded transient retries, dynamic
+  headers/credentials, and an explicit bounded-download fallback. Network and
+  authentication remain on the main thread; no URL, headers, validator, or
+  snapshot ID is exposed in Worker messages, errors, or performance samples.
+- Add source-range request coalescing, dataset singleflight, a byte-budgeted
+  range LRU, four-way maximum provider concurrency, exact reader cleanup, and
+  cross-thread memory slices (75% Worker, 12.5% source staging, 12.5%
+  retained batches/fallback).
+- Add `SOURCE_UNAVAILABLE`, `SOURCE_CHANGED`, and `RANGE_UNSUPPORTED` source
+  errors. Extend `PerformanceSample` with `sourceReads` and
+  `sourceCacheHitBytes`; `cacheHit` remains the logical batch-cache metric.
 - Move every official adapter to private Worker protocol v4 and adapter ABI v3
   resumable operations with checked revisions, bounded multi-range actions,
   cooperative no-I/O yields, and one-transfer batch output.
@@ -31,6 +46,10 @@ All notable changes to Tabulark are documented here. The project follows
   2 GiB evidence.
 - Add paired baseline performance gates, shipped-JavaScript shrinkage gates,
   and a native five-container exact-size generator/workflow.
+- Add HTTP contract, virtual/sparse 4 GiB−1, cancellation/lifecycle,
+  concurrency, cache, CORS, retry, validator-change, and explicit-fallback
+  release evidence in Chromium, Firefox, and WebKit. Keep a separate measured
+  raw/Brotli size budget for the new `/http` entry point.
 - Remove the private TypeScript large-XLSX parser and its shipped artifact.
 
 Version 0.1.1 was never tagged or published; its compatible work is included

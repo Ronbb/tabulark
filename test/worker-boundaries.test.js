@@ -68,6 +68,33 @@ test("Worker reserves large mode for local Blob or File sources", async () => {
   }
 });
 
+test("Worker keeps local Arrow and Excel at 2 GiB while remote descriptors use the u32 cap", async () => {
+  for (const adapterId of ["tabulark:arrow-ipc", "tabulark:excel"]) {
+    const worker = await workerHarness(`local-two-gib-${adapterId}`);
+    try {
+      const hello = worker.send("hello", {
+        adapters: [{ id: adapterId }],
+        memoryBudgetBytes: 8 * 1024 * 1024,
+      });
+      assert.equal((await worker.responseFor(hello)).status, "success");
+
+      const opened = worker.send("openSource", {
+        source: new SizedBlob((2 * 1024 * 1024 * 1024) + 1),
+        adapterId,
+        options: {},
+      });
+      const response = await worker.responseFor(opened);
+      assert.equal(response.status, "failure");
+      assert.equal(response.error.code, "RESOURCE_LIMIT");
+      assert.equal(response.error.details.requiredBytes, (2 * 1024 * 1024 * 1024) + 1);
+      assert.equal(response.error.details.availableBytes, 2 * 1024 * 1024 * 1024);
+    } finally {
+      await worker.shutdown();
+      worker.restore();
+    }
+  }
+});
+
 test("Worker rejects a source range whose safe offset plus length would overflow the source", async () => {
   const worker = await workerHarness("source-range-overflow");
   testAdapter("tabulark:delimited", overflowingRangeModuleUrl());
@@ -1164,6 +1191,19 @@ function testAdapter(id, moduleUrl) {
     value: { ...urls, [id]: moduleUrl },
   });
   return { id };
+}
+
+class SizedBlob extends Blob {
+  #reportedSize;
+
+  constructor(reportedSize) {
+    super([]);
+    this.#reportedSize = reportedSize;
+  }
+
+  get size() {
+    return this.#reportedSize;
+  }
 }
 
 function saveGlobals(names) {

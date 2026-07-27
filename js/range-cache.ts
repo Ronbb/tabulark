@@ -137,12 +137,16 @@ export class ByteLruCache<T> {
     return entry.value;
   }
 
-  set(key: string, value: T, byteLength: number): void {
+  set(key: string, value: T, byteLength: number, maxBytes = this.#maxBytes): void {
     if (!Number.isSafeInteger(byteLength) || byteLength < 0) {
       throw new RangeError("byteLength must be a non-negative safe integer");
     }
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+      throw new RangeError("maxBytes must be a non-negative safe integer");
+    }
+    const effectiveMaxBytes = Math.min(this.#maxBytes, maxBytes);
     const chargedBytes = Math.max(byteLength, this.#minimumEntryBytes);
-    if (chargedBytes > this.#maxBytes || this.#maxEntries === 0) {
+    if (chargedBytes > effectiveMaxBytes || this.#maxEntries === 0) {
       return;
     }
 
@@ -153,7 +157,7 @@ export class ByteLruCache<T> {
 
     while (
       this.#entries.size >= this.#maxEntries
-      || this.#byteLength + chargedBytes > this.#maxBytes
+      || this.#byteLength + chargedBytes > effectiveMaxBytes
     ) {
       const oldestKey = this.#entries.keys().next().value as string | undefined;
       if (oldestKey === undefined) {
@@ -165,6 +169,20 @@ export class ByteLruCache<T> {
 
     this.#entries.set(key, { value, byteLength: chargedBytes });
     this.#byteLength += chargedBytes;
+  }
+
+  /** Evicts least-recently-used entries until the requested live cap is met. */
+  trimTo(maxBytes: number): void {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+      throw new RangeError("maxBytes must be a non-negative safe integer");
+    }
+    const effectiveMaxBytes = Math.min(this.#maxBytes, maxBytes);
+    while (this.#byteLength > effectiveMaxBytes) {
+      const oldestKey = this.#entries.keys().next().value as string | undefined;
+      if (oldestKey === undefined) break;
+      const oldest = this.#entries.get(oldestKey)!;
+      this.#remove(oldestKey, oldest);
+    }
   }
 
   deleteWhere(predicate: (key: string, value: T) => boolean): void {

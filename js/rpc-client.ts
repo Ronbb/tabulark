@@ -10,6 +10,8 @@ import {
 
 type EventListener = (event: ProtocolEvent) => void;
 type FailureListener = (error: TabularkError) => void;
+/** Private messages exchanged by the Worker source-byte broker. */
+export type SourceBrokerListener = (value: unknown) => void;
 
 interface PendingRequest {
   readonly resolve: (value: unknown) => void;
@@ -31,6 +33,8 @@ interface RequestOptions {
 export interface OperationTelemetry {
   readonly bytesRead: number;
   readonly peakReservationBytes: number;
+  readonly sourceReads: number;
+  readonly sourceCacheHitBytes: number;
 }
 
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 2_000;
@@ -59,16 +63,34 @@ export class WorkerRpcClient {
   readonly #pending = new Map<string, PendingRequest>();
   readonly #onEvent: EventListener;
   readonly #onFailure: FailureListener;
+  readonly #onSourceMessage: SourceBrokerListener;
   #nextRequestId = 1;
   #closed = false;
 
-  constructor(worker: Worker, onEvent: EventListener, onFailure: FailureListener = () => {}) {
+  constructor(
+    worker: Worker,
+    onEvent: EventListener,
+    onFailure: FailureListener = () => {},
+    onSourceMessage: SourceBrokerListener = () => {},
+  ) {
     this.#worker = worker;
     this.#onEvent = onEvent;
     this.#onFailure = onFailure;
+    this.#onSourceMessage = onSourceMessage;
     worker.addEventListener("message", this.#handleMessage);
     worker.addEventListener("error", this.#handleWorkerFailure);
     worker.addEventListener("messageerror", this.#handleWorkerFailure);
+  }
+
+  /** Sends one private broker response without exposing the Worker object. */
+  postMessage(value: unknown, transfer: Transferable[] = []): void {
+    if (this.#closed) return;
+    try {
+      this.#worker.postMessage(value, transfer);
+    } catch {
+      // The Worker failure path settles all pending protocol work. A broker
+      // response that cannot be delivered is therefore already terminal.
+    }
   }
 
   async request<T>(
@@ -179,6 +201,18 @@ export class WorkerRpcClient {
 
   #handleMessage = (event: MessageEvent<unknown>): void => {
     const value = event.data;
+    if (isSourceBrokerMessage(value)) {
+      try {
+        this.#onSourceMessage(value);
+      } catch (error) {
+        this.#failRuntime(new TabularkError(
+          "RUNTIME_FAILURE",
+          "The Worker source broker failed",
+          { cause: error },
+        ));
+      }
+      return;
+    }
     if (isValidProtocolEvent(value)) {
       try {
         this.#onEvent(value);
@@ -305,6 +339,11 @@ export class WorkerRpcClient {
   }
 }
 
+function isSourceBrokerMessage(value: unknown): boolean {
+  return isRecord(value)
+    && (value.type === "source-read" || value.type === "source-read-cancel" || value.type === "source-close");
+}
+
 function optionsTelemetry(
   pending: PendingRequest,
   value: unknown,
@@ -324,10 +363,19 @@ function optionsTelemetry(
     pending.onTelemetry({
       bytesRead: bytesRead >= 0 ? bytesRead : 0,
       peakReservationBytes: peakReservationBytes >= 0 ? peakReservationBytes : 0,
+      sourceReads: telemetryQuantity(value, "sourceReads"),
+      sourceCacheHitBytes: telemetryQuantity(value, "sourceCacheHitBytes"),
     });
   } else {
     pending.onTelemetry(undefined);
   }
+}
+
+function telemetryQuantity(value: object, key: string): number {
+  const candidate = (value as Record<string, unknown>)[key];
+  return Number.isSafeInteger(candidate) && (candidate as number) >= 0
+    ? candidate as number
+    : 0;
 }
 
 type ProtocolResultWithTelemetry = {

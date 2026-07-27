@@ -1,8 +1,8 @@
 # Vision
 
-> Tabulark 0.2.0 finalizes the four-format, three-browser, exact-2-GiB
-> foundation. The historical `v0.1.0` tag, registry provenance, and artifact
-> checksums remain immutable in
+> Tabulark 0.2.0 finalizes the four-format, three-browser, exact-2-GiB local
+> foundation and a stable bounded remote-range capability. The historical
+> `v0.1.0` tag, registry provenance, and artifact checksums remain immutable in
 > [release-0.1.0-evidence.md](release-0.1.0-evidence.md).
 
 Tabulark is a browser-native table preview engine: a small, composable layer
@@ -17,10 +17,12 @@ virtualization.
 ### Local-first by default
 
 A local `File`, `Blob`, or `ArrayBuffer` remains local. Tabulark does not need a
-server to preview it. Future network-backed sources must be explicit
-capabilities with explicit application authority; they are not part of 0.2.0.
+server to preview it. Network-backed input is also available when an
+application explicitly supplies a `RangeSource`; URL, credentials, headers,
+and fetch policy remain on the main thread, and the Worker receives only an
+opaque handle and bounded bytes. There is no implicit remote fetch.
 
-### One table contract, four source families
+### One table contract, four format families
 
 Renderers should not know whether a table came from delimited text, Arrow IPC,
 Parquet, or Excel. Official adapters normalize datasets, tables, schemas,
@@ -40,6 +42,15 @@ remote registry, or public adapter factory needs a separately versioned
 security and compatibility design; the private Worker protocol and adapter ABI
 are not shortcuts around that work.
 
+The same adapters accept the stable `RangeSource` capability for bounded
+remote or application-owned bytes. A reader must report an exact size and
+snapshot, return exact-length ranges, and stay at or below
+`4,294,967,295` bytes (`2^32 - 1`). The host merges overlapping/adjacent
+requests, limits provider concurrency to four, and releases the reader,
+singleflight state, and byte-counted range cache on close or termination.
+`tabulark/http` supplies an opt-in HTTP implementation with a `Range` probe,
+validator checks, bounded retries, and an explicit bounded-download fallback.
+
 ### Keep the stable surface logical
 
 Public consumers work with Engine, Dataset, Table, logical schema/value/batch,
@@ -48,8 +59,9 @@ descriptors, Worker protocol v4, official adapter API v3, and batch layout v1
 remain private so their representation can evolve without breaking
 applications.
 
-The four stable JavaScript entries permit compatible additions throughout
-0.2.x. Low-level painter, controller, layout, and selection primitives live in
+The five stable JavaScript entries (root, `/arrow`, `/parquet`, `/excel`, and
+`/http`) permit compatible additions throughout 0.2.x. Low-level painter,
+controller, layout, and selection primitives live in
 `tabulark/experimental` and deliberately do not carry that promise.
 
 ### Preserve semantics and render predictably
@@ -135,8 +147,10 @@ can improve supported logical types, presentation fidelity, diagnostics, and
 performance without exposing the private transport. Larger capabilities remain
 separate design decisions:
 
-- Explicit remote range and streaming sources.
-- Persistent, opt-in caching keyed by source fingerprint and adapter version.
+- Persistent, opt-in OPFS caching keyed by source snapshot and adapter version,
+  with explicit quota, cleanup, and offline policy.
+- Streaming sources with a defined OPFS spill or bounded sliding-window
+  contract; `ReadableStream` is not accepted by the 0.2 API.
 - SQLite and other independently budgeted local formats.
 - Framework bindings around the same engine/table/view lifecycles.
 - A separately versioned and reviewed third-party adapter model.

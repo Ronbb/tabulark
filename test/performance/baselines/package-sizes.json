@@ -93,6 +93,17 @@
       }
     ]
   },
+  "http": {
+    "rawBytes": 31897,
+    "brotliBytes": 6963,
+    "files": [
+      {
+        "path": "dist/http.js",
+        "rawBytes": 31897,
+        "brotliBytes": 6963
+      }
+    ]
+  },
   "runtime": {
     "rawBytes": 7543666,
     "brotliBytes": 1684271,
@@ -216,6 +227,16 @@
         "bytes": 336917,
         "maximumBytes": 393216,
         "remainingBytes": 56299
+      },
+      "httpRaw": {
+        "bytes": 31897,
+        "maximumBytes": 36682,
+        "remainingBytes": 4785
+      },
+      "httpBrotli": {
+        "bytes": 6963,
+        "maximumBytes": 8008,
+        "remainingBytes": 1045
       },
       "npmPacked": {
         "bytes": 2485815,

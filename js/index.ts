@@ -29,6 +29,12 @@ export type {
 export { TabularkError } from "./errors.js";
 export type { TabularkErrorCode } from "./errors.js";
 export type {
+  ByteRange,
+  RangeSource,
+  RangeSourceReader,
+  RangeSourceSnapshot,
+} from "./range-source.js";
+export type {
   ArrowDataType,
   ArrowField,
   AxisExtent,

@@ -58,8 +58,24 @@ import {
   isSourceMode,
   type SourceMode,
 } from "./source.js";
+import {
+  MAX_RANGE_SOURCE_BYTES,
+  copyRangeBytes,
+  isRangeSource,
+  isSafeNonNegativeInteger,
+  normalizeRangeSourceSnapshot,
+  validateRangeSourceReader,
+  type RangeSource,
+  type RangeSourceReader,
+} from "./range-source.js";
 
 export type { SourceMode } from "./source.js";
+export type {
+  ByteRange,
+  RangeSource,
+  RangeSourceReader,
+  RangeSourceSnapshot,
+} from "./range-source.js";
 
 const MIN_MEMORY_BUDGET_BYTES = 8 * 1024 * 1024;
 const LIFECYCLE_CLOSE_TIMEOUT_MS = 2_000;
@@ -72,6 +88,41 @@ const MAX_DIAGNOSTIC_MESSAGE_LENGTH = 512;
 const MAX_PERFORMANCE_SAMPLES = 128;
 const MIN_BATCH_CACHE_ENTRY_BYTES = 4 * 1024;
 const MAX_BATCH_CACHE_ENTRIES = 512;
+// The core and HTTP helper are separate bundles. A shared weak store lets both
+// see the same open-options reservation without adding any observable key to
+// the public RangeSourceOpenOptions object.
+const RANGE_SOURCE_HOST_RESERVATION_STORE = Symbol.for(
+  "tabulark.internal.range-source-reservation-store.v1",
+);
+
+interface RangeSourceHostReservations {
+  reserveStaging(bytes: number, signal: AbortSignal): Promise<() => void>;
+  reserveRetained(bytes: number): () => void;
+}
+
+function attachRangeSourceHostReservations<T extends object>(
+  options: T,
+  reservations: RangeSourceHostReservations,
+): T {
+  rangeSourceHostReservationStore().set(options, Object.freeze(reservations));
+  return options;
+}
+
+function rangeSourceHostReservationStore(): WeakMap<object, RangeSourceHostReservations> {
+  const host = globalThis as typeof globalThis & {
+    [RANGE_SOURCE_HOST_RESERVATION_STORE]?: WeakMap<object, RangeSourceHostReservations>;
+  };
+  const existing = host[RANGE_SOURCE_HOST_RESERVATION_STORE];
+  if (existing instanceof WeakMap) return existing;
+  const store = new WeakMap<object, RangeSourceHostReservations>();
+  Object.defineProperty(host, RANGE_SOURCE_HOST_RESERVATION_STORE, {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: store,
+  });
+  return store;
+}
 
 export interface OpenSourceOptions<Options = unknown> {
   /** One of the official descriptors registered when the engine was created. */
@@ -165,6 +216,10 @@ export interface PerformanceSample {
   readonly cacheHit: boolean;
   /** Peak reservation observed by the host, when known. */
   readonly peakReservationBytes: number;
+  /** Number of provider range reads represented by this operation. */
+  readonly sourceReads: number;
+  /** Bytes served from the Worker source-range cache. */
+  readonly sourceCacheHitBytes: number;
 }
 
 export type DatasetEvent =
@@ -204,7 +259,7 @@ export interface TableHandle {
 }
 
 export interface TabularkEngine {
-  open<Options>(source: Blob | ArrayBuffer, options: OpenSourceOptions<Options>): Promise<DatasetSession>;
+  open<Options>(source: Blob | ArrayBuffer | RangeSource, options: OpenSourceOptions<Options>): Promise<DatasetSession>;
   subscribePerformance(listener: (sample: PerformanceSample) => void): Unsubscribe;
   close(): Promise<void>;
   dispose(): Promise<void>;
@@ -222,6 +277,221 @@ interface NormalizedOpenOptions {
   readonly adapter: AdapterRegistration;
   readonly options: Readonly<Record<string, unknown>>;
   readonly sourceMode: SourceMode;
+  readonly isRangeSource: boolean;
+}
+
+interface SourceReaderRecord {
+  readonly handle: string;
+  readonly size: number;
+  readonly maxConcurrency: number;
+  readonly reader: RangeSourceReader;
+  readonly pending: Map<string, AbortController>;
+  readonly concurrency: SourceReadConcurrencyLimiter;
+  closed: boolean;
+}
+
+interface SourceStagingPermit {
+  readonly release: () => void;
+}
+
+interface SourceStagingWaiter {
+  readonly bytes: number;
+  readonly signal: AbortSignal;
+  readonly resolve: (permit: SourceStagingPermit) => void;
+  readonly reject: (error: unknown) => void;
+  onAbort: () => void;
+}
+
+/**
+ * Aggregates transient host-side source buffers across every opened reader.
+ * A per-request length check is insufficient: several readers can otherwise
+ * each consume the full staging slice at once.  Waiting here keeps the bound
+ * hard without making a valid adapter operation fail merely because another
+ * read is currently transferring bytes.
+ */
+class SourceStagingLimiter {
+  readonly #capacity: number;
+  readonly #queue: SourceStagingWaiter[] = [];
+  #used = 0;
+  #closed = false;
+
+  constructor(capacity: number) {
+    this.#capacity = Math.max(1, Number.isSafeInteger(capacity) ? capacity : 1);
+  }
+
+  acquire(bytes: number, signal: AbortSignal): Promise<SourceStagingPermit> {
+    if (!Number.isSafeInteger(bytes) || bytes < 0) {
+      return Promise.reject(new TabularkError(
+        "RANGE_UNSUPPORTED",
+        "The source range length is invalid",
+      ));
+    }
+    if (bytes > this.#capacity) {
+      return Promise.reject(new TabularkError(
+        "RESOURCE_LIMIT",
+        "The source exceeds its staging budget",
+        {
+          details: {
+            resource: "source-staging",
+            requiredBytes: bytes,
+            availableBytes: this.#capacity,
+          },
+        },
+      ));
+    }
+    if (this.#closed) return Promise.reject(closedError("Source staging"));
+    if (signal.aborted) return Promise.reject(cancelledError());
+    if (this.#used + bytes <= this.#capacity) {
+      return Promise.resolve(this.#grant(bytes));
+    }
+    return new Promise<SourceStagingPermit>((resolve, reject) => {
+      const waiter: SourceStagingWaiter = {
+        bytes,
+        signal,
+        resolve,
+        reject,
+        onAbort: () => undefined,
+      };
+      const onAbort = (): void => {
+        const index = this.#queue.indexOf(waiter);
+        if (index >= 0) this.#queue.splice(index, 1);
+        signal.removeEventListener("abort", onAbort);
+        reject(cancelledError());
+      };
+      waiter.onAbort = onAbort;
+      signal.addEventListener("abort", onAbort, { once: true });
+      this.#queue.push(waiter);
+      this.#drain();
+    });
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    for (const waiter of this.#queue.splice(0)) {
+      waiter.signal.removeEventListener("abort", waiter.onAbort);
+      waiter.reject(closedError("Source staging"));
+    }
+  }
+
+  #grant(bytes: number): SourceStagingPermit {
+    this.#used += bytes;
+    let released = false;
+    return Object.freeze({
+      release: () => {
+        if (released) return;
+        released = true;
+        this.#used = Math.max(0, this.#used - bytes);
+        this.#drain();
+      },
+    });
+  }
+
+  #drain(): void {
+    if (this.#closed) return;
+    for (;;) {
+      let selected = -1;
+      for (let index = 0; index < this.#queue.length; index += 1) {
+        const waiter = this.#queue[index]!;
+        if (waiter.signal.aborted) {
+          this.#queue.splice(index, 1);
+          waiter.signal.removeEventListener("abort", waiter.onAbort);
+          waiter.reject(cancelledError());
+          index -= 1;
+          continue;
+        }
+        if (this.#used + waiter.bytes <= this.#capacity) {
+          selected = index;
+          break;
+        }
+      }
+      if (selected < 0) return;
+      const waiter = this.#queue.splice(selected, 1)[0]!;
+      waiter.signal.removeEventListener("abort", waiter.onAbort);
+      waiter.resolve(this.#grant(waiter.bytes));
+    }
+  }
+}
+
+/** Enforces a reader's advertised 1–4 provider concurrency at the broker. */
+class SourceReadConcurrencyLimiter {
+  readonly #limit: number;
+  readonly #queue: Array<{
+    readonly signal: AbortSignal;
+    readonly resolve: (release: () => void) => void;
+    readonly reject: (error: unknown) => void;
+    onAbort: () => void;
+  }> = [];
+  #active = 0;
+  #closed = false;
+
+  constructor(limit: number) {
+    this.#limit = Math.min(4, Math.max(1, Number.isSafeInteger(limit) ? limit : 1));
+  }
+
+  acquire(signal: AbortSignal): Promise<() => void> {
+    if (this.#closed) return Promise.reject(closedError("Range source reader"));
+    if (signal.aborted) return Promise.reject(cancelledError());
+    if (this.#active < this.#limit) {
+      this.#active += 1;
+      return Promise.resolve(this.#grant());
+    }
+    return new Promise<() => void>((resolve, reject) => {
+      const entry: {
+        readonly signal: AbortSignal;
+        readonly resolve: (release: () => void) => void;
+        readonly reject: (error: unknown) => void;
+        onAbort: () => void;
+      } = {
+        signal,
+        resolve,
+        reject,
+        onAbort: () => undefined,
+      };
+      const onAbort = (): void => {
+        const index = this.#queue.indexOf(entry);
+        if (index >= 0) this.#queue.splice(index, 1);
+        signal.removeEventListener("abort", onAbort);
+        reject(cancelledError());
+      };
+      entry.onAbort = onAbort;
+      signal.addEventListener("abort", onAbort, { once: true });
+      this.#queue.push(entry);
+    });
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    for (const entry of this.#queue.splice(0)) {
+      entry.signal.removeEventListener("abort", entry.onAbort);
+      entry.reject(closedError("Range source reader"));
+    }
+  }
+
+  #grant(): () => void {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.#active = Math.max(0, this.#active - 1);
+      this.#drain();
+    };
+  }
+
+  #drain(): void {
+    if (this.#closed) return;
+    while (this.#active < this.#limit && this.#queue.length > 0) {
+      const entry = this.#queue.shift()!;
+      entry.signal.removeEventListener("abort", entry.onAbort);
+      if (entry.signal.aborted) {
+        entry.reject(cancelledError());
+        continue;
+      }
+      this.#active += 1;
+      entry.resolve(this.#grant());
+    }
+  }
 }
 
 interface PerformanceRequestOptions {
@@ -249,6 +519,8 @@ interface RangeSingleflight {
   settled: boolean;
   bytesRead: number;
   peakReservationBytes: number;
+  sourceReads: number;
+  sourceCacheHitBytes: number;
 }
 
 class Engine implements TabularkEngine {
@@ -258,12 +530,19 @@ class Engine implements TabularkEngine {
   readonly #limits: MemoryBudgetLimits;
   readonly #maxArrayBufferBytes: number;
   readonly #adapters: ReadonlyMap<OfficialAdapterId, AdapterRegistration>;
+  readonly #sourceStaging: SourceStagingLimiter;
+  #retainedSourceBytes = 0;
+  readonly #sourceReaders = new Map<string, SourceReaderRecord>();
+  readonly #datasetSources = new Map<string, string>();
+  readonly #openingSources = new Set<AbortController>();
+  #nextSourceHandle = 1;
   readonly #sessions = new Map<string, DatasetSessionImpl>();
   readonly #orphanEvents = new Map<string, ProtocolEvent[]>();
   readonly #performanceListeners = new Set<(sample: PerformanceSample) => void>();
   readonly #performanceQueue: PerformanceSample[] = [];
   #orphanEventCount = 0;
   #closed = false;
+  #sourceCleanupPromise: Promise<void> | undefined;
 
   constructor(
     rpc: WorkerRpcClient,
@@ -272,13 +551,20 @@ class Engine implements TabularkEngine {
   ) {
     this.#rpc = rpc;
     this.#limits = limits;
-    this.#rangeCache = new ByteLruCache(limits.mainThreadRangeCacheBytes, {
+    this.#sourceStaging = new SourceStagingLimiter(limits.mainThreadSourceBytes);
+    this.#rangeCache = new ByteLruCache(
+      Math.min(limits.mainThreadRangeCacheBytes, limits.mainThreadRetainedBytes),
+      {
       maxEntries: Math.min(
         MAX_BATCH_CACHE_ENTRIES,
-        Math.max(1, Math.floor(limits.mainThreadRangeCacheBytes / MIN_BATCH_CACHE_ENTRY_BYTES)),
+        Math.max(1, Math.floor(
+          Math.min(limits.mainThreadRangeCacheBytes, limits.mainThreadRetainedBytes)
+            / MIN_BATCH_CACHE_ENTRY_BYTES,
+        )),
       ),
       minimumEntryBytes: MIN_BATCH_CACHE_ENTRY_BYTES,
-    });
+      },
+    );
     this.#maxArrayBufferBytes = limits.maxArrayBufferBytes;
     this.#adapters = new Map(adapters.map((adapter) => [adapter.id, adapter]));
   }
@@ -303,7 +589,7 @@ class Engine implements TabularkEngine {
   #emitPerformanceSample(
     stage: string,
     startedAt: number | undefined,
-    options: Partial<Pick<PerformanceSample, "bytesRead" | "cacheHit" | "peakReservationBytes">> = {},
+    options: Partial<Pick<PerformanceSample, "bytesRead" | "cacheHit" | "peakReservationBytes" | "sourceReads" | "sourceCacheHitBytes">> = {},
   ): void {
     // If no operation was being measured, avoid even taking a timestamp or
     // allocating a sample. A listener can still unsubscribe while an already
@@ -321,6 +607,8 @@ class Engine implements TabularkEngine {
       bytesRead: nonNegativeSafeQuantity(options.bytesRead),
       cacheHit: options.cacheHit === true,
       peakReservationBytes: nonNegativeSafeQuantity(options.peakReservationBytes),
+      sourceReads: nonNegativeSafeQuantity(options.sourceReads),
+      sourceCacheHitBytes: nonNegativeSafeQuantity(options.sourceCacheHitBytes),
     });
     // Keep a bounded history for a listener that is temporarily reentrant or
     // detached while a request settles. No source/path/protocol data enters it.
@@ -362,6 +650,10 @@ class Engine implements TabularkEngine {
       if (engine !== undefined) {
         engine.#handleRuntimeFailure(error);
       }
+    }, (message) => {
+      if (engine !== undefined) {
+        engine.#handleSourceBrokerMessage(message);
+      }
     });
     engine = new Engine(rpc, normalized.limits, normalized.adapters);
     try {
@@ -399,13 +691,15 @@ class Engine implements TabularkEngine {
   }
 
   async open<Options>(
-    source: Blob | ArrayBuffer,
+    source: Blob | ArrayBuffer | RangeSource,
     options: OpenSourceOptions<Options>,
   ): Promise<DatasetSession> {
     this.#assertOpen();
     const startedAt = this.#performanceListeners.size > 0 ? finitePerformanceNow() : undefined;
     let bytesRead = 0;
     let peakReservationBytes = 0;
+    let sourceReads = 0;
+    let sourceCacheHitBytes = 0;
     const onTelemetry = (telemetry: OperationTelemetry | undefined): void => {
       if (!telemetry) return;
       // `open()` spans the source request and the table-list handshake. Each
@@ -414,9 +708,17 @@ class Engine implements TabularkEngine {
       // under-report a footer plus metadata scan).
       bytesRead = addPerformanceBytes(bytesRead, telemetry.bytesRead);
       peakReservationBytes = Math.max(peakReservationBytes, telemetry.peakReservationBytes);
+      sourceReads = addPerformanceBytes(sourceReads, telemetry.sourceReads);
+      sourceCacheHitBytes = addPerformanceBytes(sourceCacheHitBytes, telemetry.sourceCacheHitBytes);
     };
     try {
-      const normalizedOptions = normalizeOpenOptions(options, this.#adapters, inferSourceName(source));
+      const rangeSourceInput = isRangeSource(source);
+      const normalizedOptions = normalizeOpenOptions(
+        options,
+        this.#adapters,
+        rangeSourceInput ? undefined : inferSourceName(source),
+        rangeSourceInput,
+      );
       // Capture the logical source length before an optional ArrayBuffer
       // transfer. Structured-cloning with a transfer list detaches the caller's
       // buffer, so reading `byteLength` after the Worker request would make the
@@ -424,8 +726,123 @@ class Engine implements TabularkEngine {
       // Keep this capture inside the validated source branches so malformed
       // JavaScript values still produce the public INVALID_ARGUMENT error.
       let sourceBytes: number;
+      let sourcePayload: Blob | ArrayBuffer | Record<string, unknown> = source as Blob | ArrayBuffer;
+      let sourceRecord: SourceReaderRecord | undefined;
       const transfer: Transferable[] = [];
-      if (source instanceof ArrayBuffer) {
+      if (rangeSourceInput) {
+        if (options.sourceMode !== undefined || options.transferInput !== undefined) {
+          throw invalidArgument("sourceMode and transferInput do not apply to RangeSource inputs");
+        }
+        const openController = new AbortController();
+        this.#openingSources.add(openController);
+        const signal = combineAbortSignals(options.signal, openController.signal);
+        let reader: RangeSourceReader;
+        try {
+          const openOptions = attachRangeSourceHostReservations({
+            signal,
+            maxSourceBytes: MAX_RANGE_SOURCE_BYTES,
+            maxStagingBytes: sourceStagingBudget(this.#limits),
+          }, {
+            reserveStaging: async (bytes, reservationSignal) => {
+              const permit = await this.#sourceStaging.acquire(bytes, reservationSignal);
+              return permit.release;
+            },
+            reserveRetained: (bytes) => this.#reserveRetainedSourceBytes(bytes),
+          });
+          reader = await openRangeReaderWithCancellation(source, openOptions, signal);
+        } catch (error) {
+          if (this.#closed) throw closedError("Engine");
+          if (options.signal?.aborted || openController.signal.aborted) throw cancelledError();
+          throw normalizeRangeSourceOpenError(error);
+        } finally {
+          this.#openingSources.delete(openController);
+        }
+        if (this.#closed) {
+          await closeRangeReaderBestEffort(reader);
+          throw closedError("Engine");
+        }
+        if (options.signal?.aborted || openController.signal.aborted) {
+          await closeRangeReaderBestEffort(reader);
+          throw cancelledError();
+        }
+        const readerValue: unknown = reader;
+        let reportedSize: unknown;
+        try {
+          reportedSize = isRecord(readerValue) ? readerValue.size : undefined;
+        } catch {
+          await closeRangeReaderBestEffort(readerValue);
+          throw new TabularkError("RUNTIME_FAILURE", "The range source returned an invalid reader");
+        }
+        if (typeof reportedSize === "number" && reportedSize > MAX_RANGE_SOURCE_BYTES) {
+          await closeRangeReaderBestEffort(readerValue);
+          throw new TabularkError("RESOURCE_LIMIT", "The range source exceeds the addressable byte limit", {
+            details: {
+              resource: "source-address-space",
+              requiredBytes: Number.isSafeInteger(reportedSize)
+                ? reportedSize
+                : Number.MAX_SAFE_INTEGER,
+              availableBytes: MAX_RANGE_SOURCE_BYTES,
+            },
+          });
+        }
+        if (!validateRangeSourceReader(readerValue)) {
+          await closeRangeReaderBestEffort(readerValue);
+          throw new TabularkError("RUNTIME_FAILURE", "The range source returned an invalid reader");
+        }
+        try {
+          // Snapshot validation stays on the host.  The opaque validator is
+          // deliberately never serialized into the Worker descriptor.
+          normalizeRangeSourceSnapshot(reader.snapshot);
+        } catch (error) {
+          await closeRangeReaderBestEffort(readerValue);
+          throw new TabularkError("RUNTIME_FAILURE", "The range source returned an invalid snapshot");
+        }
+        let readerMaxConcurrency: number | undefined;
+        try {
+          // Capture immutable reader facts before publishing the host handle.
+          // A stateful/hostile getter must not throw after registration and
+          // leave a reader that the lifecycle cleanup cannot reach.
+          sourceBytes = reader.size;
+          readerMaxConcurrency = reader.maxConcurrency;
+        } catch {
+          await closeRangeReaderBestEffort(readerValue);
+          throw new TabularkError("RUNTIME_FAILURE", "The range source returned an invalid reader");
+        }
+        if (!isSafeNonNegativeInteger(sourceBytes)) {
+          await closeRangeReaderBestEffort(readerValue);
+          throw new TabularkError("RUNTIME_FAILURE", "The range source returned an invalid reader");
+        }
+        if (readerMaxConcurrency !== undefined
+          && (!Number.isSafeInteger(readerMaxConcurrency)
+            || readerMaxConcurrency < 1
+            || readerMaxConcurrency > 4)) {
+          await closeRangeReaderBestEffort(readerValue);
+          throw new TabularkError("RUNTIME_FAILURE", "The range source returned an invalid reader");
+        }
+        if (sourceBytes > MAX_RANGE_SOURCE_BYTES) {
+          await closeRangeReaderBestEffort(readerValue);
+          throw new TabularkError("RESOURCE_LIMIT", "The range source exceeds the addressable byte limit", {
+            details: { resource: "source-address-space", requiredBytes: sourceBytes, availableBytes: MAX_RANGE_SOURCE_BYTES },
+          });
+        }
+        const handle = this.#allocateSourceHandle();
+        sourceRecord = {
+          handle,
+          size: sourceBytes,
+          maxConcurrency: readerMaxConcurrency ?? 1,
+          reader,
+          pending: new Map(),
+          concurrency: new SourceReadConcurrencyLimiter(readerMaxConcurrency ?? 1),
+          closed: false,
+        };
+        this.#sourceReaders.set(handle, sourceRecord);
+        sourcePayload = Object.freeze({
+          kind: "range",
+          handle,
+          size: sourceBytes,
+          ...(readerMaxConcurrency === undefined ? {} : { maxConcurrency: readerMaxConcurrency }),
+        });
+      } else if (source instanceof ArrayBuffer) {
         if (normalizedOptions.sourceMode === "large") {
           throw invalidArgument("sourceMode large requires a local Blob or File source");
         }
@@ -460,6 +877,17 @@ class Engine implements TabularkEngine {
         ) {
           throw largeSourceLimitError(sourceSize);
         }
+        if (
+          (normalizedOptions.adapter.id === "tabulark:arrow-ipc"
+            || normalizedOptions.adapter.id === "tabulark:excel")
+          && Number.isSafeInteger(sourceSize)
+          && sourceSize > MAX_LARGE_SOURCE_BYTES
+        ) {
+          // The range-capable Rust runtimes accept 4 GiB-1 for a remote
+          // descriptor. Keep the established local Arrow/Excel Blob contract
+          // at the exact 2 GiB boundary regardless of sourceMode.
+          throw largeSourceLimitError(sourceSize);
+        }
       }
 
       let dataset: { datasetHandle: string };
@@ -467,10 +895,10 @@ class Engine implements TabularkEngine {
         const opened = await this.#rpc.request<unknown>(
           "openSource",
           {
-            source,
+            source: sourcePayload,
             adapterId: normalizedOptions.adapter.id,
             options: normalizedOptions.options,
-            sourceMode: normalizedOptions.sourceMode,
+            ...(normalizedOptions.isRangeSource ? {} : { sourceMode: normalizedOptions.sourceMode }),
           },
           "dataset",
           {
@@ -487,7 +915,18 @@ class Engine implements TabularkEngine {
           throw this.#terminateForProtocolFailure("Worker returned an invalid dataset handle");
         }
         dataset = { datasetHandle: opened.datasetHandle };
+        if (sourceRecord !== undefined) {
+          // The Worker now owns the dataset lifetime; retain the host reader
+          // until its explicit close message or a terminal engine failure.
+          sourceRecord = this.#sourceReaders.get(sourceRecord.handle);
+          if (sourceRecord !== undefined) {
+            this.#datasetSources.set(dataset.datasetHandle, sourceRecord.handle);
+          }
+        }
       } catch (error) {
+        if (sourceRecord !== undefined) {
+          await this.#closeSourceReader(sourceRecord.handle);
+        }
         throw error;
       }
 
@@ -515,6 +954,7 @@ class Engine implements TabularkEngine {
             tableDescriptors,
             normalizedOptions.sourceMode,
             this.#stagedSourceLimit(normalizedOptions.adapter.id),
+            normalizedOptions.isRangeSource,
           ),
         );
         this.#sessions.set(dataset.datasetHandle, session);
@@ -531,18 +971,24 @@ class Engine implements TabularkEngine {
           this.#sessions.delete(dataset.datasetHandle);
         }
         await this.#discardOpenedDataset(dataset.datasetHandle);
+        if (sourceRecord !== undefined) {
+          await this.#closeSourceReader(sourceRecord.handle);
+        }
         throw terminalError ?? error;
       }
     } finally {
       this.#emitPerformanceSample("open", startedAt, {
         bytesRead,
         peakReservationBytes,
+        sourceReads,
+        sourceCacheHitBytes,
       });
     }
   }
 
   async close(): Promise<void> {
     if (this.#closed) {
+      await this.#sourceCleanupPromise;
       return;
     }
     const startedAt = this.#performanceListeners.size > 0 ? finitePerformanceNow() : undefined;
@@ -551,6 +997,8 @@ class Engine implements TabularkEngine {
       if (telemetry) peakReservationBytes = Math.max(peakReservationBytes, telemetry.peakReservationBytes);
     };
     this.#closed = true;
+    this.#sourceStaging.close();
+    for (const controller of this.#openingSources) controller.abort();
     for (const session of this.#sessions.values()) {
       session.closeLocally();
     }
@@ -558,6 +1006,7 @@ class Engine implements TabularkEngine {
     this.#abortRangeSingleflights();
     this.#rangeCache.clear();
     this.#clearOrphanEvents();
+    await this.#closeAllSourceReaders();
     try {
       await this.#rpc.shutdown(
         LIFECYCLE_CLOSE_TIMEOUT_MS,
@@ -641,6 +1090,8 @@ class Engine implements TabularkEngine {
     let bytesRead = 0;
     let cacheHit = false;
     let peakReservationBytes = 0;
+    let sourceReads = 0;
+    let sourceCacheHitBytes = 0;
     let flight: RangeSingleflight | undefined;
     try {
       const normalized = validateRange(request);
@@ -674,6 +1125,8 @@ class Engine implements TabularkEngine {
       const backing = await this.#joinRangeSingleflight(flight, options.signal);
       bytesRead = flight.bytesRead;
       peakReservationBytes = flight.peakReservationBytes;
+      sourceReads = flight.sourceReads;
+      sourceCacheHitBytes = flight.sourceCacheHitBytes;
       this.#assertOpen();
       table.assertOpen();
       return new ColumnarTableBatch(backing);
@@ -681,11 +1134,15 @@ class Engine implements TabularkEngine {
       if (flight) {
         bytesRead = flight.bytesRead;
         peakReservationBytes = flight.peakReservationBytes;
+        sourceReads = flight.sourceReads;
+        sourceCacheHitBytes = flight.sourceCacheHitBytes;
       }
       this.#emitPerformanceSample("read-range", startedAt, {
         bytesRead,
         cacheHit,
         peakReservationBytes,
+        sourceReads,
+        sourceCacheHitBytes,
       });
     }
   }
@@ -709,6 +1166,8 @@ class Engine implements TabularkEngine {
       settled: false,
       bytesRead: 0,
       peakReservationBytes: 0,
+      sourceReads: 0,
+      sourceCacheHitBytes: 0,
     };
     const onTelemetry = (telemetry: OperationTelemetry | undefined): void => {
       if (!telemetry) return;
@@ -716,6 +1175,11 @@ class Engine implements TabularkEngine {
       flight.peakReservationBytes = Math.max(
         flight.peakReservationBytes,
         telemetry.peakReservationBytes,
+      );
+      flight.sourceReads = addPerformanceBytes(flight.sourceReads, telemetry.sourceReads);
+      flight.sourceCacheHitBytes = addPerformanceBytes(
+        flight.sourceCacheHitBytes,
+        telemetry.sourceCacheHitBytes,
       );
     };
     flight.promise = this.#rpc.request<WireTableBatch>(
@@ -744,7 +1208,12 @@ class Engine implements TabularkEngine {
         && table.metadata.schema.version === schemaVersion
         && !table.datasetClosed
       ) {
-        this.#rangeCache.set(key, backing, wireBatchByteLength(backing));
+        this.#rangeCache.set(
+          key,
+          backing,
+          wireBatchByteLength(backing),
+          this.#availableRetainedCacheBytes(),
+        );
       }
       return backing;
     }).finally(() => {
@@ -951,6 +1420,7 @@ class Engine implements TabularkEngine {
     session.closeLocally();
     if (this.#closed) {
       this.#sessions.delete(session.handle);
+      await this.#closeDatasetSource(session.handle);
       this.#emitPerformanceSample("close-session", startedAt, { peakReservationBytes });
       return;
     }
@@ -963,6 +1433,7 @@ class Engine implements TabularkEngine {
     } finally {
       this.#sessions.delete(session.handle);
       this.#deleteOrphanEvents(session.handle);
+      await this.#closeDatasetSource(session.handle);
       this.#emitPerformanceSample("close-session", startedAt, { peakReservationBytes });
     }
   }
@@ -992,6 +1463,247 @@ class Engine implements TabularkEngine {
     return Math.min(this.#maxArrayBufferBytes, runtimeBudget);
   }
 
+  #allocateSourceHandle(): string {
+    // This is an opaque process-local capability. It intentionally contains no
+    // URL, validator, source name, or user-controlled text.
+    return `s${(this.#nextSourceHandle++).toString(36)}`;
+  }
+
+  /** Shares the retained 12.5% slice between logical batches and HTTP fallback bodies. */
+  #reserveRetainedSourceBytes(bytes: number): () => void {
+    if (!Number.isSafeInteger(bytes) || bytes < 0) {
+      throw new TabularkError("RESOURCE_LIMIT", "The source retained-byte request is invalid", {
+        details: {
+          resource: "source-retained",
+          requiredBytes: Number.MAX_SAFE_INTEGER,
+          availableBytes: this.#availableRetainedCacheBytes(),
+        },
+      });
+    }
+    if (this.#closed) throw closedError("Engine");
+    const availableBytes = this.#limits.mainThreadRetainedBytes - this.#retainedSourceBytes;
+    if (bytes > availableBytes) {
+      throw new TabularkError("RESOURCE_LIMIT", "The source exceeds the retained-byte budget", {
+        details: { resource: "source-retained", requiredBytes: bytes, availableBytes },
+      });
+    }
+    // Retained fallback data has a live reader and cannot be evicted. Logical
+    // batches are an LRU, so reclaim those first and keep the aggregate slice
+    // within the engine budget without waiting for another dataset to close.
+    this.#rangeCache.trimTo(availableBytes - bytes);
+    this.#retainedSourceBytes += bytes;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.#retainedSourceBytes = Math.max(0, this.#retainedSourceBytes - bytes);
+    };
+  }
+
+  #availableRetainedCacheBytes(): number {
+    return Math.max(0, this.#limits.mainThreadRetainedBytes - this.#retainedSourceBytes);
+  }
+
+  #handleSourceBrokerMessage(value: unknown): void {
+    if (!isRecord(value) || typeof value.type !== "string") return;
+    if (value.type === "source-close") {
+      if (typeof value.sourceHandle === "string") {
+        void this.#closeSourceReader(value.sourceHandle);
+      }
+      return;
+    }
+    if (value.type === "source-read-cancel") {
+      if (typeof value.sourceHandle !== "string" || typeof value.requestId !== "string") return;
+      const record = this.#sourceReaders.get(value.sourceHandle);
+      record?.pending.get(value.requestId)?.abort();
+      return;
+    }
+    if (value.type !== "source-read") return;
+    const sourceHandle = value.sourceHandle;
+    const requestId = value.requestId;
+    const offset = value.offset;
+    const length = value.length;
+    if (
+      typeof sourceHandle !== "string"
+      || typeof requestId !== "string"
+      || requestId.length === 0
+      || requestId.length > 256
+      || !isSafeNonNegativeInteger(offset)
+      || !isSafeNonNegativeInteger(length)
+    ) {
+      // Without a valid pair of opaque identifiers there is no safe pending
+      // entry to settle. Treat the private broker message as a protocol fault
+      // instead of leaving a Worker request waiting forever.
+      this.#rpc.terminate(
+        new TabularkError("PROTOCOL_INCOMPATIBLE", "The Worker sent an invalid source read request"),
+        true,
+      );
+      return;
+    }
+    const record = this.#sourceReaders.get(sourceHandle);
+    if (record === undefined || record.closed) {
+      this.#postSourceFailure(requestId, sourceHandle, offset, length, "HANDLE_CLOSED");
+      return;
+    }
+    if (record.pending.has(requestId)) {
+      this.#rpc.terminate(
+        new TabularkError("PROTOCOL_INCOMPATIBLE", "The Worker reused a source request identifier"),
+        true,
+      );
+      return;
+    }
+    if (
+      offset > record.size
+      || length > record.size - offset
+    ) {
+      this.#postSourceFailure(requestId, sourceHandle, offset, length, "RANGE_UNSUPPORTED");
+      return;
+    }
+    if (length > sourceStagingBudget(this.#limits)) {
+      this.#postSourceFailure(requestId, sourceHandle, offset, length, "RESOURCE_LIMIT", false, {
+        resource: "source-staging",
+        requiredBytes: length,
+        availableBytes: sourceStagingBudget(this.#limits),
+      });
+      return;
+    }
+    const controller = new AbortController();
+    record.pending.set(requestId, controller);
+    this.#runSourceRead(record, requestId, sourceHandle, offset, length, controller);
+  }
+
+  /** Admits one bounded host buffer, then performs and settles the provider read. */
+  #runSourceRead(
+    record: SourceReaderRecord,
+    requestId: string,
+    sourceHandle: string,
+    offset: number,
+    length: number,
+    controller: AbortController,
+  ): void {
+    void (async () => {
+      let concurrencyRelease: (() => void) | undefined;
+      let stagingPermit: SourceStagingPermit | undefined;
+      try {
+        concurrencyRelease = await record.concurrency.acquire(controller.signal);
+        stagingPermit = await this.#sourceStaging.acquire(length, controller.signal);
+        // A queued request may have been cancelled or its dataset may have
+        // closed before staging became available. Do not invoke user code in
+        // that case; the Worker-side cancellation already settled its wait.
+        if (
+          record.closed
+          || record.pending.get(requestId) !== controller
+          || controller.signal.aborted
+        ) {
+          return;
+        }
+        const value = await Promise.resolve().then(() => record.reader.read(
+          { offset, length },
+          { signal: controller.signal },
+        ));
+        // A cancelled/closed broker request no longer has a Worker waiter;
+        // discard a late provider result instead of transferring bytes into
+        // a dead operation or exposing a stale snapshot response.
+        if (
+          record.closed
+          || record.pending.get(requestId) !== controller
+          || controller.signal.aborted
+        ) {
+          return;
+        }
+        // Validate the provider's reported byte length before copying. A
+        // hostile reader can otherwise return a very large backing buffer;
+        // copying it first would temporarily exceed the aggregate staging
+        // reservation even though the request itself was bounded.
+        const buffer = copyExactRangeBytes(value, length);
+        this.#rpc.postMessage({
+          type: "source-read-result",
+          requestId,
+          sourceHandle,
+          offset,
+          length,
+          buffer,
+        }, [buffer]);
+      } catch (error) {
+        if (!record.closed && record.pending.get(requestId) === controller) {
+          const normalized = normalizeSourceProviderError(error);
+          this.#postSourceFailure(
+            requestId,
+            sourceHandle,
+            offset,
+            length,
+            normalized.code,
+            normalized.retryable,
+          );
+          if (normalized.code === "SOURCE_CHANGED") {
+            void this.#closeSourceReader(sourceHandle);
+          }
+        }
+      } finally {
+        stagingPermit?.release();
+        concurrencyRelease?.();
+        if (record.pending.get(requestId) === controller) record.pending.delete(requestId);
+      }
+    })();
+  }
+
+  #postSourceFailure(
+    requestId: unknown,
+    sourceHandle: unknown,
+    offset: unknown,
+    length: unknown,
+    code: string,
+    retryable = false,
+    details?: Readonly<Record<string, unknown>>,
+  ): void {
+    if (typeof requestId !== "string" || typeof sourceHandle !== "string") return;
+    this.#rpc.postMessage({
+      type: "source-read-failure",
+      requestId,
+      sourceHandle,
+      ...(isSafeNonNegativeInteger(offset) ? { offset } : {}),
+      ...(isSafeNonNegativeInteger(length) ? { length } : {}),
+      error: {
+        code: sourceErrorCode(code),
+        message: sourceErrorMessage(code),
+        retryable,
+        ...(details === undefined ? {} : { details }),
+      },
+    });
+  }
+
+  async #closeDatasetSource(datasetHandle: string): Promise<void> {
+    const handle = this.#datasetSources.get(datasetHandle);
+    if (handle !== undefined) {
+      this.#datasetSources.delete(datasetHandle);
+      await this.#closeSourceReader(handle);
+    }
+  }
+
+  async #closeSourceReader(handle: string): Promise<void> {
+    const record = this.#sourceReaders.get(handle);
+    if (record === undefined || record.closed) return;
+    record.closed = true;
+    this.#sourceReaders.delete(handle);
+    for (const controller of record.pending.values()) controller.abort();
+    record.pending.clear();
+    record.concurrency.close();
+    await closeRangeReaderBestEffort(record.reader);
+  }
+
+  async #closeAllSourceReaders(): Promise<void> {
+    if (this.#sourceCleanupPromise !== undefined) {
+      await this.#sourceCleanupPromise;
+      return;
+    }
+    this.#sourceCleanupPromise = (async () => {
+      for (const controller of this.#openingSources) controller.abort();
+      this.#datasetSources.clear();
+      await Promise.all([...this.#sourceReaders.keys()].map((handle) => this.#closeSourceReader(handle)));
+    })();
+    await this.#sourceCleanupPromise;
+  }
+
   #handleEvent(event: ProtocolEvent): void {
     const handle = event.datasetHandle;
     if (!handle && event.event === "runtimeError") {
@@ -1007,9 +1719,16 @@ class Engine implements TabularkEngine {
       return;
     }
     session.handleEvent(event);
+    if (event.event === "runtimeError" && !event.tableHandle && session.closed) {
+      // A source validator failure emits runtimeError before the Worker's
+      // closed event. Release the host reader immediately even if the latter
+      // is lost during Worker termination.
+      void this.#closeDatasetSource(handle);
+    }
     if (event.event === "closed" && !event.tableHandle && session.closed) {
       this.#sessions.delete(handle);
       this.#deleteOrphanEvents(handle);
+      void this.#closeDatasetSource(handle);
     }
   }
 
@@ -1069,6 +1788,7 @@ class Engine implements TabularkEngine {
       // closeSource may emit a final closed event before its acknowledgement.
       // No DatasetSession will consume that event after a failed open.
       this.#deleteOrphanEvents(datasetHandle);
+      await this.#closeDatasetSource(datasetHandle);
     }
   }
 
@@ -1166,9 +1886,12 @@ class Engine implements TabularkEngine {
       return;
     }
     this.#closed = true;
+    this.#sourceStaging.close();
+    for (const controller of this.#openingSources) controller.abort();
     this.#abortRangeSingleflights();
     this.#rangeCache.clear();
     this.#clearOrphanEvents();
+    void this.#closeAllSourceReaders();
     for (const session of this.#sessions.values()) {
       session.failLocally(error);
     }
@@ -1645,6 +2368,7 @@ function normalizeOpenOptions<Options>(
   options: OpenSourceOptions<Options>,
   adapters: ReadonlyMap<OfficialAdapterId, AdapterRegistration>,
   inferredSourceName?: string,
+  rangeSource = false,
 ): NormalizedOpenOptions {
   if (!options || typeof options !== "object") {
     throw invalidArgument("open options are required");
@@ -1655,6 +2379,9 @@ function normalizeOpenOptions<Options>(
   const sourceMode = options.sourceMode === undefined ? "auto" : options.sourceMode;
   if (!isSourceMode(sourceMode)) {
     throw invalidArgument("sourceMode must be auto or large");
+  }
+  if (rangeSource && (options.sourceMode !== undefined || options.transferInput !== undefined)) {
+    throw invalidArgument("sourceMode and transferInput do not apply to RangeSource inputs");
   }
   const selected = resolveOfficialAdapter(options.adapter);
   if (!selected) {
@@ -1699,6 +2426,7 @@ function normalizeOpenOptions<Options>(
     adapter: registered,
     options: normalized,
     sourceMode,
+    isRangeSource: rangeSource,
   };
 }
 
@@ -2316,6 +3044,9 @@ const SAFE_DIAGNOSTIC_CODES = new Set([
   "INVALID_RANGE",
   "INVALID_ARGUMENT",
   "UNSUPPORTED_RUNTIME",
+  "SOURCE_UNAVAILABLE",
+  "SOURCE_CHANGED",
+  "RANGE_UNSUPPORTED",
 ]);
 
 function safeDiagnosticMessage(value: unknown, fallback: string, code?: string): string {
@@ -2360,6 +3091,12 @@ function diagnosticFallback(code: string | undefined, severity: "warning" | "err
       return "An operation argument is invalid";
     case "UNSUPPORTED_RUNTIME":
       return "The current runtime is unsupported";
+    case "SOURCE_UNAVAILABLE":
+      return "The source is unavailable";
+    case "SOURCE_CHANGED":
+      return "The source changed while it was open";
+    case "RANGE_UNSUPPORTED":
+      return "The source does not support the requested byte range";
     case "RUNTIME_FAILURE":
       return "The runtime reported a failure";
     default:
@@ -2391,6 +3128,7 @@ function createDatasetCapabilitySeed(
   tables: readonly TableDescriptor[],
   sourceMode: SourceMode = "auto",
   stagedSourceLimit = MAX_ARRAY_BUFFER_BYTES,
+  rangeSource = false,
 ): DatasetCapabilitySeed {
   const manifest = officialAdapterManifestEntry(adapterId);
   // `auto` is intentionally conservative: a File may resolve to an IPC file
@@ -2401,7 +3139,9 @@ function createDatasetCapabilitySeed(
   const sourceAccess = adapterId === "tabulark:arrow-ipc" && options.container === "stream"
       ? "streaming"
       : manifest.resources.sourceAccess;
-  const maxSourceBytes = sourceMode === "large"
+  const maxSourceBytes = rangeSource
+    ? MAX_RANGE_SOURCE_BYTES
+    : sourceMode === "large"
     ? MAX_LARGE_SOURCE_BYTES
     : adapterId === "tabulark:excel"
       ? stagedSourceLimit
@@ -2508,6 +3248,83 @@ function asTabularkError(error: unknown, message: string): TabularkError {
     : new TabularkError("RUNTIME_FAILURE", message, { cause: error });
 }
 
+/** Sanitizes arbitrary provider failures before they cross the public boundary. */
+function normalizeRangeSourceOpenError(error: unknown): TabularkError {
+  const structured = rangeSourceErrorLike(error);
+  if (structured !== undefined) {
+    const code = sourceErrorCode(structured.code);
+    if (code === "CANCELLED") return cancelledError();
+    if (code === "HANDLE_CLOSED") return closedError("Range source reader");
+    if (code === "SOURCE_CHANGED") {
+      return new TabularkError("SOURCE_CHANGED", "The source changed while it was opening", {
+        retryable: structured.retryable,
+      });
+    }
+    if (code === "RANGE_UNSUPPORTED") {
+      return new TabularkError("RANGE_UNSUPPORTED", "The source does not support the requested range", {
+        retryable: structured.retryable,
+      });
+    }
+    if (code === "RESOURCE_LIMIT") {
+      return new TabularkError("RESOURCE_LIMIT", "The source exceeds its configured limit", {
+        details: safeSourceLimitDetails(structured.details),
+      });
+    }
+    if (code === "RUNTIME_FAILURE") {
+      return new TabularkError("RUNTIME_FAILURE", "The source provider returned invalid bytes", {
+        retryable: structured.retryable,
+      });
+    }
+    return new TabularkError("SOURCE_UNAVAILABLE", "The source could not be opened", {
+      retryable: structured.retryable,
+    });
+  }
+  if (isAbortLikeError(error)) return cancelledError();
+  return new TabularkError("SOURCE_UNAVAILABLE", "The source could not be opened", { retryable: true });
+}
+
+/**
+ * RangeSource implementations may come from a separately bundled entrypoint,
+ * so their TabularkError constructor does not necessarily share identity with
+ * core. Capture only the constrained public fields; callers rebuild messages
+ * and sanitize any retained details before exposing them.
+ */
+function rangeSourceErrorLike(value: unknown): {
+  readonly code: string;
+  readonly retryable: boolean;
+  readonly details: unknown;
+} | undefined {
+  if (!isRecord(value)) return undefined;
+  try {
+    const code = value.code;
+    const retryable = value.retryable;
+    if (typeof code !== "string" || typeof retryable !== "boolean") return undefined;
+    return { code, retryable, details: value.details };
+  } catch {
+    return undefined;
+  }
+}
+
+function safeSourceLimitDetails(value: unknown): Readonly<Record<string, unknown>> {
+  if (!isRecord(value)) {
+    return { resource: "source-staging", requiredBytes: 0, availableBytes: 0 };
+  }
+  const resource = typeof value.resource === "string"
+    && /^[A-Za-z0-9_.:-]{1,64}$/u.test(value.resource)
+    ? value.resource
+    : "source-staging";
+  const requiredBytes = isSafeNonNegativeInteger(value.requiredBytes) ? value.requiredBytes : 0;
+  const availableBytes = isSafeNonNegativeInteger(value.availableBytes) ? value.availableBytes : 0;
+  return { resource, requiredBytes, availableBytes };
+}
+
+function isAbortLikeError(value: unknown): boolean {
+  return typeof value === "object"
+    && value !== null
+    && ((value as { name?: unknown }).name === "AbortError"
+      || (value as { code?: unknown }).code === 20);
+}
+
 function numeric(value: unknown, fallback: number): number {
   return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : fallback;
 }
@@ -2537,6 +3354,183 @@ function safelyCall<T>(listener: (value: T) => void, value: T): void {
     if (typeof reportError === "function") {
       reportError(error);
     }
+  }
+}
+
+function sourceStagingBudget(limits: MemoryBudgetLimits): number {
+  return limits.mainThreadSourceBytes;
+}
+
+/**
+ * Calls a provider's close hook without allowing a malformed reader (or a
+ * throwing getter) to replace the structured open/cleanup result.  The
+ * public contract requires close to be best-effort and idempotent; this
+ * helper also covers the invalid-reader path before a typed reader exists.
+ */
+async function closeRangeReaderBestEffort(value: unknown): Promise<void> {
+  if (typeof value !== "object" || value === null) return;
+  let close: unknown;
+  try {
+    close = (value as { close?: unknown }).close;
+  } catch {
+    return;
+  }
+  if (typeof close !== "function") return;
+  let closeResult: Promise<unknown>;
+  try {
+    // A provider is allowed to return a Promise, but a non-cooperative close
+    // must not make engine shutdown unbounded. Attach a rejection handler even
+    // when the timeout wins so a late rejection cannot become unhandled.
+    closeResult = Promise.resolve((close as () => unknown).call(value));
+  } catch {
+    return;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, LIFECYCLE_CLOSE_TIMEOUT_MS);
+  });
+  await Promise.race([closeResult.then(() => undefined, () => undefined), timeout]);
+  if (timer !== undefined) clearTimeout(timer);
+}
+
+/**
+ * Races an open against its AbortSignal. JavaScript Promises cannot be
+ * forcibly cancelled, so a late reader is closed when the provider eventually
+ * resolves; this keeps cancellation prompt while preserving the exactly-once
+ * reader lifecycle guarantee.
+ */
+function openRangeReaderWithCancellation(
+  source: RangeSource,
+  options: {
+    readonly signal: AbortSignal;
+    readonly maxSourceBytes: number;
+    readonly maxStagingBytes: number;
+  },
+  signal: AbortSignal,
+): Promise<RangeSourceReader> {
+  let finished = false;
+  const opening = signal.aborted
+    ? Promise.reject<RangeSourceReader>(cancelledError())
+    : Promise.resolve().then(() => source.open(options));
+  return new Promise<RangeSourceReader>((resolve, reject) => {
+    const cleanup = (): void => {
+      signal.removeEventListener("abort", onAbort);
+    };
+    const onAbort = (): void => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      reject(cancelledError());
+    };
+    if (signal.aborted) {
+      onAbort();
+      // Still attach handlers below so a provider that ignores cancellation
+      // cannot produce an unhandled rejection.
+    } else {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    opening.then(
+      (value) => {
+        if (finished) {
+          void closeRangeReaderBestEffort(value);
+          return;
+        }
+        finished = true;
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        if (finished) return;
+        finished = true;
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
+
+function copyExactRangeBytes(
+  value: ArrayBuffer | ArrayBufferView,
+  expectedLength: number,
+): ArrayBuffer {
+  const actualLength = value instanceof ArrayBuffer
+    ? value.byteLength
+    : ArrayBuffer.isView(value)
+      ? value.byteLength
+      : undefined;
+  if (actualLength !== expectedLength) {
+    throw new TabularkError(
+      "RUNTIME_FAILURE",
+      "The source provider returned an invalid byte length",
+    );
+  }
+  // The broker owns an exact ArrayBuffer returned by the provider and
+  // immediately transfers it to the Worker. Reusing that allocation avoids a
+  // second main-thread buffer that would temporarily double the staging
+  // slice. Exact whole-buffer views can use the same ownership transfer; only
+  // offset/shared views need a bounded copy.
+  if (value instanceof ArrayBuffer) return value;
+  if (
+    value.buffer instanceof ArrayBuffer
+    && value.byteOffset === 0
+    && value.byteLength === value.buffer.byteLength
+  ) {
+    return value.buffer;
+  }
+  return copyRangeBytes(value);
+}
+
+function combineAbortSignals(first: AbortSignal | undefined, second: AbortSignal): AbortSignal {
+  if (first === undefined) return second;
+  if (first === second) return first;
+  const any = (AbortSignal as typeof AbortSignal & {
+    any?: (signals: readonly AbortSignal[]) => AbortSignal;
+  }).any;
+  if (typeof any === "function") return any([first, second]);
+  const controller = new AbortController();
+  const abort = (): void => controller.abort();
+  if (first.aborted || second.aborted) {
+    controller.abort();
+  } else {
+    first.addEventListener("abort", abort, { once: true });
+    second.addEventListener("abort", abort, { once: true });
+  }
+  return controller.signal;
+}
+
+function normalizeSourceProviderError(error: unknown): { code: string; retryable: boolean } {
+  const structured = rangeSourceErrorLike(error);
+  if (structured !== undefined) {
+    const code = sourceErrorCode(structured.code);
+    return { code, retryable: structured.retryable };
+  }
+  if (typeof error === "object" && error !== null && (error as { name?: unknown }).name === "AbortError") {
+    return { code: "CANCELLED", retryable: false };
+  }
+  return { code: "SOURCE_UNAVAILABLE", retryable: true };
+}
+
+function sourceErrorCode(value: unknown): string {
+  return value === "SOURCE_CHANGED"
+    || value === "RANGE_UNSUPPORTED"
+    || value === "SOURCE_UNAVAILABLE"
+    || value === "RESOURCE_LIMIT"
+    || value === "CANCELLED"
+    || value === "HANDLE_CLOSED"
+    || value === "RUNTIME_FAILURE"
+    ? value
+    : "SOURCE_UNAVAILABLE";
+}
+
+function sourceErrorMessage(code: unknown): string {
+  switch (sourceErrorCode(code)) {
+    case "SOURCE_CHANGED": return "The source changed while it was open";
+    case "RANGE_UNSUPPORTED": return "The source range is unsupported";
+    case "CANCELLED": return "The source read was cancelled";
+    case "HANDLE_CLOSED": return "The source is closed";
+    case "RUNTIME_FAILURE": return "The source provider returned invalid bytes";
+    case "RESOURCE_LIMIT": return "The source exceeds its configured limit";
+    default: return "The source provider is unavailable";
   }
 }
 

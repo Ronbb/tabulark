@@ -43,6 +43,10 @@ for (const adapter of officialManifest.adapters) {
 await Promise.all([
   ...[...adapterEntrypoints].map(([sourceName, outputName]) => build({
     ...shared,
+    // Keep the stable root under its frozen delivery ceiling. Source maps
+    // preserve debuggability while production identifier/syntax compaction
+    // avoids charging readable internal names to every local consumer.
+    ...(sourceName === "index" ? { minify: true } : {}),
     entryPoints: [fileURLToPath(new URL(`js/${sourceName}.ts`, rootUrl))],
     outfile: fileURLToPath(new URL(`dist/${outputName}.js`, rootUrl)),
   })),
@@ -53,12 +57,27 @@ await Promise.all([
   }),
   build({
     ...shared,
+    entryPoints: [fileURLToPath(new URL("js/http.ts", rootUrl))],
+    outfile: fileURLToPath(new URL("dist/http.js", rootUrl)),
+  }),
+  build({
+    ...shared,
     // The Worker is a private protocol endpoint: compact its internal names
     // while keeping source maps for diagnostics. This pays for ABI-v3
     // validation without relaxing the frozen P0 Worker-size ceiling.
-    minifyIdentifiers: true,
+    minify: true,
+    // This private module is a separately measured, lazy Worker capability.
+    // Preserving the relative import ensures Blob/ArrayBuffer opens never
+    // download its HTTP/provider broker and interval cache.
+    external: ["./worker-range-source.js"],
     entryPoints: [fileURLToPath(new URL("js/worker.ts", rootUrl))],
     outfile: fileURLToPath(new URL("dist/worker.js", rootUrl)),
+  }),
+  build({
+    ...shared,
+    minify: true,
+    entryPoints: [fileURLToPath(new URL("js/worker-range-source.ts", rootUrl))],
+    outfile: fileURLToPath(new URL("dist/worker-range-source.js", rootUrl)),
   }),
 ]);
 

@@ -7,6 +7,25 @@
  */
 export const MAX_LARGE_SOURCE_BYTES = 2 * 1024 * 1024 * 1024;
 
+// RangeSource is kept in a small standalone module so the stable client and
+// the optional HTTP entrypoint share one structural contract without pulling
+// HTTP/fetch code into the core bundle.
+export {
+  MAX_RANGE_SOURCE_BYTES,
+  isRangeSource,
+  validateByteRange,
+  validateRangeSourceReader,
+  copyRangeBytes,
+} from "./range-source.js";
+export type {
+  ByteRange,
+  RangeSource,
+  RangeSourceOpenOptions,
+  RangeSourceReader,
+  RangeSourceReadOptions,
+  RangeSourceSnapshot,
+} from "./range-source.js";
+
 /** Selects the bounded default path or the large local-Blob path. */
 export type SourceMode = "auto" | "large";
 

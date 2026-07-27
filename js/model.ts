@@ -12,12 +12,24 @@ const ADAPTER_TILE_CACHE_MAX_BYTES = 96 * 1024 * 1024;
 const MAIN_THREAD_RANGE_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const FIELD_AND_BATCH_MAX_BYTES = 8 * 1024 * 1024;
 
+// Batch values are decoded one cell at a time by the logical facade. Reusing
+// these immutable helpers avoids constructing a TextDecoder/DataView for every
+// UTF-8 value and primitive read while keeping the cache weakly tied to the
+// transferred backing buffer's lifetime.
+const UTF8_DECODER = new TextDecoder();
+const DATA_VIEW_CACHE = new WeakMap<object, Map<number, Map<number, DataView>>>();
+
 export const MAX_SOURCES = 2;
 export const MAX_ACTIVE_RANGES = 2;
 export const MAX_RANGE_WAITERS = 8;
 
 export interface MemoryBudgetLimits {
   readonly memoryBudgetBytes: number;
+  /** Cross-thread accounting slices used by RangeSource brokers. */
+  readonly workerBudgetBytes: number;
+  readonly mainThreadSourceBytes: number;
+  readonly mainThreadRetainedBytes: number;
+  readonly sourceRangeCacheBytes: number;
   /** Shared retained capacity allocated among the adapters actually registered. */
   readonly adapterRuntimePoolBytes: number;
   /** Maximum transient/decoded budget retained by one active adapter operation. */
@@ -43,8 +55,18 @@ export function deriveMemoryBudgetLimits(memoryBudgetBytes: number): MemoryBudge
   // hard-coded split based on a historic number of built-in adapters.
   const adapterRuntimePoolBytes = Math.max(1, Math.floor(memoryBudgetBytes / 2));
   const operationBudgetBytes = Math.max(1, Math.floor(memoryBudgetBytes / 8));
+  const workerBudgetBytes = Math.max(1, Math.floor(memoryBudgetBytes * 3 / 4));
+  const mainThreadSourceBytes = Math.max(1, oneEighth);
+  const mainThreadRetainedBytes = Math.max(
+    1,
+    memoryBudgetBytes - workerBudgetBytes - mainThreadSourceBytes,
+  );
   return Object.freeze({
     memoryBudgetBytes,
+    workerBudgetBytes,
+    mainThreadSourceBytes,
+    mainThreadRetainedBytes,
+    sourceRangeCacheBytes: Math.max(1, Math.floor(workerBudgetBytes / 8)),
     adapterRuntimePoolBytes,
     operationBudgetBytes,
     indexBudgetBytes: Math.min(INDEX_BUDGET_MAX_BYTES, oneEighth),
@@ -619,7 +641,7 @@ function decodeDisplayValue(
   if (end < start || end > data.byteLength) {
     throw invalidArgument(`Column ${columnId} has invalid display offsets`);
   }
-  return new TextDecoder().decode(data.subarray(start, end));
+  return UTF8_DECODER.decode(data.subarray(start, end));
 }
 
 export function validateRange(request: RangeRequest): RangeRequest {
@@ -926,7 +948,7 @@ function decodeNativeValue(
       return null;
     case "unknown": {
       const bytes = decodeVariableBytes(descriptor, buffers, physicalIndex, 4);
-      return new TextDecoder().decode(bytes);
+      return UTF8_DECODER.decode(bytes);
     }
     case "boolean": {
       const values = requiredRegion(descriptor.values, buffers, "boolean values");
@@ -947,13 +969,13 @@ function decodeNativeValue(
     case "utf8":
     case "large-utf8": {
       const bytes = decodeVariableBytes(descriptor, buffers, physicalIndex, type.type === "large-utf8" ? 8 : 4);
-      return new TextDecoder().decode(bytes);
+      return UTF8_DECODER.decode(bytes);
     }
     case "binary":
     case "large-binary":
       return decodeVariableBytes(descriptor, buffers, physicalIndex, type.type === "large-binary" ? 8 : 4).slice();
     case "utf8-view":
-      return new TextDecoder().decode(decodeViewBytes(descriptor, buffers, physicalIndex));
+      return UTF8_DECODER.decode(decodeViewBytes(descriptor, buffers, physicalIndex));
     case "binary-view":
       return decodeViewBytes(descriptor, buffers, physicalIndex).slice();
     case "fixed-size-binary": {
@@ -1024,7 +1046,7 @@ function decodeNativeValue(
       if (physicalIndex >= typeIds.byteLength) {
         throw invalidArgument("Union type id is out of bounds");
       }
-      const typeId = new DataView(typeIds.buffer, typeIds.byteOffset, typeIds.byteLength).getInt8(physicalIndex);
+      const typeId = dataViewFor(typeIds).getInt8(physicalIndex);
       const fieldIndex = type.fields.findIndex((entry) => entry.typeId === typeId);
       if (fieldIndex < 0) {
         throw invalidArgument(`Union type id ${typeId} has no child`);
@@ -1120,7 +1142,7 @@ function decodeInterval(
   unit: IntervalUnit,
 ): IntervalValue {
   const values = requiredRegion(descriptor.values, buffers, "interval values");
-  const view = new DataView(values.buffer, values.byteOffset, values.byteLength);
+  const view = dataViewFor(values);
   if (unit === "year-month") {
     ensureViewRange(view, index * 4, 4, "year-month interval");
     return Object.freeze({ kind: "interval", unit, months: view.getInt32(index * 4, true) });
@@ -1165,7 +1187,7 @@ function decodeViewBytes(
   index: number,
 ): Uint8Array {
   const views = requiredRegion(descriptor.values, buffers, "view values");
-  const view = new DataView(views.buffer, views.byteOffset, views.byteLength);
+  const view = dataViewFor(views);
   const offset = index * 16;
   ensureViewRange(view, offset, 16, "view value");
   const length = view.getInt32(offset, true);
@@ -1192,7 +1214,7 @@ function readNumber(
   signedness: "signed" | "unsigned",
 ): number {
   const values = requiredRegion(descriptor.values, buffers, "numeric values");
-  const view = new DataView(values.buffer, values.byteOffset, values.byteLength);
+  const view = dataViewFor(values);
   const offset = index * width;
   ensureViewRange(view, offset, width, "numeric value");
   if (width === 1) return signedness === "signed" ? view.getInt8(offset) : view.getUint8(offset);
@@ -1207,7 +1229,7 @@ function readFloat(
   width: 4 | 8,
 ): number {
   const values = requiredRegion(descriptor.values, buffers, "floating-point values");
-  const view = new DataView(values.buffer, values.byteOffset, values.byteLength);
+  const view = dataViewFor(values);
   const offset = index * width;
   ensureViewRange(view, offset, width, "floating-point value");
   return width === 4 ? view.getFloat32(offset, true) : view.getFloat64(offset, true);
@@ -1220,7 +1242,7 @@ function readBigInt(
   signed: boolean,
 ): bigint {
   const values = requiredRegion(descriptor.values, buffers, "64-bit values");
-  const view = new DataView(values.buffer, values.byteOffset, values.byteLength);
+  const view = dataViewFor(values);
   const offset = index * 8;
   ensureViewRange(view, offset, 8, "64-bit value");
   return signed ? view.getBigInt64(offset, true) : view.getBigUint64(offset, true);
@@ -1281,8 +1303,31 @@ function readSignedOffset(bytes: Uint8Array, index: number, width: 4 | 8): numbe
   return readOffset(bytes, index, width, true);
 }
 
+function dataViewFor(bytes: Uint8Array): DataView {
+  // Uint8Array.buffer is an ArrayBufferLike object (ArrayBuffer or
+  // SharedArrayBuffer). The nested numeric maps avoid allocating a string key
+  // on every primitive decode while preserving distinct subview boundaries.
+  const backing = bytes.buffer as unknown as object;
+  let byOffset = DATA_VIEW_CACHE.get(backing);
+  if (byOffset === undefined) {
+    byOffset = new Map();
+    DATA_VIEW_CACHE.set(backing, byOffset);
+  }
+  let byLength = byOffset.get(bytes.byteOffset);
+  if (byLength === undefined) {
+    byLength = new Map();
+    byOffset.set(bytes.byteOffset, byLength);
+  }
+  let view = byLength.get(bytes.byteLength);
+  if (view === undefined) {
+    view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    byLength.set(bytes.byteLength, view);
+  }
+  return view;
+}
+
 function readOffset(bytes: Uint8Array, index: number, width: 4 | 8, signed: boolean): number {
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const view = dataViewFor(bytes);
   const offset = index * width;
   ensureViewRange(view, offset, width, "offset");
   const value = width === 4

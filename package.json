@@ -26,6 +26,11 @@
       "import": "./dist/excel.js",
       "default": "./dist/excel.js"
     },
+    "./http": {
+      "types": "./dist/http.d.ts",
+      "import": "./dist/http.js",
+      "default": "./dist/http.js"
+    },
     "./experimental": {
       "types": "./dist/experimental.d.ts",
       "import": "./dist/experimental.js",

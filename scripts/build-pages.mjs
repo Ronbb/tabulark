@@ -61,7 +61,7 @@ await writeFile(resolve(pagesRoot, ".nojekyll"), "", "utf8");
 const stableBundles = officialManifest.adapters.map(({ entrypoint }) => (
   entrypoint === "." ? "index" : entrypoint.replace(/^\.\//u, "")
 ));
-const publicBundles = [...stableBundles, "experimental", "worker"];
+const publicBundles = [...stableBundles, "experimental", "worker", "worker-range-source"];
 const requiredFiles = [
   ".nojekyll",
   "index.html",

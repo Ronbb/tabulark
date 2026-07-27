@@ -9,7 +9,10 @@ test("release tags cannot bypass main, prerequisite runs, or protected environme
   assert.match(workflow, /actions: read/u);
   assert.match(workflow, /git rev-parse "\$\{GITHUB_REF_NAME\}\^\{commit\}"/u);
   assert.match(workflow, /git ls-remote origin refs\/heads\/main/u);
-  assert.match(workflow, /for workflow in "CI" "GitHub Pages" "M6 Large Files"/u);
+  assert.match(
+    workflow,
+    /for workflow in "CI" "GitHub Pages" "M6 Large Files" "Remote RangeSource"/u,
+  );
   assert.match(workflow, /\.head_sha == \$sha/u);
   assert.match(workflow, /\.conclusion == "success"/u);
   assert.match(workflow, /grep -Fx "## \$\{version\}" CHANGELOG\.md/u);
@@ -103,6 +106,7 @@ test("pre-tag checks require a finalized clean candidate and external release fa
     'assertSuccessfulWorkflow("CI", head)',
     'assertSuccessfulWorkflow("GitHub Pages", head)',
     'assertSuccessfulWorkflow("M6 Large Files", head)',
+    'assertSuccessfulWorkflow("Remote RangeSource", head)',
     "GH_TOKEN",
   ]) {
     assert.ok(preflight.includes(required), `preflight must retain ${required}`);
@@ -110,6 +114,24 @@ test("pre-tag checks require a finalized clean candidate and external release fa
   assert.match(preflight, /\^## \$\{escapeRegExp\(cargoVersion\)\}\$/u);
   assert.match(preflight, /has \*\*not\*\* been published/u);
   assert.doesNotMatch(preflight, /\(\?: — unreleased\)\?/u);
+});
+
+test("Remote RangeSource gate covers contracts, package size, and all desktop browsers", async () => {
+  const workflow = await readFile(
+    new URL("../.github/workflows/range-sources.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(workflow, /^name: Remote RangeSource$/mu);
+  assert.match(workflow, /npm test/u);
+  assert.match(workflow, /npm run typecheck/u);
+  assert.match(workflow, /npm run package:check/u);
+  assert.match(workflow, /npm run benchmark:size/u);
+  assert.match(workflow, /playwright install --with-deps chromium firefox webkit/u);
+  assert.match(workflow, /test\/browser\/remote-range-source\.spec\.mjs/u);
+  for (const project of ["chromium", "firefox", "webkit"]) {
+    assert.match(workflow, new RegExp(`--project=${project}`, "u"));
+  }
+  assert.match(workflow, /--workers=1 --retries=0/u);
 });
 
 test("M6 generates and deletes five exact 2 GiB containers without artifacting fixtures", async () => {

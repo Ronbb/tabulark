@@ -20,7 +20,12 @@ use tabulark::{ErrorCode, TabularkError};
 use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::{JsCast, JsValue};
 
-const MAX_LARGE_SOURCE_BYTES: usize = 2 * 1024 * 1024 * 1024;
+/// Maximum source address accepted by the incremental range boundary.
+///
+/// Local Blob staging is governed by the host's separate 2-GiB contract. A
+/// range source never materializes the source in WASM and may use the full
+/// 32-bit byte address space (`2^32 - 1`).
+const MAX_RANGE_SOURCE_BYTES: u64 = u32::MAX as u64;
 
 struct PendingOpen {
     operation: ArrowIpcOpenOperation,
@@ -186,8 +191,21 @@ impl WasmRuntime {
         options: JsValue,
         source_length: f64,
     ) -> std::result::Result<JsValue, JsValue> {
-        let source_length = safe_usize(source_length, "sourceLength")?;
-        validate_incremental_source_length(source_length).map_err(error_to_js)?;
+        // Validate the format-independent range address limit while the
+        // value is still a u64. On wasm32, converting a value just above
+        // `u32::MAX` to `usize` first would incorrectly report INVALID_ARGUMENT
+        // instead of the required RESOURCE_LIMIT.
+        let source_length_u64 = safe_u64(source_length, "sourceLength")?;
+        validate_incremental_source_length(source_length_u64).map_err(error_to_js)?;
+        let source_length = usize::try_from(source_length_u64).map_err(|_| {
+            error_to_js(
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "Arrow IPC source length exceeds the runtime address space",
+                )
+                .with_detail("sourceBytes", source_length_u64),
+            )
+        })?;
         let mut options = if options.is_null() || options.is_undefined() {
             ArrowIpcOptions::default()
         } else {
@@ -1072,37 +1090,29 @@ const fn current_wasm_memory_pages() -> u64 {
     0
 }
 
-fn safe_usize(value: f64, field: &str) -> std::result::Result<usize, JsValue> {
-    let value = safe_u64(value, field)?;
-    usize::try_from(value).map_err(|_| {
-        error_to_js(
-            TabularkError::new(
-                ErrorCode::InvalidArgument,
-                format!("{field} exceeds the supported integer range"),
-            )
-            .with_detail("field", field),
-        )
-    })
-}
-
-fn validate_incremental_source_length(source_length: usize) -> tabulark::Result<()> {
-    if source_length > MAX_LARGE_SOURCE_BYTES {
+fn validate_incremental_source_length(source_length: u64) -> tabulark::Result<()> {
+    if source_length > MAX_RANGE_SOURCE_BYTES {
         return Err(TabularkError::new(
             ErrorCode::ResourceLimit,
-            "Arrow IPC source exceeds the exact 2 GiB local-file limit",
+            "Arrow IPC range source exceeds the exact 4 GiB-1 address limit",
         )
         .with_detail("sourceBytes", source_length)
-        .with_detail("maxSourceBytes", MAX_LARGE_SOURCE_BYTES));
+        .with_detail("maxSourceBytes", MAX_RANGE_SOURCE_BYTES));
     }
     Ok(())
 }
 
 fn incremental_limits(memory_budget_bytes: usize) -> tabulark::Result<ArrowIpcLimits> {
     let mut limits = ArrowIpcLimits::from_memory_budget(memory_budget_bytes)?;
-    // The encoded File stays in a Worker-owned Blob and is never retained in
-    // WASM. Keep decoded/output sublimits tied to the runtime budget while the
-    // independent source-length ceiling follows the exact 2 GiB contract.
-    limits.max_source_bytes = MAX_LARGE_SOURCE_BYTES;
+    // The encoded File stays behind a Worker-owned accessor and is never
+    // retained in WASM. Keep decoded/output sublimits tied to the runtime budget while the
+    // independent source-length ceiling follows the range address contract.
+    limits.max_source_bytes = usize::try_from(MAX_RANGE_SOURCE_BYTES).map_err(|_| {
+        TabularkError::new(
+            ErrorCode::ResourceLimit,
+            "Arrow IPC range source limit exceeds the runtime address space",
+        )
+    })?;
     limits.validate_for_memory_budget(memory_budget_bytes)?;
     Ok(limits)
 }
@@ -1181,14 +1191,18 @@ fn error_to_js(error: TabularkError) -> JsValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_LARGE_SOURCE_BYTES, incremental_limits, validate_incremental_source_length};
+    use super::{MAX_RANGE_SOURCE_BYTES, incremental_limits, validate_incremental_source_length};
 
     #[test]
     fn incremental_limits_decouple_source_extent_from_wasm_memory() {
         let limits = incremental_limits(32 * 1024 * 1024).expect("incremental limits");
-        assert_eq!(limits.max_source_bytes, MAX_LARGE_SOURCE_BYTES);
+        assert_eq!(
+            limits.max_source_bytes,
+            usize::try_from(MAX_RANGE_SOURCE_BYTES).expect("range limit fits usize")
+        );
         assert!(limits.max_decoded_bytes <= 32 * 1024 * 1024);
-        validate_incremental_source_length(MAX_LARGE_SOURCE_BYTES).expect("exact 2 GiB");
-        assert!(validate_incremental_source_length(MAX_LARGE_SOURCE_BYTES + 1).is_err());
+        validate_incremental_source_length(MAX_RANGE_SOURCE_BYTES)
+            .expect("exact 4 GiB-1 range source");
+        assert!(validate_incremental_source_length(MAX_RANGE_SOURCE_BYTES + 1).is_err());
     }
 }

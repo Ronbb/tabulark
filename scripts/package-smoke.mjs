@@ -67,9 +67,15 @@ const requiredFiles = [
   "dist/experimental.js",
   "dist/experimental.js.map",
   "dist/experimental.d.ts",
+  "dist/http.js",
+  "dist/http.js.map",
+  "dist/http.d.ts",
   "dist/worker.js",
   "dist/worker.js.map",
   "dist/worker.d.ts",
+  "dist/worker-range-source.js",
+  "dist/worker-range-source.js.map",
+  "dist/worker-range-source.d.ts",
   ...officialManifest.adapters.flatMap(({ wasm }) => [
     `${wasm.outputDirectory}/${wasm.outputName}.js`.replace(/^dist\//u, "dist/"),
     `${wasm.outputDirectory}/${wasm.outputName}.d.ts`.replace(/^dist\//u, "dist/"),
@@ -109,6 +115,7 @@ for (const adapter of officialManifest.adapters) {
   );
 }
 assertExport(installedManifest, "./experimental", "./dist/experimental.js", "./dist/experimental.d.ts");
+assertExport(installedManifest, "./http", "./dist/http.js", "./dist/http.d.ts");
 
 for (const retiredPath of [
   "dist/wasm/tabulark.js",
@@ -126,12 +133,14 @@ await writeFile(
   `import * as stable from "tabulark";\n`
     + runtimeAdapterImports
     + `import { CanvasTablePainter, createTableController } from "tabulark/experimental";\n`
+    + `import { httpRangeSource } from "tabulark/http";\n`
     + `for (const privateName of ["PROTOCOL_VERSION", "ADAPTER_API_VERSION", "BATCH_LAYOUT_VERSION", "ColumnarTableBatch"]) {\n`
     + `  if (privateName in stable) throw new Error(\`private export leaked: \${privateName}\`);\n`
     + `}\n`
     + runtimeAdapterChecks
     + `if (typeof createTableController !== "function") throw new Error("experimental export mismatch");\n`
     + `if (typeof CanvasTablePainter !== "function") throw new Error("experimental painter mismatch");\n`
+    + `if (typeof httpRangeSource !== "function") throw new Error("http export mismatch");\n`
     + `await import("tabulark/protocol").then(\n`
     + `  () => { throw new Error("private protocol subpath is exported"); },\n`
     + `  (error) => { if (error?.code !== "ERR_PACKAGE_PATH_NOT_EXPORTED") throw error; },\n`
@@ -147,6 +156,7 @@ await writeFile(
     + `import { parquetAdapter, type ParquetAdapterOptions } from "tabulark/parquet";\n`
     + `import { excelAdapter, type ExcelAdapterOptions } from "tabulark/excel";\n`
     + `import { CanvasTablePainter, createTableController } from "tabulark/experimental";\n`
+    + `import { httpRangeSource, type HttpRangeSourceOptions } from "tabulark/http";\n`
     + `const arrowOptions: ArrowIpcAdapterOptions = { container: "auto" };\n`
     + `const parquetOptions: ParquetAdapterOptions = { sourceName: "sample.parquet" };\n`
     + `const excelOptions: ExcelAdapterOptions = { format: "auto", sourceName: "sample.xlsx" };\n`
@@ -160,7 +170,8 @@ await writeFile(
     + `// @ts-expect-error native descriptors are private implementation details\n`
     + `batch.columns[0]?.native;\n`
     + `void arrowOptions; void parquetOptions; void excelOptions; void engine; void display; void first; void presentation;\n`
-    + `void createCanvasTableView; void CanvasTablePainter; void createTableController;\n`,
+    + `const httpOptions: HttpRangeSourceOptions = { credentials: "same-origin", fallback: { mode: "bounded-download", maxBytes: 1024 } };\n`
+    + `void createCanvasTableView; void CanvasTablePainter; void createTableController; void httpRangeSource; void httpOptions;\n`,
   "utf8",
 );
 await writeFile(

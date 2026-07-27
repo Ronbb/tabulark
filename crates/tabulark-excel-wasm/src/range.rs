@@ -1197,7 +1197,8 @@ pub(crate) fn compact_xls(
     drop(compound);
     // Once every referenced FAT/miniFAT/Workbook sector has been proven
     // readable, materialize only the indexed low prefix.  Appended sparse
-    // capacity (including an exact-2-GiB final window) is not part of the CFB
+    // capacity (including a sparse final window near the address limit) is not
+    // part of the CFB
     // sector graph and therefore never enters WebAssembly memory.  Avoiding a
     // newly-created CFB also keeps this path deterministic on wasm32, where
     // `SystemTime::now` is unavailable to the cfb writer.
@@ -1336,6 +1337,22 @@ mod tests {
         assert!(HostRange::new(source_length, 1, source_length).is_err());
         assert!(HostRange::new(u64::MAX, 2, u64::MAX).is_err());
         assert!(HostRange::new((1_u64 << 31) + 1, 1, (1_u64 << 31) + 2).is_ok());
+    }
+
+    #[test]
+    fn sparse_ranges_support_the_exact_four_gib_minus_one_source_extent() {
+        let source_length = u32::MAX as u64;
+        let mut indexed = IndexedRanges::new(source_length);
+        let high = HostRange::new(source_length - 16, 16, source_length).unwrap();
+        indexed.insert(&high, vec![0x5a; 16]).unwrap();
+        assert_eq!(indexed.bytes(&high), Some(&[0x5a; 16][..]));
+
+        let query = HostRange::new(source_length - 32, 32, source_length).unwrap();
+        assert_eq!(
+            indexed.first_missing(&query).unwrap(),
+            Some(HostRange::new(source_length - 32, 16, source_length).unwrap())
+        );
+        assert_eq!(tail_range(source_length).unwrap().end(), source_length);
     }
 
     #[test]

@@ -9,6 +9,8 @@
     "parquetBrotli": 1048576,
     "excelRaw": 1114112,
     "excelBrotli": 393216,
+    "httpRaw": 36682,
+    "httpBrotli": 8008,
     "npmPacked": 2883584,
     "npmUnpacked": 9961472,
     "pagesRaw": 10092544,

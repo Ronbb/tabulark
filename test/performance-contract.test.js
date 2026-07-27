@@ -112,6 +112,8 @@ test("performance scenarios and size budgets remain reproducible and bounded", a
     "coreRaw",
     "excelBrotli",
     "excelRaw",
+    "httpBrotli",
+    "httpRaw",
     "npmPacked",
     "npmUnpacked",
     "pagesBrotli",
@@ -141,6 +143,16 @@ test("performance scenarios and size budgets remain reproducible and bounded", a
       budget.maximumBytes[budgetKey],
       withDeliveryHeadroom(packageBaseline[group][field]),
       `${budgetKey} delivery headroom`,
+    );
+  }
+  for (const [budgetKey, field] of [
+    ["httpRaw", "rawBytes"],
+    ["httpBrotli", "brotliBytes"],
+  ]) {
+    assert.equal(
+      budget.maximumBytes[budgetKey],
+      Math.ceil(packageBaseline.http[field] * 1.15),
+      `${budgetKey} exact 15% delivery headroom`,
     );
   }
 });
@@ -233,6 +245,7 @@ test("0.2 P0 gates keep paired medians, JavaScript shrinkage, and the frozen SHA
   assert.match(sizes, /candidateMaximumBytes/u);
   assert.match(sizes, /workerMaximumBytes/u);
   assert.match(sizes, /removedArtifact/u);
+  assert.match(sizes, /!== "dist\/http\.js"/u);
   assert.match(workflow, /git worktree add --detach "\$baseline" "\$baseline_sha"/u);
   assert.match(workflow, /node scripts\/run-performance-gate\.mjs --baseline-root/u);
 });

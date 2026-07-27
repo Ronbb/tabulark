@@ -17,6 +17,7 @@ const stableEntrypoints = Object.freeze({
   "./arrow": "arrow.d.ts",
   "./parquet": "parquet.d.ts",
   "./excel": "excel.d.ts",
+  "./http": "http.d.ts",
 });
 
 export async function collectStableDeclarationSnapshot() {

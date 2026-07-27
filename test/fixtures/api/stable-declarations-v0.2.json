@@ -5,7 +5,8 @@
     ".": "index.d.ts",
     "./arrow": "arrow.d.ts",
     "./parquet": "parquet.d.ts",
-    "./excel": "excel.d.ts"
+    "./excel": "excel.d.ts",
+    "./http": "http.d.ts"
   },
   "files": {
     "dist/adapters.d.ts": {
@@ -17,24 +18,28 @@
       "sha256": "38bac185d689852de466d1053b537d305f348145996bd58915c776fe20b22658"
     },
     "dist/client.d.ts": {
-      "bytes": 5746,
-      "sha256": "6240096d2d4a52b5068f85119c228c524d585e3a59567ccf1fd008562034f0f8"
+      "bytes": 6129,
+      "sha256": "6b9bb77b425ce16d8ef018b277c17ba87104283ecd2cc222e5699b22efd00a9b"
     },
     "dist/errors.d.ts": {
-      "bytes": 1171,
-      "sha256": "94949b34d8a8cc82b87e6a70af77d679539ebfe81f56d8ee99aeba5b221ad275"
+      "bytes": 1465,
+      "sha256": "af970f87134f0752b6982e6d6a6af76ed18b71ce2d5385a6089217165b1d819e"
     },
     "dist/excel.d.ts": {
       "bytes": 302,
       "sha256": "0e1fcf6c5e156a1cad4c30ea132ce4f1969dab0fea0825023381e87921cbb035"
     },
+    "dist/http.d.ts": {
+      "bytes": 3172,
+      "sha256": "0a2c5ad4b201f7e2d9bd0739c76f56248d89081b0ab3f0eed7b5d068f0489c02"
+    },
     "dist/index.d.ts": {
-      "bytes": 1488,
-      "sha256": "9d2439341e7cde6ae9eadb0c454c85b471a532b53e86506fe3dcdf0b877c438d"
+      "bytes": 1594,
+      "sha256": "a11a4113e981a676e0e5bb0f7a611e18682da4f5d4f7af042d879ccfca754e83"
     },
     "dist/model.d.ts": {
-      "bytes": 14766,
-      "sha256": "6f75490dec8ce6b98125d0720760b37d7784140682802a9385e3f365735b4349"
+      "bytes": 15011,
+      "sha256": "32358ba92eacd949eb7b9e432f3b97d74732d4dd6eb32b509998fed17ed41116"
     },
     "dist/official-adapter-manifest.d.ts": {
       "bytes": 1611,
@@ -48,9 +53,13 @@
       "bytes": 2522,
       "sha256": "28857a5cbfae9f61b1b39f336a97ec90293e836d405c9faef3e175e69433fe55"
     },
+    "dist/range-source.d.ts": {
+      "bytes": 2943,
+      "sha256": "6319811a1bf1c0909e5885b3258354a77871d2ba8ff9be288b76465e7ee741eb"
+    },
     "dist/source.d.ts": {
-      "bytes": 557,
-      "sha256": "2d5b3f47630a24af5ab32feec9680f8aaec7e7ff7e6a2dbeb382e9cb6cc6622a"
+      "bytes": 849,
+      "sha256": "76e1dc20650d8ae2dc527270fe367511825f4ef3cae0fc90ad4d08a7bb30fc09"
     },
     "dist/view/canvas-table-view-public.d.ts": {
       "bytes": 2735,

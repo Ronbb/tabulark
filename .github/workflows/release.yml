@@ -40,7 +40,7 @@ jobs:
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2022-11-28' \
             "/repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${candidate}&per_page=100")"
-          for workflow in "CI" "GitHub Pages" "M6 Large Files"; do
+          for workflow in "CI" "GitHub Pages" "M6 Large Files" "Remote RangeSource"; do
             if ! jq -e --arg workflow "$workflow" --arg sha "$candidate" \
               '[.workflow_runs[] | select(
                 .name == $workflow

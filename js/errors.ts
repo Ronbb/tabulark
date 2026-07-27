@@ -12,6 +12,12 @@ export type TabularkErrorCode =
   | "UNSUPPORTED_FEATURE"
   | "UNSUPPORTED_RUNTIME"
   | "RUNTIME_FAILURE"
+  /** A remote/source provider could not be reached or did not return bytes. */
+  | "SOURCE_UNAVAILABLE"
+  /** The provider validator or total length changed while a reader was open. */
+  | "SOURCE_CHANGED"
+  /** The provider did not honor the required single-range protocol. */
+  | "RANGE_UNSUPPORTED"
   | (string & {});
 
 /** A stable, serializable error returned by Tabulark. */

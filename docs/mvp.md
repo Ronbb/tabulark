@@ -8,11 +8,13 @@
 
 ## Product boundary
 
-Tabulark is a local browser preview primitive, not a spreadsheet editor or
-database product. It accepts `File`, `Blob`, or `ArrayBuffer`, opens the source
-through an explicitly selected official adapter in a Worker, exposes bounded
-dataset/table/range APIs, and renders a keyboard-accessible Canvas viewport
-with a bounded semantic grid.
+Tabulark is a bounded browser preview primitive, not a spreadsheet editor or
+database product. It accepts local `File`, `Blob`, or `ArrayBuffer` inputs and
+explicit `RangeSource` capabilities, opens the source through an explicitly
+selected official adapter in a Worker, exposes bounded dataset/table/range
+APIs, and renders a keyboard-accessible Canvas viewport with a bounded semantic
+grid. For a remote source, URL/network/authentication stay on the main thread;
+the Worker receives only an opaque handle and bounded bytes.
 
 The 0.2.0 release contains exactly four official adapter IDs:
 
@@ -21,9 +23,10 @@ The 0.2.0 release contains exactly four official adapter IDs:
 - `tabulark:parquet` for Parquet.
 - `tabulark:excel` for BIFF8 XLS and OOXML XLSX.
 
-Network range providers, `ReadableStream`, persistent caches, arbitrary
-JavaScript adapters, application-defined module URLs, and remote registries
-remain outside this release.
+`ReadableStream`, persistent cross-session caches, arbitrary JavaScript
+adapters, application-defined module URLs, and remote registries remain outside
+this release. Remote byte ranges are supported only through the explicit
+`RangeSource` contract; `tabulark/http` is the bundled HTTP implementation.
 
 ## Milestone history
 
@@ -100,13 +103,14 @@ The compatibility-covered entries are:
 | `tabulark/arrow` | `arrowIpcAdapter` |
 | `tabulark/parquet` | `parquetAdapter` and `ParquetAdapterOptions { sourceName? }` |
 | `tabulark/excel` | `excelAdapter` and `ExcelAdapterOptions { format?: "auto" \| "xls" \| "xlsx"; sourceName? }` |
+| `tabulark/http` | `httpRangeSource(url, options)` and HTTP range/fallback option types |
 
 `tabulark/experimental` contains the low-level painter/controller/layout/
 selection primitives and has no compatibility promise. Public `TableBatch`
 exposes logical range/data access and `toRows()`/`toDisplayRows()`; physical
 buffer regions, transport descriptors, and ABI/protocol/layout constants are
-not stable exports. In the 0.1.x line the four stable entries allow compatible
-additions only; removals or incompatible changes wait for 0.2.0.
+not stable exports. The five stable entries allow compatible additions through
+0.2.x; removals or incompatible changes require a future major version.
 
 ### Parquet
 
@@ -171,6 +175,36 @@ cover `2^31 + 1`, unsafe JavaScript integers, checked-add overflow, and WASM
 gates; Chromium additionally owns pixels, performance, real clipboard, and
 exact-size evidence.
 
+## 0.2.0 stable remote RangeSource
+
+The first post-M6 capability is a stable, repeatably openable `RangeSource`
+for CSV/TSV, Arrow IPC File/Stream, Parquet, XLSX, and XLS. A reader reports
+an exact `size` and `snapshot`, returns exactly each requested half-open byte
+range, and exposes an optional provider concurrency limit from one through
+four. The engine rejects unsafe offsets, overflow, short or long reads,
+invalid snapshots, and any source above exactly `4,294,967,295` bytes
+(`2^32 - 1`). `RangeSource` does not use `sourceMode` or `transferInput`.
+
+The host owns the reader registry, URL/network/authentication, cancellation
+controllers, and the aggregate main-thread source/staging budget. The Worker
+receives only an opaque handle, exact size, and transferable bounded bytes. A
+dataset merges overlap/adjacency, uses at most four provider reads in flight,
+and maintains a byte-budgeted range LRU plus singleflight; all pending reads,
+cache bytes, and the reader are released on dataset close, engine close, source
+failure, or Worker termination. Reader close is idempotent and occurs exactly
+once per open.
+
+`tabulark/http` provides the built-in HTTP source. It probes with a single
+`GET Range: bytes=0-0`, validates `Content-Range` and a strong ETag (falling
+back to `Last-Modified` plus total length only when permitted), and checks the
+validator and total on every `206`. It never infers range support from
+`Accept-Ranges`; a post-probe `200` or `416` fails. Retry attempts are bounded
+to transient network and documented status failures. Full download requires
+an explicit bounded fallback and a trustworthy `Content-Length` below both
+the caller's `maxBytes` and engine staging budget. Public errors and
+performance samples are sanitized and never contain URLs, query parameters,
+headers, validators, or snapshot IDs.
+
 ## 0.2.0 runtime boundary
 
 Worker protocol v4 and adapter ABI v3 make open, table-open, read, and
@@ -194,7 +228,9 @@ See [`testing.md`](testing.md) and [`releasing.md`](releasing.md).
 ## Out of scope for 0.2.0
 
 - Third-party adapter distribution or a stable public adapter ABI.
-- Remote sources, persistent caching, and application-controlled streaming.
+- Implicit/default remote fetching, multipart ranges, `ReadableStream`, and
+  whole-file download without the explicit bounded fallback.
+- Cross-session persistent caching, offline policy, and OPFS quota/cleanup.
 - SQLite, framework bindings, and Arrow JavaScript/FFI/C Data interfaces.
 - XLSM, XLSB, ODS, pre-BIFF8 XLS, encrypted workbooks, and formula execution.
 - Editing, workbook round-tripping, or document-level Excel rendering.

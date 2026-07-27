@@ -601,7 +601,7 @@ impl ArrowIpcSource {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadBytesAction {
-    /// Absolute byte offset in the Blob or ArrayBuffer.
+    /// Absolute byte offset in the host-owned source accessor.
     pub offset: u64,
     /// Exact number of bytes requested.
     pub length: u64,

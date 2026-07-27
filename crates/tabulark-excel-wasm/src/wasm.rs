@@ -27,6 +27,14 @@ use crate::{
     ExcelSheetVisibility, ExcelSourceHandle, ExcelTableHandle,
 };
 
+/// Largest source length accepted by the range-backed Excel boundary.
+///
+/// This is an address-space limit, not an allocation promise: range-backed
+/// opens retain only the bounded windows requested by the parser.  Local
+/// Blob staging limits are enforced by the JavaScript host before reaching
+/// this adapter and may be lower.
+pub(crate) const MAX_RANGE_SOURCE_BYTES: u64 = u32::MAX as u64;
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct WasmConfig {
@@ -298,18 +306,7 @@ impl WasmRuntime {
             from_js(options, "invalid Excel adapter options")?
         };
         let mut state = self.state.borrow_mut();
-        const MAX_EXCEL_SOURCE_BYTES: u64 = 1_u64 << 31;
-        if source_length > MAX_EXCEL_SOURCE_BYTES {
-            return Err(error_to_js(
-                TabularkError::new(
-                    ErrorCode::ResourceLimit,
-                    "Excel source exceeds the 2 GiB product limit",
-                )
-                .with_detail("resource", "source-bytes")
-                .with_detail("requiredBytes", source_length)
-                .with_detail("availableBytes", MAX_EXCEL_SOURCE_BYTES),
-            ));
-        }
+        validate_range_source_length(source_length).map_err(error_to_js)?;
         if source_length < 8 {
             return Err(error_to_js(TabularkError::new(
                 ErrorCode::ParseFailed,
@@ -318,8 +315,9 @@ impl WasmRuntime {
         }
         let operation = state.allocate_operation()?;
         let mut cursor = AdapterOperationCursor::new();
-        // Signature first: XLS never needs the ZIP tail, so an exact-2-GiB
-        // sparse CFB does not retain an irrelevant final window in WASM.
+        // Signature first: XLS never needs the ZIP tail, so a sparse CFB does
+        // not retain an irrelevant final window in WASM, even near the
+        // 4-GiB-1 range-source address limit.
         let expected = vec![HostRange::new(0, 8, source_length).map_err(error_to_js)?];
         let result = read_ranges_step(
             operation,
@@ -729,6 +727,19 @@ impl WasmRuntime {
         state.runtime.shutdown();
         state.ledger.release_all();
     }
+}
+
+fn validate_range_source_length(source_length: u64) -> Result<()> {
+    if source_length > MAX_RANGE_SOURCE_BYTES {
+        return Err(TabularkError::new(
+            ErrorCode::ResourceLimit,
+            "Excel range source exceeds the exact 4 GiB-1 address limit",
+        )
+        .with_detail("resource", "source-bytes")
+        .with_detail("requiredBytes", source_length)
+        .with_detail("availableBytes", MAX_RANGE_SOURCE_BYTES));
+    }
+    Ok(())
 }
 
 enum OperationAdvance {
@@ -1844,6 +1855,22 @@ mod tests {
     use super::*;
 
     const XLSX: &[u8] = include_bytes!("../../../test/fixtures/excel/v1/tabulark-ooxml.xlsx");
+
+    #[test]
+    fn range_source_accepts_exact_four_gib_minus_one_and_rejects_next_byte() {
+        validate_range_source_length(MAX_RANGE_SOURCE_BYTES)
+            .expect("the exact 4 GiB-1 address limit is supported");
+        let error = validate_range_source_length(MAX_RANGE_SOURCE_BYTES + 1)
+            .expect_err("the first unaddressable byte must be rejected");
+        assert_eq!(error.code(), ErrorCode::ResourceLimit);
+        assert_eq!(
+            error
+                .details()
+                .get("availableBytes")
+                .and_then(|value| value.as_u64()),
+            Some(MAX_RANGE_SOURCE_BYTES)
+        );
+    }
 
     #[test]
     fn entry_fetch_excludes_the_indexed_signature_from_its_header_action() {

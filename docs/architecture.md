@@ -6,10 +6,14 @@
 
 ## Boundary and invariants
 
-Tabulark previews local bytes without sending them to a service. It keeps
-format parsing, source staging, and large decoded allocations in a module
-Worker; the main thread receives bounded logical batches and paints only a
-viewport-sized Canvas and semantic grid.
+Tabulark previews bounded local bytes and can also consume an explicit remote
+`RangeSource`. Local bytes remain in the browser. For a remote source, URL,
+network policy, credentials, headers, and the provider implementation stay on
+the main thread; the module Worker receives only an opaque source handle, an
+exact length, and bounded byte responses. Format parsing, source staging, and
+large decoded allocations remain in the Worker; the main thread receives
+bounded logical batches and paints only a viewport-sized Canvas and semantic
+grid.
 
 The only built-in adapters are derived from one checked-in official manifest:
 
@@ -22,29 +26,36 @@ The only built-in adapters are derived from one checked-in official manifest:
 
 The manifest drives descriptor validation, Worker loading, build output,
 package and Pages assembly, and size checks. There is no global registry,
-arbitrary JavaScript adapter, module URL injection, remote range provider,
-`ReadableStream`, Arrow JavaScript table, or C Data Interface route.
+arbitrary JavaScript adapter, module URL injection, `ReadableStream`, Arrow
+JavaScript table, or C Data Interface route. `RangeSource` is the one explicit
+source capability: it is repeatably opened, validates an exact size and
+snapshot, and is brokered through a private main-thread handle.
 
 `sourceMode: "large"` accepts only a local `File`/`Blob` through exactly
 `2,147,483,648` bytes (`2^31`); `ArrayBuffer` and `auto` retain their
-conservative limits. The exact-boundary Chromium gate covers CSV, Arrow File,
-Parquet, XLSX, and XLS and reads a final window ending at offset `2^31 - 1`.
-Checked synthetic tests cover larger offsets and arithmetic overflow without
-raising the product limit.
+conservative limits. A `RangeSource` is capped separately at exactly
+`4,294,967,295` bytes (`2^32 - 1`) and may be used with CSV/TSV, Arrow IPC,
+Parquet, XLSX, and XLS. The exact-boundary Chromium gate covers the five local
+containers; remote tests use a virtual/sparse source and non-adjacent offsets
+above `2^31`. Checked synthetic tests cover larger offsets and arithmetic
+overflow without allocating an over-limit source.
 
 ## Runtime shape
 
 ```text
-File | Blob | ArrayBuffer
-          |
-          v
-  stable main-thread Engine / Dataset / Table handles
-          +-- immutable BatchBacking cache + singleflight
-          |  private Worker protocol v4
-          v
-      module Worker
-          |
-          +-- bounded source byte broker / cross-adapter quota coordinator
+File | Blob | ArrayBuffer       RangeSource / tabulark/http
+          |                                  |
+          +---------------+------------------+
+                          v
+       stable main-thread Engine / Dataset / Table handles
+                          +-- immutable BatchBacking cache + singleflight
+                          +-- source-reader registry + staging quota
+                          |  (URL/auth/network never cross this boundary)
+                          |  private Worker protocol v4
+                          v
+                      module Worker
+                          |
+                          +-- opaque source broker / cross-adapter quota coordinator
           +-- official-adapter host
           |       +-- Delimited Rust/WASM + resource ledger
           |       +-- Arrow IPC Rust/WASM + resource ledger
@@ -60,10 +71,39 @@ Canvas viewport + bounded ARIA grid + copy/keyboard interaction
 allow-list but does not fetch WASM. The first open for a descriptor imports its
 glue and artifact; concurrent first opens coalesce. Parsing, indexes,
 decompression, operation state, native caches, resource admission, and batch
-construction live in Rust/WASM. JavaScript retains the public facade, source
-and transfer bridge, top-level quota coordination, the sole decoded-batch
-cache, Canvas, and ARIA. In every path the Worker brokers bounded source bytes,
-validates opaque transport values, and owns cleanup.
+construction live in Rust/WASM. JavaScript retains the public facade, local
+Blob accessor, remote source-reader registry, transfer bridge, top-level quota
+coordination, the sole decoded-batch cache, Canvas, and ARIA. In every path the
+Worker requests bounded source bytes through an opaque handle, validates the
+handle/range/length/action mapping again on receipt, and owns cleanup.
+
+### RangeSource broker
+
+`RangeSource.open()` runs on the main thread with the engine's source and
+staging limits. It returns an independent reader with an exact byte length and
+`strong` or `weak` snapshot. The host assigns an opaque handle; URLs, headers,
+credentials, validators, provider callbacks, source implementations, and
+`RangeSource.name` all remain host-side and are never serialized to the Worker.
+Applications may still provide an explicit logical `sourceName` through the
+selected adapter's normal options.
+A Worker step can request at most 32 ranges. The host validates the
+handle, action index, safe offset/length, and exact returned byte count before
+transferring a buffer back. Overlapping or directly adjacent ranges in one
+step are merged, split only to fit the staging budget, and read with at most
+four provider calls in flight. A dataset-level singleflight and byte-counted
+LRU avoid duplicate provider reads and are discarded on dataset close or
+termination.
+
+The optional `tabulark/http` entry point is a source helper, not an implicit
+fetch policy. Its probe uses `GET` with `Range: bytes=0-0`; a successful `206` must
+carry an exact `Content-Range` total and a validator. Each later `206` is
+checked against that total and validator. A server that returns `200` or `416`
+after a successful probe is a source failure, not a reason to silently switch
+to full download. `fallback: { mode: "bounded-download", maxBytes }` is the
+only full-response path, and it requires a trusted length below both the
+caller bound and main-thread staging budget. Retry status codes and
+`Retry-After` are bounded; diagnostics are sanitized to exclude request
+identity and validator material.
 
 ## Private protocol and adapter ABI
 
@@ -87,11 +127,15 @@ import nor depend on these versions.
 ## Global memory accounting and lifetime
 
 The Worker retains the necessary top-level broker for quotas shared across
-WASM adapters. Each Rust runtime performs its own checked admission and reports
-a private ledger split into persistent, active-operation, ingress/output,
-native-cache, and caller-owned telemetry. Runtime-owned budget pressure clears
-soft native cache and retries admission exactly once before failing. The ledger
-also records current and high-water WebAssembly memory pages.
+WASM adapters. The engine-wide `memoryBudgetBytes` is split across threads:
+75% is the Worker/runtime pool, 12.5% is main-thread source reads/staging, and
+the remaining 12.5% is retained batches and an explicitly bounded HTTP
+fallback. Remote range-cache bytes are charged to the Worker share. Each Rust
+runtime performs its own checked admission and reports a private ledger split
+into persistent, active-operation, ingress/output, native-cache, and
+caller-owned telemetry. Runtime-owned budget pressure clears soft native cache
+and retries admission exactly once before failing. The ledger also records
+current and high-water WebAssembly memory pages.
 
 The main thread is the only owner of decoded batch caching. An immutable
 `BatchBacking` is keyed by dataset, logical table ID, revision, schema version,
@@ -103,17 +147,21 @@ all waiters propagates one cancel to the Worker.
 
 ```text
 Engine.close()
+  └─ source readers and opening controllers
   └─ DatasetSession.close()
-       └─ TableHandle.close()
-            └─ outstanding operations
+       └─ range cache and pending source reads
+            └─ TableHandle.close() / outstanding operations
 ```
 
 All close operations are idempotent. Dataset/engine close cascades downward;
 cancellation versus close settles once. Resource exhaustion reports
 `RESOURCE_LIMIT` with the resource category plus requested and available
-capacity. Lifecycle evidence repeats 100 open/read/cancel/close cycles per
-official runtime, requires runtime-owned accounting to return to zero, and
-requires the WASM page high-water mark to stop growing after cycle 10.
+capacity. A source reader is closed exactly once on a failed or cancelled open,
+dataset close, engine close, or Worker failure; its range cache and pending
+singleflight requests are released with it. Lifecycle evidence repeats 100
+open/read/cancel/close cycles per official runtime and source kind, requires
+runtime-owned accounting to return to zero, and requires the WASM page
+high-water mark to stop growing after cycle 10.
 
 ## Rust packages and artifacts
 
@@ -227,13 +275,15 @@ part of this layer.
 
 ## Delivery boundary
 
-The npm archive contains the four stable entries, the explicit experimental
-entry, declarations/source maps, generic Worker, all four WASM artifacts,
-licenses, notices, and changelog. Pages assembly uses the same manifest and
-copies all format fixtures plus locked provenance. Package, Pages, artifact-size,
-and three-browser tests validate this boundary. Chromium, Firefox, and WebKit
-are release-blocking functional gates; Chromium alone owns pixel snapshots,
-performance comparison, and exact-2-GiB evidence.
+The npm archive contains the five stable entries (root, `/arrow`, `/parquet`,
+`/excel`, and `/http`), the explicit experimental entry, declarations/source
+maps, generic Worker, all four WASM artifacts, licenses, notices, and changelog.
+`/http` has its own measured raw/Brotli budget; adding it does not relax the
+core, adapter, npm, or Pages caps. Pages assembly uses the same manifest and
+copies all format fixtures plus locked provenance. Package, Pages, artifact-
+size, HTTP contract, and three-browser tests validate this boundary. Chromium,
+Firefox, and WebKit are release-blocking functional gates; Chromium alone owns
+pixel snapshots, performance comparison, and exact-2-GiB evidence.
 
 The stable compatibility promise is documented in
 [api-stability.md](api-stability.md). Rust APIs, Worker protocol v4, adapter ABI

@@ -503,12 +503,16 @@ impl CsvScanner {
             .with_detail("indexedRows", self.rows));
         }
 
+        // Checkpoints are appended in monotonically increasing row order.
+        // Range reads are a hot path, so locate the nearest predecessor with
+        // a binary search instead of scanning the entire sparse index from
+        // the tail for every request.
         let checkpoint = self
             .checkpoints
-            .iter()
-            .rev()
+            .partition_point(|checkpoint| checkpoint.row <= request.row_start())
+            .checked_sub(1)
+            .and_then(|index| self.checkpoints.get(index))
             .copied()
-            .find(|checkpoint| checkpoint.row <= request.row_start())
             .unwrap_or(CsvCheckpoint {
                 row: self.rows,
                 byte_offset: self.parser_offset,
@@ -1710,6 +1714,28 @@ mod tests {
         assert_eq!(late.columns()[0].value(0), Some(Some("r4")));
         assert_eq!(early.columns()[0].value(0), Some(Some("r1")));
         assert_eq!(early.columns()[0].value(1), Some(Some("r2")));
+    }
+
+    #[test]
+    fn range_plan_selects_the_nearest_checkpoint_predecessor() {
+        let mut options = DelimitedOptions::csv();
+        options.checkpoint_interval = 2;
+        let source = MemorySource::open(b"value\nr0\nr1\nr2\nr3\nr4\n".to_vec(), options)
+            .expect("scan source");
+
+        let plan = source
+            .scanner
+            .plan_range(RangeRequest::new(3, 1, 0, 1).expect("range"))
+            .expect("plan");
+        assert_eq!(plan.checkpoint().row(), 2);
+        assert_eq!(plan.rows_to_skip(), 1);
+
+        let first = source
+            .scanner
+            .plan_range(RangeRequest::new(0, 1, 0, 1).expect("range"))
+            .expect("first plan");
+        assert_eq!(first.checkpoint().row(), 0);
+        assert_eq!(first.rows_to_skip(), 0);
     }
 
     #[test]

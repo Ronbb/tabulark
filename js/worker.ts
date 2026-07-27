@@ -53,22 +53,36 @@ import {
   isSourceMode,
   type SourceMode,
 } from "./source.js";
+import { BlobSourceAccessor } from "./worker/blob-source-accessor.js";
+import type {
+  SourceAccessor,
+  SourceReadOptions,
+} from "./worker/source-accessor.js";
 
 const CHUNK_BYTES = 1024 * 1024;
+const MAX_RANGE_SOURCE_BYTES = 0xffff_ffff;
 // wasm32 address arithmetic and Rust `usize` cap one Blob source below 4 GiB.
 // This is a format-addressability bound, not an allocation reservation: Arrow
 // File opens retain only footer/index state and fetch bounded blocks on demand.
-const MAX_ARROW_SOURCE_BYTES = 0xffff_ffff;
+const MAX_ARROW_SOURCE_BYTES = MAX_RANGE_SOURCE_BYTES;
 const INITIAL_READ_LIMIT_BYTES = 8 * CHUNK_BYTES;
 const INITIAL_ROW_TARGET = 256;
 const MAX_IN_FLIGHT_RANGES = MAX_ACTIVE_RANGES + MAX_RANGE_WAITERS;
+// The public engine rejects budgets below 8 MiB. Keep direct low-budget
+// protocol fixtures compatible with the historical Worker harness while the
+// supported browser path uses the explicit 75/12.5/12.5 split.
+const MIN_SPLIT_BUDGET_BYTES = 8 * 1024 * 1024;
 
 const scope = globalThis as unknown as DedicatedWorkerGlobalScope;
+type RangeSourceRuntime = typeof import("./worker-range-source.js");
+type SourceBroker = InstanceType<RangeSourceRuntime["WorkerSourceBroker"]>;
+let sourceBroker: SourceBroker | undefined;
+let rangeSourceRuntimePromise: Promise<RangeSourceRuntime> | undefined;
 
 interface DatasetState {
   readonly handle: string;
   readonly openRequestId: string;
-  readonly source: Blob;
+  readonly source: SourceAccessor;
   readonly adapterId: OfficialAdapterId;
   readonly adapter: AdapterRuntime;
   readonly sourceHandle: string | number;
@@ -178,13 +192,23 @@ interface ReservedBlobRead {
 interface OperationMeasurement {
   bytesRead: number;
   peakReservationBytes: number;
+  sourceReads: number;
+  sourceCacheHitBytes: number;
 }
 
 interface OpenSourcePayload {
-  readonly source: Blob | ArrayBuffer;
+  readonly source: Blob | ArrayBuffer | RemoteSourcePayload;
   readonly adapterId: OfficialAdapterId;
   readonly options: Record<string, unknown>;
   readonly sourceMode?: SourceMode;
+  readonly transferInput?: boolean;
+}
+
+interface RemoteSourcePayload {
+  readonly kind: "range";
+  readonly handle: string;
+  readonly size: number;
+  readonly maxConcurrency?: number;
 }
 
 let shuttingDown = false;
@@ -207,8 +231,32 @@ const openedDatasetsByRequest = new Map<string, string>();
 const rangePermits = new AsyncPermitQueue(MAX_ACTIVE_RANGES, MAX_RANGE_WAITERS);
 
 scope.addEventListener("message", (event: MessageEvent<unknown>) => {
+  if (sourceBroker?.handle(event.data)) {
+    return;
+  }
   void dispatch(event.data);
 });
+
+function loadRangeSourceRuntime(): Promise<RangeSourceRuntime> {
+  if (rangeSourceRuntimePromise !== undefined) return rangeSourceRuntimePromise;
+  const loading = import("./worker-range-source.js").catch((error) => {
+    rangeSourceRuntimePromise = undefined;
+    throw new ProtocolFault(
+      "RUNTIME_FAILURE",
+      "Failed to initialize the range source runtime",
+      false,
+      undefined,
+      error,
+    );
+  });
+  rangeSourceRuntimePromise = loading;
+  return loading;
+}
+
+function requireSourceBroker(runtime: RangeSourceRuntime): SourceBroker {
+  sourceBroker ??= new runtime.WorkerSourceBroker(scope);
+  return sourceBroker;
+}
 
 async function dispatch(value: unknown): Promise<void> {
   if (!isRequest(value)) {
@@ -228,7 +276,7 @@ async function dispatch(value: unknown): Promise<void> {
   }
 
   const measurement = (request as ProtocolRequest & { measure?: unknown }).measure === true
-    ? { bytesRead: 0, peakReservationBytes: 0 }
+    ? { bytesRead: 0, peakReservationBytes: 0, sourceReads: 0, sourceCacheHitBytes: 0 }
     : undefined;
   if (measurement) {
     activeMeasurements.add(measurement);
@@ -351,7 +399,18 @@ async function hello(value: unknown): Promise<unknown> {
   const limits = deriveMemoryBudgetLimits(payload.memoryBudgetBytes);
   adapterRegistrations = registrations;
   memoryLimits = limits;
-  memoryLedger = new MemoryReservationLedger(payload.memoryBudgetBytes);
+  // The ledger accounts only for Worker-owned allocations.  Main-thread
+  // source staging and retained batches have their own 12.5% slices, so using
+  // the full engine budget here would silently defeat the cross-thread cap.
+  // The source-range LRU is bounded independently by
+  // `sourceRangeCacheBytes`; reserve that slice up front instead of allowing
+  // the general Worker ledger and the LRU to each consume the full 75% share.
+  // This keeps the advertised engine budget a real cross-thread ceiling even
+  // when both datasets fill their range caches while adapter work is active.
+  const workerLedgerBytes = payload.memoryBudgetBytes < MIN_SPLIT_BUDGET_BYTES
+    ? payload.memoryBudgetBytes
+    : Math.max(1, limits.workerBudgetBytes - limits.sourceRangeCacheBytes);
+  memoryLedger = new MemoryReservationLedger(workerLedgerBytes);
   peakReservationBytes = 0;
   return helloResult();
 }
@@ -407,6 +466,7 @@ async function openSource(
   activeRequests.set(requestId, active);
   let dataset: DatasetState | undefined;
   let sourceHandle: string | number | undefined;
+  let source: SourceAccessor | undefined;
   let releaseSourceSlot: (() => void) | undefined;
   let opened = false;
 
@@ -424,45 +484,76 @@ async function openSource(
     if (!isRecord(payload.options) || Array.isArray(payload.options)) {
       throw new ProtocolFault("INVALID_ARGUMENT", "openSource options must be an object");
     }
-    const sourceMode = payload.sourceMode === undefined ? "auto" : payload.sourceMode;
-    if (!isSourceMode(sourceMode)) {
-      throw new ProtocolFault("INVALID_ARGUMENT", "openSource sourceMode must be auto or large");
-    }
-    let source: Blob;
-    if (payload.source instanceof Blob) {
-      source = payload.source;
-    } else if (payload.source instanceof ArrayBuffer) {
-      if (sourceMode === "large") {
+    const remoteSource = isRecord(payload.source) && payload.source.kind === "range";
+    if (remoteSource) {
+      // Range readers own their source policy, so local-only sourceMode/
+      // transferInput cannot silently alter it. Validator identity remains on
+      // the host and is never serialized into this descriptor.
+      if (payload.sourceMode !== undefined || payload.transferInput !== undefined) {
         throw new ProtocolFault(
           "INVALID_ARGUMENT",
-          "sourceMode large requires a local Blob or File source",
+          "sourceMode and transferInput do not apply to range sources",
         );
       }
-      if (payload.source.byteLength > limits.maxArrayBufferBytes) {
-        throw new ProtocolFault(
-          "RESOURCE_LIMIT",
-          `ArrayBuffer sources larger than ${limits.maxArrayBufferBytes} bytes must be supplied as a Blob`,
-          false,
-          {
-            resource: "source-staging",
-            requiredBytes: payload.source.byteLength,
-            availableBytes: limits.maxArrayBufferBytes,
-          },
-        );
-      }
-      source = new Blob([payload.source]);
+      const rangeRuntime = await loadRangeSourceRuntime();
+      const validateDescriptor: (candidate: unknown) => asserts candidate is RemoteSourcePayload =
+        rangeRuntime.validateRangeDescriptor;
+      validateDescriptor(payload.source);
+      source = new rangeRuntime.RangeSourceAccessor(
+        payload.source,
+        requireSourceBroker(rangeRuntime),
+        sourceRangeCacheBudget(limits),
+        limits.mainThreadSourceBytes,
+      );
     } else {
-      throw new ProtocolFault("INVALID_ARGUMENT", "source must be a Blob or ArrayBuffer");
+      const sourceMode = payload.sourceMode === undefined ? "auto" : payload.sourceMode;
+      if (!isSourceMode(sourceMode)) {
+        throw new ProtocolFault("INVALID_ARGUMENT", "openSource sourceMode must be auto or large");
+      }
+      let local: Blob;
+      if (typeof Blob !== "undefined" && payload.source instanceof Blob) {
+        local = payload.source;
+      } else if (payload.source instanceof ArrayBuffer) {
+        if (sourceMode === "large") {
+          throw new ProtocolFault(
+            "INVALID_ARGUMENT",
+            "sourceMode large requires a local Blob or File source",
+          );
+        }
+        if (payload.source.byteLength > limits.maxArrayBufferBytes) {
+          throw new ProtocolFault(
+            "RESOURCE_LIMIT",
+            `ArrayBuffer sources larger than ${limits.maxArrayBufferBytes} bytes must be supplied as a Blob`,
+            false,
+            {
+              resource: "source-staging",
+              requiredBytes: payload.source.byteLength,
+              availableBytes: limits.maxArrayBufferBytes,
+            },
+          );
+        }
+        local = new Blob([payload.source]);
+      } else {
+        throw new ProtocolFault("INVALID_ARGUMENT", "source must be a Blob, ArrayBuffer, or range source");
+      }
+      assertSourceSize(local, sourceMode);
+      assertLocalAdapterSourceSize(local, payload.adapterId);
+      source = new BlobSourceAccessor(local);
     }
-    assertSourceSize(source, sourceMode);
+    // The accessor is definitely initialized by one of the branches above.
+    const sourceAccessor = source;
+    if (!sourceAccessor) {
+      throw new ProtocolFault("INVALID_ARGUMENT", "openSource source is invalid");
+    }
     releaseSourceSlot = reserveSourceSlot();
 
     // Auto mode retains its conservative staging ceiling. Explicit large mode
     // is range-backed by the Rust Excel runtime for both XLS and XLSX.
     if (
-      sourceMode === "auto"
+      sourceAccessor.kind === "blob"
+      && payload.sourceMode !== "large"
       && payload.adapterId === "tabulark:excel"
-      && source.size > adapterRuntimeBudget("tabulark:excel", limits)
+      && sourceAccessor.size > adapterRuntimeBudget("tabulark:excel", limits)
     ) {
       throw new ProtocolFault(
         "RESOURCE_LIMIT",
@@ -470,7 +561,7 @@ async function openSource(
         false,
         {
           resource: "source-staging",
-          requiredBytes: source.size,
+          requiredBytes: sourceAccessor.size,
           availableBytes: adapterRuntimeBudget("tabulark:excel", limits),
         },
       );
@@ -480,7 +571,7 @@ async function openSource(
     active.adapter = runtime;
 
     const beginningOpen = Promise.resolve().then(() =>
-      runtime.beginOpen(adapterOpenOptions(payload, limits), source.size),
+      runtime.beginOpen(adapterOpenOptions(payload, limits), sourceAccessor.size),
     );
     // An async adapter can publish its operation/source handles after the
     // cancellation race has already completed. Reclaim those late handles
@@ -494,7 +585,7 @@ async function openSource(
     const initialStep = await awaitOperationStep(beginningOpen, active);
     const publishedOpen = await runOpenUntilPublished(
       runtime,
-      source,
+      sourceAccessor,
       initialStep,
       active,
       payload.adapterId,
@@ -520,13 +611,13 @@ async function openSource(
     const openedDataset: DatasetState = {
       handle: datasetHandle,
       openRequestId: requestId,
-      source,
+      source: sourceAccessor,
       adapterId: payload.adapterId,
       adapter: runtime,
       sourceHandle,
       tables: initialTables,
       metadata: initialMetadata,
-      scanOffset: progressiveOpen ? 0 : source.size,
+      scanOffset: progressiveOpen ? 0 : sourceAccessor.size,
       scanDone: !progressiveOpen,
       closed: false,
       eventsReady: false,
@@ -567,6 +658,9 @@ async function openSource(
         } catch {
           // Preserve the original open or cancellation failure.
         }
+      }
+      if (!dataset) {
+        source?.close();
       }
     }
     releaseSourceSlot?.();
@@ -1038,7 +1132,8 @@ async function scanOpenToEnd(dataset: DatasetState): Promise<void> {
     }
     const failure = error instanceof ProtocolFault
       ? error
-      : new ProtocolFault("RUNTIME_FAILURE", "Background source scanning failed", false, undefined, error);
+      : sourceFailureFault(error)
+        ?? new ProtocolFault("RUNTIME_FAILURE", "Background source scanning failed", false, undefined, error);
     dataset.scanError = failure;
     dataset.scanDone = true;
     notifyScanWaiters(dataset);
@@ -1370,6 +1465,7 @@ async function shutdown(): Promise<unknown> {
   for (const dataset of [...datasets.values()]) {
     closeDatasetState(dataset, false, shutdownFailure);
   }
+  sourceBroker?.shutdown();
   for (const adapter of loadedAdapters.values()) {
     adapter.dispose?.();
   }
@@ -1410,6 +1506,18 @@ function reserveSourceSlot(): () => void {
 }
 
 /**
+ * Source bytes are a soft Worker cache, never an unbounded second staging
+ * area. Newer memory-limit structs may expose a dedicated budget; older
+ * handshakes derive one conservatively from the operation slice.
+ */
+function sourceRangeCacheBudget(limits: MemoryBudgetLimits): number {
+  // The range cache is scoped to a dataset/accessor, while the budget is
+  // engine-wide.  Reserve an equal slice for the maximum concurrently live
+  // sources so two readers cannot multiply the advertised cache allowance.
+  return Math.max(1, Math.floor(limits.sourceRangeCacheBytes / Math.max(1, limits.maxSources)));
+}
+
+/**
  * Validates the source length before adapter startup. Blob sizes are exposed as
  * JavaScript numbers, while adapter offsets cross a wasm boundary; rejecting
  * non-safe lengths here prevents a rounded value from turning into a bogus
@@ -1445,6 +1553,22 @@ function assertSourceSize(source: Blob, sourceMode: SourceMode): void {
       },
     );
   }
+}
+
+/** Keeps local Arrow/Excel behavior independent from the remote u32 range cap. */
+function assertLocalAdapterSourceSize(source: Blob, adapterId: OfficialAdapterId): void {
+  if (adapterId !== "tabulark:arrow-ipc" && adapterId !== "tabulark:excel") return;
+  if (source.size <= MAX_LARGE_SOURCE_BYTES) return;
+  throw new ProtocolFault(
+    "RESOURCE_LIMIT",
+    `Local ${adapterId === "tabulark:excel" ? "Excel" : "Arrow IPC"} sources support at most ${MAX_LARGE_SOURCE_BYTES} bytes`,
+    false,
+    {
+      resource: "source-staging",
+      requiredBytes: source.size,
+      availableBytes: MAX_LARGE_SOURCE_BYTES,
+    },
+  );
 }
 
 /** Returns an exact, safe end offset or `undefined` for an invalid range. */
@@ -1556,128 +1680,6 @@ function cleanupLateAdapterStep(
       // A late, malformed or already-closed source cannot be retained here.
     }
   }
-}
-
-/**
- * Acquires a Blob read while keeping its reservation attached to the actual
- * read lifetime. Blob.arrayBuffer() cannot be cancelled: if the request loses
- * the cancellation race, the lease is released only after that read settles.
- */
-async function acquireReservedBlobRead(
-  blob: Blob,
-  reservation: MemoryReservation,
-  active?: ActiveRequest,
-  expectedLength?: number,
-): Promise<ReservedBlobRead> {
-  let operation: Promise<ArrayBuffer>;
-  let boundedLength: number;
-  try {
-    boundedLength = expectedLength ?? blob.size;
-    if (!Number.isSafeInteger(boundedLength) || boundedLength < 0) {
-      throw new ProtocolFault("RUNTIME_FAILURE", "Blob slice has an invalid bounded length");
-    }
-    // The Worker never invokes arrayBuffer() on the original File. It invokes
-    // it only on the already-bounded Blob.slice() returned for this action;
-    // retaining that distinction preserves cancellation/test seams while
-    // keeping the source-sized allocation impossible. A stream fallback is
-    // used by host doubles that expose stream() but not arrayBuffer().
-    const read = (blob as unknown as { arrayBuffer?: () => Promise<ArrayBuffer> }).arrayBuffer;
-    if (typeof read === "function") {
-      operation = Promise.resolve(read.call(blob));
-    } else if (typeof blob.stream === "function") {
-      operation = readBlobStream(blob, boundedLength);
-    } else {
-      throw new TypeError("Blob slices must provide stream() or arrayBuffer()");
-    }
-  } catch (error) {
-    reservation.release();
-    throw error;
-  }
-  try {
-    const buffer = active === undefined
-      ? await operation
-      : await awaitOperationStep(operation, active);
-    if (!(buffer instanceof ArrayBuffer) || buffer.byteLength !== boundedLength) {
-      throw new ProtocolFault("RUNTIME_FAILURE", "Blob slice read returned an invalid bounded length");
-    }
-    return Object.freeze({ buffer, release: reservation.release });
-  } catch (error) {
-    if (active?.cancelled) {
-      void operation.then(
-        () => reservation.release(),
-        () => reservation.release(),
-      );
-    } else {
-      reservation.release();
-    }
-    throw error;
-  }
-}
-
-/**
- * Takes a source range only after its reservation has been acquired. A host
- * Blob/File implementation can override slice(), so an exception or an
- * incorrectly-sized result must release that reservation before propagating.
- */
-function sliceReservedSource(
-  source: Blob,
-  offset: number,
-  end: number,
-  reservation: MemoryReservation,
-): Blob {
-  try {
-    const bounded = source.slice(offset, end);
-    const reportedLength = bounded == null
-      ? undefined
-      : (bounded as unknown as { size?: unknown }).size;
-    const expectedLength = end - offset;
-    if (
-      !bounded
-      || (reportedLength !== undefined
-        && (typeof reportedLength !== "number"
-          || !Number.isSafeInteger(reportedLength)
-          || reportedLength < 0
-          || reportedLength !== expectedLength))
-    ) {
-      throw new ProtocolFault("RUNTIME_FAILURE", "Blob slice returned an invalid bounded length");
-    }
-    return bounded;
-  } catch (error) {
-    reservation.release();
-    throw error;
-  }
-}
-
-async function readBlobStream(blob: Blob, expectedLength?: number): Promise<ArrayBuffer> {
-  const expected = expectedLength ?? (
-    Number.isSafeInteger(blob.size) && blob.size >= 0 ? blob.size : undefined
-  );
-  if (expected === undefined) {
-    throw new TypeError("Blob slice size must be a safe integer");
-  }
-  const output = new Uint8Array(expected);
-  const reader = blob.stream().getReader();
-  let written = 0;
-  try {
-    for (;;) {
-      const next = await reader.read();
-      if (next.done) break;
-      const chunk = next.value instanceof Uint8Array
-        ? next.value
-        : new Uint8Array(next.value as ArrayBufferLike);
-      if (chunk.byteLength > expected - written) {
-        throw new RangeError("Blob slice stream exceeded its declared length");
-      }
-      output.set(chunk, written);
-      written += chunk.byteLength;
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  if (written !== expected) {
-    throw new RangeError("Blob slice stream ended before its declared length");
-  }
-  return output.buffer;
 }
 
 function flushPendingDatasetEvents(value: unknown): void {
@@ -1919,6 +1921,11 @@ function closeDatasetState(
   } catch {
     // close() is intentionally idempotent and best effort.
   }
+  try {
+    dataset.source.close();
+  } catch {
+    // Provider cleanup is best effort after the adapter/source handles close.
+  }
   if (emitEvent) {
     emit({
       event: "closed",
@@ -1927,6 +1934,28 @@ function closeDatasetState(
       revision: dataset.metadata.revision,
       payload: { handle: dataset.handle, kind: "source" },
     });
+  }
+}
+
+/** A validator change invalidates every operation and reader for that dataset. */
+function terminateDatasetForSourceFailure(
+  source: SourceAccessor,
+  failure: ProtocolFault,
+): void {
+  for (const dataset of [...datasets.values()]) {
+    if (dataset.closed || dataset.source !== source) continue;
+    try {
+      emit({
+        event: "runtimeError",
+        datasetHandle: dataset.handle,
+        tableId: dataset.metadata.tableId,
+        revision: dataset.metadata.revision,
+        payload: serializeFault(failure, "The source provider failed"),
+      });
+    } catch {
+      // Closing remains authoritative if event delivery itself fails.
+    }
+    closeDatasetState(dataset, true, failure);
   }
 }
 
@@ -2459,7 +2488,7 @@ function reserveMemory(
  */
 async function runOpenUntilPublished(
   adapter: AdapterRuntime,
-  source: Blob,
+  source: SourceAccessor,
   initial: unknown,
   active: ActiveOpenRequest,
   adapterId: OfficialAdapterId,
@@ -2515,7 +2544,7 @@ async function runOpenUntilPublished(
 
 async function runAdapterOperation(
   adapter: AdapterRuntime,
-  source: Blob,
+  source: SourceAccessor,
   initial: unknown,
   active: ActiveOpenRequest | ActiveRangeRequest,
   adapterId: OfficialAdapterId,
@@ -2547,6 +2576,9 @@ async function runAdapterOperation(
         measurement,
       );
     }
+  } catch (error) {
+    closeDatasetForSourceFailure(active, error);
+    throw error;
   } finally {
     if (!complete && active.operationHandle !== undefined) {
       cancelOwnedOperation(active, adapter);
@@ -2556,7 +2588,7 @@ async function runAdapterOperation(
 
 async function runAdapterValueOperation(
   adapter: AdapterRuntime,
-  source: Blob,
+  source: SourceAccessor,
   initial: unknown,
   active: ActiveAsyncRequest,
   adapterId: OfficialAdapterId,
@@ -2591,6 +2623,9 @@ async function runAdapterValueOperation(
         adapterId,
       );
     }
+  } catch (error) {
+    closeDatasetForSourceFailure(active, error);
+    throw error;
   } finally {
     if (!complete && active.operationHandle !== undefined) {
       cancelOwnedOperation(active, adapter);
@@ -2600,7 +2635,7 @@ async function runAdapterValueOperation(
 
 async function advanceAdapterOperationStep(
   adapter: AdapterRuntime,
-  source: Blob,
+  source: SourceAccessor,
   value: AdapterOperationStep,
   active: ActiveOpenRequest | ActiveRangeRequest | ActiveAsyncRequest | undefined,
   adapterId: OfficialAdapterId,
@@ -2653,6 +2688,7 @@ async function advanceAdapterOperationStep(
   }
 
   const reads: ReservedBlobRead[] = [];
+  const reservations: Array<MemoryReservation | undefined> = [];
   const results: AdapterActionResult[] = [];
   try {
     if (ranges.length === 0) {
@@ -2660,17 +2696,58 @@ async function advanceAdapterOperationStep(
       if (active) await awaitOperationStep(yielded, active);
       else await yielded;
     } else {
-      for (const { action, end } of ranges) {
-        const reservation = reserveOperationMemory(adapterId, action.length);
-        const read = await acquireReservedBlobRead(
-          sliceReservedSource(source, action.offset, end, reservation),
-          reservation,
-          active,
-          action.length,
-        );
+      // Reserve every action before issuing provider work. If admission fails
+      // halfway through, the already-acquired leases are released below.
+      try {
+        for (const { action } of ranges) {
+          reservations.push(reserveOperationMemory(adapterId, action.length));
+        }
+      } catch (error) {
+        for (const reservation of reservations) reservation?.release();
+        reservations.length = 0;
+        throw error;
+      }
+
+      const cancellation = active?.cancellation.promise;
+      const sourceOptions: SourceReadOptions = {
+        ...(cancellation === undefined ? {} : { cancellation }),
+        onProviderRead: (bytes) => recordSourceProviderRead(measurement, bytes),
+        onCacheHit: (bytes) => recordSourceCacheHit(measurement, bytes),
+      };
+      let sourceBytes: readonly ArrayBuffer[];
+      try {
+        sourceBytes = source.kind === "range" && source.readMany !== undefined
+          ? await source.readMany(
+            ranges.map(({ action, end }) => ({ offset: action.offset, end })),
+            sourceOptions,
+          )
+          : await readLocalActions(source, ranges, sourceOptions, reservations);
+      } catch (error) {
+        const failure = sourceFailureFault(error);
+        if (failure !== undefined && failure.code !== "CANCELLED") {
+          terminateDatasetForSourceFailure(source, failure);
+        }
+        throw error;
+      }
+      if (sourceBytes.length !== ranges.length) {
+        throw new ProtocolFault("RUNTIME_FAILURE", "The source accessor returned an invalid action count");
+      }
+      for (let index = 0; index < ranges.length; index += 1) {
+        const { action, end } = ranges[index]!;
+        const buffer = sourceBytes[index]!;
+        if (!(buffer instanceof ArrayBuffer) || buffer.byteLength !== action.length) {
+          throw new ProtocolFault("RUNTIME_FAILURE", "The source accessor returned an invalid bounded length");
+        }
+        const reservation = reservations[index];
+        if (reservation === undefined) {
+          throw new ProtocolFault("CANCELLED", "The source read was cancelled");
+        }
+        const read: ReservedBlobRead = Object.freeze({
+          buffer,
+          release: reservation.release,
+        });
         reads.push(read);
         const bytes = new Uint8Array(read.buffer);
-        recordSourceRead(measurement, bytes.byteLength);
         results.push(Object.freeze({
           actionIndex: action.actionIndex,
           offset: action.offset,
@@ -2679,6 +2756,8 @@ async function advanceAdapterOperationStep(
         }));
         if (active) throwIfCancelled(active);
       }
+      // Ownership moved into `reads`; the finally block releases each lease.
+      reservations.length = 0;
     }
     const continuation = Promise.resolve().then(() => adapter.continueOperation(
       step.operationHandle,
@@ -2704,7 +2783,65 @@ async function advanceAdapterOperationStep(
     return next;
   } finally {
     for (const read of reads) read.release();
+    for (const reservation of reservations) reservation?.release();
   }
+}
+
+async function readLocalActions(
+  source: SourceAccessor,
+  ranges: readonly Readonly<{ action: AdapterReadAction; end: number }>[],
+  options: SourceReadOptions,
+  reservations: Array<MemoryReservation | undefined>,
+): Promise<readonly ArrayBuffer[]> {
+  const output: ArrayBuffer[] = new Array(ranges.length);
+  let next = 0;
+  let failed = false;
+  let firstError: unknown;
+  const states = ranges.map(() => ({ settled: false, detached: false }));
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      if (failed) return;
+      const index = next++;
+      if (index >= ranges.length) return;
+      const { action } = ranges[index]!;
+      const state = states[index]!;
+      const reservation = reservations[index];
+      const perRead: SourceReadOptions = {
+        ...options,
+        onSettled: () => {
+          state.settled = true;
+          if (state.detached) reservation?.release();
+          options.onSettled?.();
+        },
+      };
+      try {
+        output[index] = await source.read(action.offset, action.length, perRead);
+      } catch (error) {
+        if (!failed) {
+          failed = true;
+          firstError = error;
+        }
+        return;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, ranges.length) }, worker));
+  if (failed) {
+    // Any early failure (not only cancellation) may leave sibling Blob reads
+    // running. Detach unsettled leases from the operation's finally block and
+    // release them only when the accessor's onSettled hook fires; otherwise a
+    // short provider failure would make the Worker ledger under-count bytes
+    // still retained by a pending read.
+    for (let index = 0; index < states.length; index += 1) {
+      if (states[index]!.settled) continue;
+      const reservation = reservations[index];
+      if (reservation === undefined) continue;
+      reservations[index] = undefined;
+      states[index]!.detached = true;
+    }
+    throw firstError;
+  }
+  return output;
 }
 
 function expectAdapterOperationStep(value: unknown, name: string): AdapterOperationStep {
@@ -2793,6 +2930,54 @@ function cancelOwnedOperation(
   }
 }
 
+function closeDatasetForSourceFailure(active: ActiveRequest, error: unknown): void {
+  if (!("datasetHandle" in active) || active.datasetHandle === undefined) return;
+  const code = isRecord(error) && typeof error.code === "string" ? error.code : undefined;
+  if (code !== "SOURCE_CHANGED") {
+    return;
+  }
+  const dataset = datasets.get(active.datasetHandle);
+  if (dataset && !dataset.closed) {
+    closeDatasetState(dataset, true, sourceFailureFault(error));
+  }
+}
+
+/** Rebuilds faults thrown by the lazily bundled range runtime locally. */
+function sourceFailureFault(error: unknown): ProtocolFault | undefined {
+  if (!isRecord(error) || typeof error.code !== "string") return undefined;
+  const code = error.code;
+  if (code !== "SOURCE_CHANGED"
+    && code !== "SOURCE_UNAVAILABLE"
+    && code !== "RANGE_UNSUPPORTED"
+    && code !== "RUNTIME_FAILURE"
+    && code !== "RESOURCE_LIMIT"
+    && code !== "HANDLE_CLOSED"
+    && code !== "CANCELLED"
+    && code !== "PROTOCOL_INCOMPATIBLE") {
+    return undefined;
+  }
+  if (error instanceof ProtocolFault) return error;
+  return new ProtocolFault(
+    code,
+    sourceFailureMessage(code),
+    error.retryable === true,
+    code === "RESOURCE_LIMIT" ? error.details : undefined,
+  );
+}
+
+function sourceFailureMessage(code: string): string {
+  switch (code) {
+    case "SOURCE_CHANGED": return "The source changed while it was open";
+    case "RANGE_UNSUPPORTED": return "The source range is unsupported";
+    case "RUNTIME_FAILURE": return "The source provider returned invalid bytes";
+    case "RESOURCE_LIMIT": return "The source exceeds its configured limit";
+    case "HANDLE_CLOSED": return "The source is closed";
+    case "CANCELLED": return "The source read was cancelled";
+    case "PROTOCOL_INCOMPATIBLE": return "The source broker protocol is incompatible";
+    default: return "The source provider is unavailable";
+  }
+}
+
 function operationHandle(value: unknown, name: string): string | number {
   if (typeof value === "string" && value.length > 0) return value;
   if (Number.isSafeInteger(value) && (value as number) >= 0) return value as number;
@@ -2872,7 +3057,12 @@ function postSuccess(
     | "acknowledged",
   data: unknown,
   transfer: Transferable[] = [],
-  telemetry?: Readonly<{ bytesRead: number; peakReservationBytes: number }>,
+  telemetry?: Readonly<{
+    bytesRead: number;
+    peakReservationBytes: number;
+    sourceReads: number;
+    sourceCacheHitBytes: number;
+  }>,
 ): void {
   const response: ProtocolResponse = {
     protocolVersion: PROTOCOL_VERSION,
@@ -2889,7 +3079,12 @@ function postSuccess(
 function postFailure(
   requestId: string,
   error: unknown,
-  telemetry?: Readonly<{ bytesRead: number; peakReservationBytes: number }>,
+  telemetry?: Readonly<{
+    bytesRead: number;
+    peakReservationBytes: number;
+    sourceReads: number;
+    sourceCacheHitBytes: number;
+  }>,
 ): void {
   const response: ProtocolResponse = {
     protocolVersion: PROTOCOL_VERSION,
@@ -2908,15 +3103,36 @@ function recordSourceRead(measurement: OperationMeasurement | undefined, bytes: 
   measurement.bytesRead = Math.min(Number.MAX_SAFE_INTEGER, measurement.bytesRead + bytes);
 }
 
+function recordSourceProviderRead(measurement: OperationMeasurement | undefined, bytes: number): void {
+  if (!measurement || !Number.isSafeInteger(bytes) || bytes < 0) return;
+  measurement.bytesRead = Math.min(Number.MAX_SAFE_INTEGER, measurement.bytesRead + bytes);
+  measurement.sourceReads = Math.min(Number.MAX_SAFE_INTEGER, measurement.sourceReads + 1);
+}
+
+function recordSourceCacheHit(measurement: OperationMeasurement | undefined, bytes: number): void {
+  if (!measurement || !Number.isSafeInteger(bytes) || bytes < 0) return;
+  measurement.sourceCacheHitBytes = Math.min(
+    Number.MAX_SAFE_INTEGER,
+    measurement.sourceCacheHitBytes + bytes,
+  );
+}
+
 function measurementTelemetry(
   measurement: OperationMeasurement | undefined,
-): Readonly<{ bytesRead: number; peakReservationBytes: number }> | undefined {
+): Readonly<{
+  bytesRead: number;
+  peakReservationBytes: number;
+  sourceReads: number;
+  sourceCacheHitBytes: number;
+}> | undefined {
   if (!measurement) {
     return undefined;
   }
   return Object.freeze({
     bytesRead: measurement.bytesRead,
     peakReservationBytes: measurement.peakReservationBytes,
+    sourceReads: measurement.sourceReads,
+    sourceCacheHitBytes: measurement.sourceCacheHitBytes,
   });
 }
 

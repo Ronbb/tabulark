@@ -9,7 +9,8 @@
 
 ## Stable release scope
 
-The active matrix covers four official, independently lazy Rust/WASM adapters:
+The active matrix covers four official, independently lazy Rust/WASM adapters
+and the stable main-thread `RangeSource`/HTTP broker:
 
 | Official ID | Stable entry point | Source formats |
 | --- | --- | --- |
@@ -22,6 +23,12 @@ The checked-in official-adapter manifest is the source of truth for IDs,
 entry points, WASM artifacts, option keys, source policy, and runtime weighting.
 Tests reject drift between that manifest, package exports, Worker loading,
 Pages assembly, and delivery-size accounting.
+
+`RangeSource` is supported by CSV/TSV, Arrow IPC File/Stream, Parquet, XLSX,
+and XLS. Its exact source ceiling is `4,294,967,295` bytes (`2^32 - 1`); the
+local `sourceMode: "large"` ceiling remains exactly `2^31` bytes. HTTP tests
+run with both same-origin and cross-origin servers and keep URL, credentials,
+headers, validators, and snapshot IDs on the main thread.
 
 ## Local command map
 
@@ -164,8 +171,8 @@ the stable package exports.
 
 Node tests and snapshots cover:
 
-- The exact stable entry points `tabulark`, `/arrow`, `/parquet`, and `/excel`,
-  plus the explicitly unstable `/experimental` entry point.
+- The exact stable entry points `tabulark`, `/arrow`, `/parquet`, `/excel`, and
+  `/http`, plus the explicitly unstable `/experimental` entry point.
 - Immutable official adapter registration, duplicate/forged descriptor
   rejection, option validation, and the absence of arbitrary module URLs or
   third-party adapter injection.
@@ -175,11 +182,22 @@ Node tests and snapshots cover:
 - Range limits, global memory reservations, bounded queueing, cancellation,
   cascading and idempotent close, and independent recovery after one source or
   adapter fails.
+- `RangeSource` reader lifecycle (independent opens, exactly-once close,
+  cancellation races, malformed snapshots, short/long reads, invalid ranges,
+  and Worker-crash cleanup), provider concurrency (1–4), request merge and
+  dataset singleflight, byte-LRU coverage hits/eviction, and source-cache
+  release on dataset close.
+- HTTP probe/read contracts: same-origin and cross-origin CORS exposure,
+  dynamic authentication headers, precise `206 Content-Range`, `200`/`416`
+  transitions, redirects, validator changes, short/long bodies, retryable
+  429/5xx/network failures, bounded `Retry-After`, and explicit small-file
+  fallback only.
 - Multi-table metadata and lifecycle plus `getPresentation()` and range-aligned
   `readPresentationRange()` normalization.
 - The frozen `stable-declarations-v0.1.json` snapshot preserves the 0.1 API.
   `stable-declarations-v0.2.json` covers every file in the transitive
-  declaration graph of the four finalized 0.2 stable entries.
+  declaration graph of the five finalized 0.2 stable entries, including the
+  HTTP helper and range-source types.
 
 The packed-consumer test creates a real npm tarball, installs it into a clean
 temporary project, imports every entry point, and typechecks documented adapter
@@ -210,6 +228,13 @@ artifacts:
 - Local Blob ranges, non-adjacent reads, cancellation/retry, repeated close,
   resource release, themes, ARIA, and Pages smoke are covered in Firefox and
   WebKit as well as Chromium.
+- All three projects also run the real remote-source matrix with a main-thread
+  range broker: CSV/TSV, Arrow File/Stream, Parquet, XLSX, and XLS against an
+  in-memory HTTP server and a custom `RangeSource`. The matrix proves bounded
+  reads above `2^31`, exact `2^32 - 1` acceptance, 4 GiB rejection, no URL or
+  credential exposure in Worker messages/errors, validator-change shutdown,
+  CORS `Content-Range`/`ETag` exposure, retry behavior, and explicit bounded
+  full-response fallback.
 - Chromium uses the real Clipboard API. Firefox and WebKit use the explicit
   clipboard-injection seam while asserting the same TSV result.
 
@@ -257,12 +282,22 @@ usable paint, non-adjacent range read, cache hit, and lifecycle close time may
 be at most 10% slower than the baseline; the existing absolute timing and
 memory ceilings are not relaxed.
 
+Remote-source performance evidence additionally records first usable paint,
+provider request count, actual source bytes, `sourceReads`,
+`sourceCacheHitBytes`, logical `cacheHit`, p95 read latency, peak Worker and
+main-thread staging reservations, maximum in-flight provider reads, and bytes
+remaining after close. Identical concurrent ranges must produce one provider
+read, the provider concurrency must never exceed four, and source cache hits
+must not be reported as logical batch-cache hits.
+
 `benchmark:size` measures raw and Brotli-quality-11 bytes in separate groups:
 
 - Core: root entry, generic Worker, Delimited glue, and Delimited WASM.
 - Arrow: `/arrow`, Arrow glue, and Arrow WASM.
 - Parquet: `/parquet`, Parquet glue, and Parquet WASM.
 - Excel: `/excel`, Excel glue, and Excel WASM.
+- HTTP: `/http` and its declarations/source map (with a separate measured
+  raw/Brotli cap; no existing core or adapter cap is relaxed).
 - npm packed/unpacked totals and the complete Pages raw/Brotli totals.
 
 The existing per-family, npm, and Pages caps remain in force. In addition, the
@@ -294,13 +329,13 @@ smoke-tests the registry package on Node 20/22/24, and compiles/runs a clean
 Cargo consumer against the exact crates.io version.
 
 The 0.2.0 preflight and tag workflow accept only successful `CI`, `GitHub
-Pages`, and `M6 Large Files` runs for the exact same candidate SHA. A local
-green run, a retry-only pass, or a small Pages fixture cannot substitute for
-that evidence. Publishing remains behind protected approval and OIDC trusted
+Pages`, `M6 Large Files`, and remote RangeSource/HTTP contract runs for the
+exact same candidate SHA. A local green run, a retry-only pass, or a small
+Pages fixture cannot substitute for that evidence. Publishing remains behind protected approval and OIDC trusted
 publishers. Version 0.1.1 must not be tagged or published, and `v0.1.0` must
 never move.
 
-## M6 exact large-file gate
+## M6 exact large-file gate (local sources)
 
 The binary source ceiling is exactly `2^31 = 2,147,483,648` bytes. The
 Chromium-only `M6 Large Files` workflow builds a native generator separately,
@@ -335,3 +370,30 @@ Synthetic Rust/ABI tests separately cover `2^31 + 1`,
 conversion without allocating giant buffers. The successful five-container
 workflow is release evidence only for its own SHA and is mandatory alongside
 CI and Pages before creating `v0.2.0`.
+
+## Remote RangeSource gate
+
+The remote gate is independent of M6's five generated local containers. It uses
+a virtual or sparse source of exactly `4,294,967,295` bytes (`2^32 - 1`) and
+performs non-adjacent reads above `2^31`, including the first viewport and
+close/abort races, without allocating a source-sized buffer. A source of
+`4,294,967,296` bytes is rejected with `RESOURCE_LIMIT` before an adapter is
+started.
+
+Contract tests open the same `RangeSource` repeatedly and verify one
+independent reader per open, exactly-once close on success/failure/cancellation
+and Worker crash, exact byte lengths, safe offset arithmetic, snapshot
+strength/identity validation, and provider concurrency from one through four.
+Overlapping and directly adjacent actions are merged, no request crosses an
+unrequested hole, identical concurrent ranges singleflight, covered ranges
+hit the byte LRU, and eviction/termination releases all retained bytes.
+
+The HTTP matrix uses same-origin and cross-origin servers. A probe is
+`GET Range: bytes=0-0`; `206` must include exact `Content-Range`, and CORS
+must expose `Content-Range` (and `ETag` for strong validation). The tests cover
+dynamic auth headers, credentials, redirects, malformed/missing totals,
+short/long bodies, ETag and Last-Modified changes, post-probe `200`/`416`,
+408/425/429/5xx and network retries, bounded jitter/`Retry-After`, and
+explicit bounded-download fallback only when a trustworthy `Content-Length`
+fits both caller and engine staging budgets. Every source error and sample is
+checked for absence of URL, query, headers, validator, and snapshot material.

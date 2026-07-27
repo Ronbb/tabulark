@@ -10,9 +10,11 @@ immutable: never move, force-update, or rebuild it.
 
 For 0.2.0, start from a clean checkout whose `HEAD` equals `origin/main`. Run
 the full format, type, Rust, packed-consumer, fuzz-seed, three-browser,
-Chromium performance/size, and exact-large-file matrix documented in
+RangeSource/HTTP contract, Chromium performance/size, and exact-large-file
+matrix documented in
 [`testing.md`](testing.md). Confirm that `CI`, `GitHub Pages`, and `M6 Large
-Files` all completed successfully for that same `HEAD`, then run:
+Files`, including the remote RangeSource/HTTP gate, all completed successfully
+for that same `HEAD`, then run:
 
 ```sh
 node scripts/release-preflight.mjs v0.2.0 \
@@ -31,14 +33,16 @@ The preflight blocks tagging unless all of these conditions hold:
   owners are still present.
 - The operator explicitly confirms the npm and crates.io OIDC trusted-publisher
   configuration. This cannot be inferred safely through a public registry API.
-- `CI`, `GitHub Pages`, and `M6 Large Files` are all successful for the exact
-  same commit, and the deployed Pages URL is reachable.
+- `CI`, `GitHub Pages`, `M6 Large Files`, and the remote RangeSource/HTTP
+  contract gate are all successful for the exact same commit, and the deployed
+  Pages URL is reachable.
 - The three-browser and exact-large-file evidence used zero retries. A test
   that passed only after retry is diagnostic information, not release
   evidence.
 
 The tag-triggered workflow independently repeats the `origin/main` and exact
-same-SHA CI/Pages/M6 checks. A tag cannot bypass a skipped local preflight.
+same-SHA CI/Pages/M6/RangeSource checks. A tag cannot bypass a skipped local
+preflight.
 Only after the preflight succeeds should the immutable release tag be created
 and pushed:
 
