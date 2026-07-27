@@ -128,13 +128,13 @@ impl IndexedRanges {
                 ));
             }
         }
-        if let Some((&next, _)) = self.ranges.range(requested.offset..).next()
-            && next < requested.end()
-        {
-            return Err(TabularkError::new(
-                ErrorCode::InvalidArgument,
-                "Excel range result overlaps an indexed range",
-            ));
+        if let Some((&next, _)) = self.ranges.range(requested.offset..).next() {
+            if next < requested.end() {
+                return Err(TabularkError::new(
+                    ErrorCode::InvalidArgument,
+                    "Excel range result overlaps an indexed range",
+                ));
+            }
         }
         self.retained_bytes = self.retained_bytes.checked_add(actual).ok_or_else(|| {
             TabularkError::new(
@@ -382,11 +382,12 @@ pub(crate) fn missing_range(error: &(dyn std::error::Error + 'static)) -> Option
         if let Some(missing) = candidate.downcast_ref::<MissingRange>() {
             return Some(missing.0.clone());
         }
-        if let Some(io_error) = candidate.downcast_ref::<io::Error>()
-            && let Some(inner) = io_error.get_ref()
-            && let Some(missing) = inner.downcast_ref::<MissingRange>()
-        {
-            return Some(missing.0.clone());
+        if let Some(io_error) = candidate.downcast_ref::<io::Error>() {
+            if let Some(inner) = io_error.get_ref() {
+                if let Some(missing) = inner.downcast_ref::<MissingRange>() {
+                    return Some(missing.0.clone());
+                }
+            }
         }
         current = candidate.source();
     }
@@ -967,9 +968,10 @@ pub(crate) fn parse_workbook_descriptors(
                     && kind
                         .as_deref()
                         .is_some_and(|value| value.ends_with("/worksheet"))
-                    && let (Some(id), Some(target)) = (id, target)
                 {
-                    targets.insert(id, resolve_zip_target(base, &target)?);
+                    if let (Some(id), Some(target)) = (id, target) {
+                        targets.insert(id, resolve_zip_target(base, &target)?);
+                    }
                 }
             }
             Ok(XmlEvent::Eof) => break,
