@@ -74,7 +74,7 @@ jobs:
         run: |
           assets=(
             target/release/SHA256SUMS
-            target/release/chromium-version.txt
+            target/release/browser-versions.txt
             "target/release/tabulark-${VERSION}.crate"
             "target/release/tabulark-${VERSION}.spdx.json"
             "target/release/tabulark-${VERSION}.tgz"
@@ -100,7 +100,7 @@ jobs:
         run: |
           assets=(
             target/release/SHA256SUMS
-            target/release/chromium-version.txt
+            target/release/browser-versions.txt
             "target/release/tabulark-${VERSION}.crate"
             "target/release/tabulark-${VERSION}.spdx.json"
             "target/release/tabulark-${VERSION}.tgz"

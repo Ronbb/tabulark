@@ -52,6 +52,9 @@ test("release tags cannot bypass main, prerequisite runs, or protected environme
   assert.match(publishJob, /id-token: write/u);
   assert.doesNotMatch(workflow, /^\s+path:\s+target\/release\/\s*$/mu);
   assert.doesNotMatch(workflow, /gh release (?:create|upload)[^\n]*target\/release\/\*/u);
+  assert.match(workflow, /target\/release\/browser-versions\.txt/u);
+  assert.doesNotMatch(workflow, /target\/release\/chromium-version\.txt/u);
+  assert.match(workflow, /sha256sum browser-versions\.txt "\$tarball" \*\.crate \*\.spdx\.json/u);
   assert.match(workflow, /consumer="\$temp_root\/consumer"/u);
 });
 
@@ -79,6 +82,8 @@ test("release recovery finalizes immutable artifacts without republishing", asyn
   }
   assert.doesNotMatch(workflow, /(?:npm|cargo) publish/u);
   assert.doesNotMatch(workflow, /gh release (?:create|upload)[^\n]*target\/release\/\*/u);
+  assert.match(workflow, /target\/release\/browser-versions\.txt/u);
+  assert.doesNotMatch(workflow, /target\/release\/chromium-version\.txt/u);
   assert.ok(
     workflow.indexOf('version="${BASH_REMATCH[1]}"') <
       workflow.indexOf('[[ ! "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]'),

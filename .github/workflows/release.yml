@@ -246,7 +246,7 @@ jobs:
         run: |
           tarball="$(find target/release -maxdepth 1 -name '*.tgz' -printf '%f\n')"
           test -n "$tarball"
-          (cd target/release && sha256sum "$tarball" *.crate *.spdx.json > SHA256SUMS)
+          (cd target/release && sha256sum browser-versions.txt "$tarball" *.crate *.spdx.json > SHA256SUMS)
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
           cat target/release/SHA256SUMS
 
@@ -461,7 +461,7 @@ jobs:
         run: |
           assets=(
             target/release/SHA256SUMS
-            target/release/chromium-version.txt
+            target/release/browser-versions.txt
             "target/release/tabulark-${VERSION}.crate"
             "target/release/tabulark-${VERSION}.spdx.json"
             "target/release/tabulark-${VERSION}.tgz"

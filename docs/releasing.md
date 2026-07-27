@@ -12,9 +12,9 @@ For 0.2.0, start from a clean checkout whose `HEAD` equals `origin/main`. Run
 the full format, type, Rust, packed-consumer, fuzz-seed, three-browser,
 RangeSource/HTTP contract, Chromium performance/size, and exact-large-file
 matrix documented in
-[`testing.md`](testing.md). Confirm that `CI`, `GitHub Pages`, and `M6 Large
-Files`, including the remote RangeSource/HTTP gate, all completed successfully
-for that same `HEAD`, then run:
+[`testing.md`](testing.md). Confirm that `CI`, `GitHub Pages`, `M6 Large Files`,
+and `Remote RangeSource` all completed successfully for that same `HEAD`, then
+run:
 
 ```sh
 node scripts/release-preflight.mjs v0.2.0 \
