@@ -46,6 +46,7 @@ const ARROW_MAGIC: &[u8; 6] = b"ARROW1";
 const EXTENSION_NAME_KEY: &str = "ARROW:extension:name";
 const EXTENSION_METADATA_KEY: &str = "ARROW:extension:metadata";
 const DEFAULT_ARROW_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const NESTED_DISPLAY_TRUNCATION_SUFFIX: &str = "... [truncated]";
 
 /// Selects which Arrow IPC container reader is used.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -4283,27 +4284,47 @@ fn display_array_with_total_limit(
             values.append_null();
             continue;
         }
-        let mut value = match direct_float_display(array, index) {
-            Some(value) => value,
-            None => formatter
-                .value(index)
-                .try_to_string()
-                .map_err(|error| arrow_error("format Arrow display value", error))?,
+        let value = if nested {
+            let remaining_total_bytes = max_total_bytes
+                .checked_sub(total_bytes)
+                .ok_or_else(|| display_total_limit_error(total_bytes, max_total_bytes))?;
+            let display_limit = max_cell_bytes.min(remaining_total_bytes);
+            let bounded = match format_bounded_nested_display(&formatter, index, display_limit) {
+                Ok(bounded) => bounded,
+                Err(error)
+                    if display_limit < max_cell_bytes
+                        && error.code() == ErrorCode::ResourceLimit =>
+                {
+                    return Err(display_total_limit_error(
+                        max_total_bytes.saturating_add(1),
+                        max_total_bytes,
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            if bounded.truncated && display_limit < max_cell_bytes {
+                return Err(display_total_limit_error(
+                    max_total_bytes.saturating_add(1),
+                    max_total_bytes,
+                ));
+            }
+            bounded.value
+        } else {
+            let mut value = match direct_float_display(array, index) {
+                Some(value) => value,
+                None => formatter
+                    .value(index)
+                    .try_to_string()
+                    .map_err(|error| arrow_error("format Arrow display value", error))?,
+            };
+            value = normalize_special_float(value);
+            if binary {
+                value.insert_str(0, "0x");
+            }
+            value
         };
-        value = normalize_special_float(value);
-        if binary {
-            value.insert_str(0, "0x");
-        }
-        if nested {
-            value = escape_raw_controls(&value);
-        }
         if value.len() > max_cell_bytes {
-            return Err(TabularkError::new(
-                ErrorCode::ResourceLimit,
-                "Arrow display cell exceeds the configured UTF-8 byte limit",
-            )
-            .with_detail("displayCellBytes", value.len())
-            .with_detail("maxDisplayCellBytes", max_cell_bytes));
+            return Err(display_cell_limit_error(value.len(), max_cell_bytes));
         }
         total_bytes = total_bytes.checked_add(value.len()).ok_or_else(|| {
             TabularkError::new(
@@ -4326,6 +4347,112 @@ fn display_total_limit_error(display_bytes: usize, max_total_bytes: usize) -> Ta
     )
     .with_detail("displayBytes", display_bytes)
     .with_detail("maxDisplayBytes", max_total_bytes)
+}
+
+fn display_cell_limit_error(display_bytes: usize, max_cell_bytes: usize) -> TabularkError {
+    TabularkError::new(
+        ErrorCode::ResourceLimit,
+        "Arrow display cell exceeds the configured UTF-8 byte limit",
+    )
+    .with_detail("displayCellBytes", display_bytes)
+    .with_detail("maxDisplayCellBytes", max_cell_bytes)
+}
+
+fn format_bounded_nested_display(
+    formatter: &ArrayFormatter<'_>,
+    index: usize,
+    max_cell_bytes: usize,
+) -> Result<BoundedNestedDisplay> {
+    let mut writer = BoundedEscapedDisplayWriter::new(max_cell_bytes);
+    let formatted = formatter.value(index).write(&mut writer);
+    if let Err(error) = formatted {
+        if !writer.truncated() {
+            return Err(arrow_error("format Arrow display value", error));
+        }
+    }
+    writer.finish()
+}
+
+struct BoundedNestedDisplay {
+    value: String,
+    truncated: bool,
+}
+
+struct BoundedEscapedDisplayWriter {
+    value: String,
+    max_bytes: usize,
+    truncated: bool,
+}
+
+impl BoundedEscapedDisplayWriter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            value: String::with_capacity(max_bytes.min(4096)),
+            max_bytes,
+            truncated: false,
+        }
+    }
+
+    fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    fn finish(mut self) -> Result<BoundedNestedDisplay> {
+        if !self.truncated {
+            return Ok(BoundedNestedDisplay {
+                value: self.value,
+                truncated: false,
+            });
+        }
+        if self.max_bytes < NESTED_DISPLAY_TRUNCATION_SUFFIX.len() {
+            return Err(display_cell_limit_error(
+                self.max_bytes.saturating_add(1),
+                self.max_bytes,
+            ));
+        }
+
+        let prefix_bytes = self.max_bytes - NESTED_DISPLAY_TRUNCATION_SUFFIX.len();
+        while self.value.len() > prefix_bytes {
+            self.value.pop();
+        }
+        self.value.push_str(NESTED_DISPLAY_TRUNCATION_SUFFIX);
+        Ok(BoundedNestedDisplay {
+            value: self.value,
+            truncated: true,
+        })
+    }
+
+    fn push_escaped(&mut self, value: &str) -> std::fmt::Result {
+        let next_len = self
+            .value
+            .len()
+            .checked_add(value.len())
+            .ok_or(std::fmt::Error)?;
+        if next_len > self.max_bytes {
+            self.truncated = true;
+            return Err(std::fmt::Error);
+        }
+        self.value.push_str(value);
+        Ok(())
+    }
+}
+
+impl std::fmt::Write for BoundedEscapedDisplayWriter {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        for character in value.chars() {
+            match character {
+                '\\' => self.push_escaped("\\\\")?,
+                '\t' => self.push_escaped("\\t")?,
+                '\r' => self.push_escaped("\\r")?,
+                '\n' => self.push_escaped("\\n")?,
+                _ => {
+                    let mut encoded = [0_u8; 4];
+                    self.push_escaped(character.encode_utf8(&mut encoded))?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn direct_float_display(array: &dyn Array, index: usize) -> Option<String> {
@@ -4396,14 +4523,6 @@ fn is_nested_logical(data_type: &ArrowDataType) -> bool {
         ArrowDataType::RunEndEncoded(_, values) => is_nested_logical(values.data_type()),
         _ => false,
     }
-}
-
-fn escape_raw_controls(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('\t', "\\t")
-        .replace('\r', "\\r")
-        .replace('\n', "\\n")
 }
 
 fn flatbuffer_error(stage: &str, error: InvalidFlatbuffer) -> TabularkError {
@@ -4506,9 +4625,11 @@ mod tests {
     use super::{
         ARROW_MAGIC, ArrowIpcContainer, ArrowIpcLimits, ArrowIpcOpenOperation, ArrowIpcOptions,
         ArrowIpcRuntime, ArrowIpcSource, ArrowReadStart, ArrowRuntimeConfig, BufferPoolBuilder,
-        ResolvedArrowIpcContainer, arrow_error, compressed_buffer_specs, descriptor_from_array,
-        display_array, encapsulated_message, file_block_spec, flatbuffer_verifier_options,
-        model_data_type, normalize_array_parts, validate_stream_message,
+        NESTED_DISPLAY_TRUNCATION_SUFFIX, ResolvedArrowIpcContainer, arrow_error,
+        compressed_buffer_specs, descriptor_from_array, display_array,
+        display_array_with_total_limit, encapsulated_message, file_block_spec,
+        flatbuffer_verifier_options, model_data_type, normalize_array_parts,
+        validate_stream_message,
     };
     use crate::error::ErrorCode;
     use crate::model::{ArrayLayout, AxisExtent, RandomAccess, RangeRequest, TableDataType};
@@ -6082,6 +6203,61 @@ mod tests {
         assert!(!display.value(0).contains('\t'));
         assert!(display.value(0).contains("\\n"));
         assert!(display.value(0).contains("\\t"));
+    }
+
+    #[test]
+    fn oversized_nested_display_is_bounded_deterministic_and_explicitly_truncated() {
+        const MAX_CELL_BYTES: usize = 64;
+
+        let mut list = ListBuilder::new(StringBuilder::new());
+        for index in 0..128 {
+            list.values()
+                .append_value(format!("東京 line {index}\nwith a tab\t"));
+        }
+        list.append(true);
+        let nested = list.finish();
+        assert_eq!(nested.value(0).len(), 128);
+
+        let first = display_array(&nested, MAX_CELL_BYTES).expect("bounded nested display");
+        let second = display_array(&nested, MAX_CELL_BYTES).expect("deterministic nested display");
+        let value = first.value(0);
+        assert_eq!(value, second.value(0));
+        assert!(value.len() <= MAX_CELL_BYTES);
+        assert!(value.ends_with(NESTED_DISPLAY_TRUNCATION_SUFFIX));
+        assert!(!value.contains('\n'));
+        assert!(!value.contains('\t'));
+        assert!(std::str::from_utf8(value.as_bytes()).is_ok());
+        assert_eq!(nested.value(0).len(), 128, "native list values stay intact");
+
+        let structural_bytes = 2 * std::mem::size_of::<i32>() + 1;
+        let exact_total_limit = structural_bytes + value.len();
+        let bounded = display_array_with_total_limit(&nested, MAX_CELL_BYTES, exact_total_limit)
+            .expect("display fits exact total limit");
+        assert_eq!(bounded.value(0), value);
+
+        let error = display_array_with_total_limit(&nested, MAX_CELL_BYTES, exact_total_limit - 1)
+            .expect_err("display total limit remains enforced");
+        assert_eq!(error.code(), ErrorCode::ResourceLimit);
+        assert!(error.message().contains("display output"));
+
+        let tiny_remaining_total = structural_bytes + 4;
+        let error = display_array_with_total_limit(&nested, MAX_CELL_BYTES, tiny_remaining_total)
+            .expect_err("nested formatting must honor the remaining aggregate budget");
+        assert_eq!(error.code(), ErrorCode::ResourceLimit);
+        assert!(error.message().contains("display output"));
+        assert_eq!(error.details()["maxDisplayBytes"], tiny_remaining_total);
+    }
+
+    #[test]
+    fn oversized_scalar_display_remains_a_resource_limit_error() {
+        const MAX_CELL_BYTES: usize = 64;
+        let scalar = StringArray::from(vec!["x".repeat(MAX_CELL_BYTES + 1)]);
+
+        let error = display_array(&scalar, MAX_CELL_BYTES)
+            .expect_err("scalar displays must not be silently truncated");
+        assert_eq!(error.code(), ErrorCode::ResourceLimit);
+        assert_eq!(error.details()["displayCellBytes"], MAX_CELL_BYTES + 1);
+        assert_eq!(error.details()["maxDisplayCellBytes"], MAX_CELL_BYTES);
     }
 
     #[test]

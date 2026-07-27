@@ -3,6 +3,16 @@
 All notable changes to Tabulark are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+- Read partial viewports from oversized Parquet row groups page by page instead
+  of staging every projected column chunk. Lazy reads enforce cumulative page
+  decompression, bounded page tracking and header parsing, compressed-cache
+  peak, and decoder-restart limits before returning data to parquet-rs.
+- Bound nested Arrow display previews without changing their native values;
+  oversized list, struct, map, and union text ends with an explicit
+  `... [truncated]` marker.
+
 ## 0.2.0
 
 - Add bounded structured diagnostics and independent diagnostic subscriptions.
