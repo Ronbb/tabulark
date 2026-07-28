@@ -296,9 +296,17 @@ export class CanvasTablePainter {
       const label = value === null ? "∅" : value;
       const textX = horizontalTextX(context.textAlign, x, width, horizontalPadding);
       const textY = verticalTextY(context.textBaseline, y, height, 4);
-      context.fillText(label, textX, textY, Math.max(0, width - horizontalPadding * 2));
+      const visibleLabel = ellipsizeCanvasText(
+        context,
+        label,
+        Math.max(0, width - horizontalPadding * 2),
+      );
+      context.fillText(visibleLabel, textX, textY);
       if (style?.font?.underline === true) {
-        const measured = Math.min(context.measureText(label).width, width - horizontalPadding * 2);
+        const measured = Math.min(
+          context.measureText(visibleLabel).width,
+          width - horizontalPadding * 2,
+        );
         const start = underlineStart(context.textAlign, textX, measured);
         context.strokeStyle = String(context.fillStyle);
         context.lineWidth = 1;
@@ -668,4 +676,67 @@ function borderDash(style: string | undefined): readonly number[] {
 
 function positive(value: number | undefined, fallback: number): number {
   return value !== undefined && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+const TEXT_OVERFLOW_MARKER = "…";
+const INITIAL_TEXT_PROBE_LENGTH = 64;
+
+/** Fits cell text without Canvas' maxWidth scaling ultra-long values horizontally. */
+function ellipsizeCanvasText(
+  context: CanvasRenderingContext2D,
+  label: string,
+  maxWidth: number,
+): string {
+  if (label.length === 0 || maxWidth <= 0) {
+    return "";
+  }
+
+  let probeEnd = Math.min(label.length, INITIAL_TEXT_PROBE_LENGTH);
+  while (context.measureText(label.slice(0, probeEnd)).width <= maxWidth) {
+    if (probeEnd === label.length) {
+      return label;
+    }
+    probeEnd = Math.min(label.length, probeEnd * 2);
+  }
+
+  if (context.measureText(TEXT_OVERFLOW_MARKER).width > maxWidth) {
+    return TEXT_OVERFLOW_MARKER;
+  }
+
+  let low = 0;
+  let high = probeEnd;
+  let bestEnd = 0;
+  while (low <= high) {
+    const midpoint = low + Math.floor((high - low) / 2);
+    const candidateEnd = codePointBoundary(label, midpoint);
+    const candidate = `${label.slice(0, candidateEnd)}${TEXT_OVERFLOW_MARKER}`;
+    if (context.measureText(candidate).width <= maxWidth) {
+      bestEnd = Math.max(bestEnd, candidateEnd);
+      low = midpoint + 1;
+    } else {
+      high = midpoint - 1;
+    }
+  }
+
+  return `${label.slice(0, bestEnd)}${TEXT_OVERFLOW_MARKER}`;
+}
+
+function codePointBoundary(value: string, end: number): number {
+  if (
+    end > 0
+    && end < value.length
+    && isHighSurrogate(value.charCodeAt(end - 1))
+    && isLowSurrogate(value.charCodeAt(end))
+  ) {
+    return end - 1;
+  }
+  return end;
+}
+
+function isHighSurrogate(value: number): boolean {
+  return value >= 0xd800 && value <= 0xdbff;
+}
+
+function isLowSurrogate(value: number): boolean {
+  return value >= 0xdc00 && value <= 0xdfff;
 }

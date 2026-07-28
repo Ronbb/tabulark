@@ -19,6 +19,7 @@ test("Canvas auto presentation preserves geometry, styles, merges, and forced co
           font: this.font,
           textAlign: this.textAlign,
           textBaseline: this.textBaseline,
+          argumentCount: args.length,
         });
         return original.apply(this, args);
       };
@@ -130,7 +131,9 @@ test("Canvas auto presentation preserves geometry, styles, merges, and forced co
           toDisplayRows() {
             return Array.from({ length: request.rowCount }, (_, rowOffset) => (
               Array.from({ length: request.columnCount }, (_, columnOffset) => (
-                `R${request.rowStart + rowOffset}C${request.columnStart + columnOffset}`
+                request.rowStart + rowOffset === 0 && request.columnStart + columnOffset === 2
+                  ? "0".repeat(20_000)
+                  : `R${request.rowStart + rowOffset}C${request.columnStart + columnOffset}`
               ))
             ));
           },
@@ -251,6 +254,12 @@ test("Canvas auto presentation preserves geometry, styles, merges, and forced co
   expect(normalPaint.cell.textBaseline).toBe("bottom");
   expect(normalPaint.records.some((entry) => entry.fillStyle === workbookColors.fill)).toBe(true);
   expect(normalPaint.records.some((entry) => entry.strokeStyle === workbookColors.border)).toBe(true);
+  const truncatedPaint = normalPaint.records.findLast((entry) => (
+    entry.kind === "fillText" && /^0+…$/u.test(entry.text)
+  ));
+  expect(truncatedPaint).toBeDefined();
+  expect(truncatedPaint.text.length).toBeLessThan(20_000);
+  expect(truncatedPaint.argumentCount).toBe(3);
 
   const scroller = view.locator("[data-tabulark-scroll]");
   await scroller.evaluate((element) => {
