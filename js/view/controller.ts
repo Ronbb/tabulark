@@ -475,6 +475,13 @@ class Controller implements TableViewController {
       this.#rebuildSnapshot("ready");
       return;
     }
+    if (visible.every((range) => this.#windows.some(
+      (window) => rangeContainsRange(window.range, range),
+    ))) {
+      this.#loadingRanges = [];
+      this.#rebuildSnapshot("ready");
+      return;
+    }
     const abort = new AbortController();
     this.#requestAbort = abort;
     const ranges = Object.freeze([

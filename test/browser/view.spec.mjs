@@ -266,6 +266,39 @@ test.describe("Canvas table view", () => {
       .toBeGreaterThan(before.x + 35);
   });
 
+  test("coalesces burst scroll events into one viewport update per frame", async ({ page }) => {
+    const { view } = await openSample(page);
+    const result = await view.evaluate(async (element) => {
+      const scroller = element.querySelector("[data-tabulark-scroll]");
+      const canvas = element.querySelector("[data-tabulark-canvas]");
+      let paints = 0;
+      const context = canvas.getContext("2d");
+      const originalClearRect = context.clearRect;
+      context.clearRect = function (...args) {
+        paints += 1;
+        return originalClearRect.apply(this, args);
+      };
+
+      for (const scrollTop of [28, 56, 84, 112]) {
+        scroller.scrollTop = scrollTop;
+        scroller.dispatchEvent(new Event("scroll"));
+      }
+      const paintsBeforeFrame = paints;
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const paintsAfterFrame = paints;
+      context.clearRect = originalClearRect;
+      return {
+        paintsBeforeFrame,
+        paintsAfterFrame,
+        scrollTop: scroller.scrollTop,
+      };
+    });
+
+    expect(result.paintsBeforeFrame).toBe(0);
+    expect(result.paintsAfterFrame).toBe(1);
+    expect(result.scrollTop).toBe(112);
+  });
+
   test("keeps a Worker runtime error visible while ignoring terminal view interactions", async ({ page }) => {
     await page.goto("/test/browser/harness.html");
 

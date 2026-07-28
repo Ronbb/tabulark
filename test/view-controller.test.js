@@ -110,6 +110,39 @@ test("controller requests only the viewport and overscan window", async () => {
   controller.dispose();
 });
 
+test("controller reuses a loaded overscan window for nearby scrolling", async () => {
+  const table = createMockTable({ rows: 10_000, columns: 12 });
+  const controller = createTableController(table);
+
+  controller.updateViewport({
+    width: 520,
+    height: 260,
+    scrollLeft: 0,
+    scrollTop: 0,
+  });
+  await waitFor(() => controller.getSnapshot().status === "ready");
+  await waitFor(() => table.calls.length === 2);
+  const callCount = table.calls.length;
+
+  controller.updateViewport({
+    width: 520,
+    height: 260,
+    scrollLeft: 0,
+    scrollTop: 28,
+  });
+  await waitFor(() => controller.getSnapshot().status === "ready");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(table.calls.length, callCount);
+  const visibleRow = controller.getSnapshot().layout.rows.visible.start;
+  assert.deepEqual(controller.getCell(visibleRow, 0), {
+    status: "loaded",
+    value: `R${visibleRow}C0`,
+  });
+
+  controller.dispose();
+});
+
 test("controller drops responses from an older scroll generation", async () => {
   const table = createMockTable({
     rows: 10_000,

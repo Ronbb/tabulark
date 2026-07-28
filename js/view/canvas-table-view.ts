@@ -136,6 +136,8 @@ class View implements CanvasTableView {
 
   #snapshot: Readonly<TableViewSnapshot>;
   #frame = 0;
+  #rendering = false;
+  #viewportDirty = false;
   #interaction: PointerInteraction | null = null;
   #copyAbort: AbortController | null = null;
   #announcementFrame = 0;
@@ -398,11 +400,13 @@ class View implements CanvasTableView {
   }
 
   readonly #onScroll = (): void => {
-    this.#updateViewport();
+    this.#viewportDirty = true;
+    this.#scheduleFrame();
   };
 
   readonly #onWindowResize = (): void => {
-    this.#updateViewport();
+    this.#viewportDirty = true;
+    this.#scheduleFrame();
   };
 
   readonly #onForcedColorsChange = (event: MediaQueryListEvent): void => {
@@ -662,12 +666,17 @@ class View implements CanvasTableView {
   }
 
   #scheduleFrame(): void {
-    if (this.#destroyed || this.#frame !== 0) {
+    if (this.#destroyed || this.#rendering || this.#frame !== 0) {
       return;
     }
     this.#frame = this.#ownerWindow.requestAnimationFrame(() => {
       this.#frame = 0;
-      this.#render();
+      this.#rendering = true;
+      try {
+        this.#render();
+      } finally {
+        this.#rendering = false;
+      }
     });
   }
 
@@ -771,6 +780,10 @@ class View implements CanvasTableView {
   #render(): void {
     if (this.#destroyed) {
       return;
+    }
+    if (this.#viewportDirty) {
+      this.#viewportDirty = false;
+      this.#updateViewport();
     }
     const snapshot = this.#snapshot;
     const layout = snapshot.layout;
