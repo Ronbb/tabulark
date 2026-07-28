@@ -8,6 +8,13 @@ async function expectLandingReady(page) {
     page.getByRole("heading", { level: 1, name: "Open big tables without locking the page." }),
   ).toBeVisible();
   await expect(page.getByTestId("app")).toHaveAttribute("data-state", "idle");
+  await expect(page.getByTestId("supported-formats")).toContainText(
+    "CSV, TSV, Arrow IPC (.arrow, .arrows, .feather), Parquet, Excel XLS, and Excel XLSX",
+  );
+  await expect(page.getByTestId("source-input")).toHaveAttribute(
+    "aria-describedby",
+    "supported-formats",
+  );
   await expect(page.getByRole("link", { name: "Open the playground" })).toHaveAttribute(
     "href",
     "#playground",

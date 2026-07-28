@@ -168,6 +168,14 @@
         text-overflow: ellipsis;
         white-space: nowrap;
       }
+      .supported-formats {
+        flex: 1 1 100%;
+        margin: -0.15rem 0 0;
+        color: #536078;
+        font-size: 0.78rem;
+        line-height: 1.45;
+      }
+      .supported-formats strong { color: #344054; }
 
       .advanced {
         flex: 1 1 100%;
@@ -1097,13 +1105,19 @@
               Choose a local file and its adapter will be detected automatically; tune options when needed, then open the preview.
             </p>
             <form id="open-form" class="toolbar" data-testid="open-form">
+              <p id="supported-formats" class="supported-formats" data-testid="supported-formats">
+                <strong>Supported table files:</strong> CSV, TSV, Arrow IPC (.arrow, .arrows, .feather),
+                Parquet, Excel XLS, and Excel XLSX. PDF, DOC, and DOCX are detected only to prevent
+                them from being opened as table data.
+              </p>
               <label id="file-picker" data-testid="file-picker" class="file-label">
                 <span class="file-name" id="file-name" data-testid="file-name">Choose a file</span>
                 <input
                   id="source"
                   data-testid="source-input"
                   type="file"
-                  accept=".csv,.tsv,.arrow,.arrows,.feather,.parquet,.xls,.xlsx,.pdf,.doc,.docx,text/csv,text/tab-separated-values,application/vnd.apache.arrow.file,application/vnd.apache.arrow.stream,application/vnd.apache.parquet,application/vnd.ms-excel,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                  aria-describedby="supported-formats"
+                  accept=".csv,.tsv,.arrow,.arrows,.feather,.parquet,.xls,.xlsx,.pdf,.doc,.docx,text/csv,text/tab-separated-values,application/vnd.apache.arrow.file,application/vnd.apache.arrow.stream,application/vnd.apache.arrow.feather,application/vnd.apache.arrow,application/vnd.apache.parquet,application/x-parquet,application/vnd.ms-excel,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 />
               </label>
               <label class="field">
