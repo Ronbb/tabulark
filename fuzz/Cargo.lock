@@ -932,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "tabulark"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -951,7 +951,7 @@ dependencies = [
 
 [[package]]
 name = "tabulark-excel-wasm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "calamine",
  "cfb",

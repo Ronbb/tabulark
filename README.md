@@ -1,6 +1,6 @@
 # Tabulark
 
-> **Status: 0.2.0.** The immutable `v0.1.0` tag and its registry/Pages
+> **Status: 0.2.1.** The immutable `v0.1.0` tag and its registry/Pages
 > evidence remain recorded in
 > [the release evidence](docs/release-0.1.0-evidence.md); that tag is never
 > moved or reused. Version 0.2 adds bounded local and remote range sources,
@@ -21,7 +21,7 @@ screen-reader access.
 
 ## Supported local formats
 
-The 0.2.0 source tree contains four official adapters. Each adapter
+The 0.2.1 source tree contains four official adapters. Each adapter
 is a separate, lazily loaded WebAssembly artifact; creating an engine loads no
 WASM and opening one format does not fetch unused artifacts.
 

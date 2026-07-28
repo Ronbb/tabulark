@@ -887,7 +887,7 @@ dependencies = [
 
 [[package]]
 name = "tabulark"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -909,7 +909,7 @@ dependencies = [
 
 [[package]]
 name = "tabulark-arrow-wasm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arrow-ipc",
  "js-sys",
@@ -921,7 +921,7 @@ dependencies = [
 
 [[package]]
 name = "tabulark-delimited-wasm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "tabulark",
  "wasm-bindgen",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "tabulark-excel-wasm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "calamine",
  "cfb",
@@ -944,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "tabulark-parquet-wasm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "js-sys",
  "parquet",

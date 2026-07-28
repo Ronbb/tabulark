@@ -1,14 +1,14 @@
-# 0.2.0 delivery and release policy
+# 0.2.1 delivery and release policy
 
-The 0.2.0 release candidate is finalized. Version 0.1.1 was never tagged or
-published; do not create a `v0.1.1` tag. The completed 0.1.0 tag target,
+The 0.2.1 release candidate is finalized. Versions 0.1.1 and 0.2.0 were never
+tagged or published; do not create either skipped tag. The completed 0.1.0 tag target,
 protected runs, registry provenance, and checksums remain frozen in
 [`release-0.1.0-evidence.md`](release-0.1.0-evidence.md). `v0.1.0` is
 immutable: never move, force-update, or rebuild it.
 
 ## Pre-tag checklist
 
-For 0.2.0, start from a clean checkout whose `HEAD` equals `origin/main`. Run
+For 0.2.1, start from a clean checkout whose `HEAD` equals `origin/main`. Run
 the full format, type, Rust, packed-consumer, fuzz-seed, three-browser,
 RangeSource/HTTP contract, Chromium performance/size, and exact-large-file
 matrix documented in
@@ -17,7 +17,7 @@ and `Remote RangeSource` all completed successfully for that same `HEAD`, then
 run:
 
 ```sh
-node scripts/release-preflight.mjs v0.2.0 \
+node scripts/release-preflight.mjs v0.2.1 \
   --confirm-npm-trusted-publisher \
   --confirm-crates-trusted-publisher
 ```
@@ -47,8 +47,8 @@ Only after the preflight succeeds should the immutable release tag be created
 and pushed:
 
 ```sh
-git tag -a v0.2.0 -m "tabulark 0.2.0"
-git push origin v0.2.0
+git tag -a v0.2.1 -m "tabulark 0.2.1"
+git push origin v0.2.1
 ```
 
 The confirmation flags are deliberate: before tagging, independently verify
@@ -100,9 +100,9 @@ code changes when a workflow delivery step fails. Before a rerun accepts an
 existing version, it downloads the registry `.crate` or npm tarball and
 compares it byte-for-byte with the checksum-verified release bundle; a
 mismatch fails the workflow instead of silently skipping publication. If code
-needs to change after either registry publishes 0.2.0, create a new immutable
-patch release such as `v0.2.1`; never create the skipped `v0.1.1`, and never
-move or reuse `v0.1.0` or `v0.2.0`.
+needs to change after either registry publishes 0.2.1, create a new immutable
+patch release such as `v0.2.2`; never create the skipped `v0.1.1` or `v0.2.0`,
+and never move or reuse `v0.1.0` or `v0.2.1`.
 
 If both registries already match the verified bundle but GitHub Release
 finalization or the downstream consumer jobs fail, do not move the tag. Run

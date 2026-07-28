@@ -1,6 +1,6 @@
 # Architecture
 
-> **This document describes the finalized 0.2.0 architecture.** The historical
+> **This document describes the 0.2 architecture shipped by 0.2.1.** The historical
 > `v0.1.0` tag and its artifact evidence remain immutable in
 > [release-0.1.0-evidence.md](release-0.1.0-evidence.md).
 

@@ -3,7 +3,7 @@
 All notable changes to Tabulark are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 0.2.1
 
 - Read partial viewports from oversized Parquet row groups page by page instead
   of staging every projected column chunk. Lazy reads enforce cumulative page
@@ -12,6 +12,10 @@ All notable changes to Tabulark are documented here. The project follows
 - Bound nested Arrow display previews without changing their native values;
   oversized list, struct, map, and union text ends with an explicit
   `... [truncated]` marker.
+- Add a separately built, experimental document-preview source package with a
+  Worker-isolated PDFium page pipeline, bounded RGBA page rendering, and an
+  accessible framework-free paged view. It is not part of the stable root npm
+  exports or official tabular-adapter manifest.
 
 ## 0.2.0
 

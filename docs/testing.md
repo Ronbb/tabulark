@@ -1,11 +1,11 @@
-# Testing and 0.2.0 release validation
+# Testing and 0.2.1 release validation
 
 > **Historical evidence is frozen.** Commit `1d79837` and its M4 record remain
 > in [`m4-completion.md`](m4-completion.md); the immutable `v0.1.0` tag and its
 > registry, Pages, recovery, and checksum evidence remain in
 > [`release-0.1.0-evidence.md`](release-0.1.0-evidence.md). Do not rewrite
-> either record for 0.2.0. Version 0.1.1 was never tagged or published; its
-> compatible work is included in the finalized 0.2.0 release candidate.
+> either record for 0.2.1. Versions 0.1.1 and 0.2.0 were never tagged or
+> published; their compatible work is included in the finalized 0.2.1 release.
 
 ## Stable release scope
 
@@ -330,12 +330,12 @@ that same verified npm tarball with provenance, creates the GitHub Release, and
 smoke-tests the registry package on Node 20/22/24, and compiles/runs a clean
 Cargo consumer against the exact crates.io version.
 
-The 0.2.0 preflight and tag workflow accept only successful `CI`, `GitHub
+The 0.2.1 preflight and tag workflow accept only successful `CI`, `GitHub
 Pages`, `M6 Large Files`, and remote RangeSource/HTTP contract runs for the
 exact same candidate SHA. A local green run, a retry-only pass, or a small
 Pages fixture cannot substitute for that evidence. Publishing remains behind protected approval and OIDC trusted
-publishers. Version 0.1.1 must not be tagged or published, and `v0.1.0` must
-never move.
+publishers. Versions 0.1.1 and 0.2.0 must not be tagged or published, and
+`v0.1.0` must never move.
 
 ## M6 exact large-file gate (local sources)
 
@@ -371,7 +371,7 @@ Synthetic Rust/ABI tests separately cover `2^31 + 1`,
 `Number.MAX_SAFE_INTEGER`, checked `offset + length`, and WASM `usize`
 conversion without allocating giant buffers. The successful five-container
 workflow is release evidence only for its own SHA and is mandatory alongside
-CI and Pages before creating `v0.2.0`.
+CI and Pages before creating `v0.2.1`.
 
 ## Remote RangeSource gate
 

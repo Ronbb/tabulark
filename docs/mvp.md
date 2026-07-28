@@ -1,10 +1,10 @@
 # MVP and milestone status
 
-> **Current status: 0.2.0.** The immutable `v0.1.0` artifact and registry
+> **Current status: 0.2.1.** The immutable `v0.1.0` artifact and registry
 > evidence remains recorded in
 > [`release-0.1.0-evidence.md`](release-0.1.0-evidence.md); that tag is never
-> moved or reused. The unpublished patch work and M6 large-file foundation are
-> finalized together in 0.2.0.
+> moved or reused. The 0.2 foundation and bounded Parquet/Arrow patch work are
+> finalized together in 0.2.1.
 
 ## Product boundary
 
@@ -16,7 +16,7 @@ APIs, and renders a keyboard-accessible Canvas viewport with a bounded semantic
 grid. For a remote source, URL/network/authentication stay on the main thread;
 the Worker receives only an opaque handle and bounded bytes.
 
-The 0.2.0 release contains exactly four official adapter IDs:
+The 0.2.1 release contains exactly four official adapter IDs:
 
 - `tabulark:delimited` for CSV/TSV.
 - `tabulark:arrow-ipc` for Arrow IPC File/Stream.
@@ -148,7 +148,7 @@ and separate Parquet/Excel size groups. Chromium is the sole 0.1.0 browser
 gate. The assembled and deployed Pages tests open CSV, TSV, Arrow, Parquet,
 XLS, and XLSX while proving that only the selected adapter artifact loads.
 
-### Unpublished patch work folded into 0.2.0
+### Unpublished patch work folded into 0.2.1
 
 The untagged patch baseline added bounded structured diagnostics and independent diagnostic
 subscriptions, logical dataset/table capability snapshots, opt-in privacy-safe
@@ -175,7 +175,7 @@ cover `2^31 + 1`, unsafe JavaScript integers, checked-add overflow, and WASM
 gates; Chromium additionally owns pixels, performance, real clipboard, and
 exact-size evidence.
 
-## 0.2.0 stable remote RangeSource
+## 0.2.1 stable remote RangeSource
 
 The first post-M6 capability is a stable, repeatably openable `RangeSource`
 for CSV/TSV, Arrow IPC File/Stream, Parquet, XLSX, and XLS. A reader reports
@@ -205,7 +205,7 @@ the caller's `maxBytes` and engine staging budget. Public errors and
 performance samples are sanitized and never contain URLs, query parameters,
 headers, validators, or snapshot IDs.
 
-## 0.2.0 runtime boundary
+## 0.2.1 runtime boundary
 
 Worker protocol v4 and adapter ABI v3 make open, table-open, read, and
 presentation operations resumable and revision checked. The main thread owns
@@ -220,12 +220,12 @@ M5 was not complete merely because implementation or local tests were green.
 The same commit must pass CI, Pages assembly/deployment, the actual deployed-URL
 smoke, format/lifecycle/budget/fuzz/size gates, clean consumers, registry
 availability and ownership checks, and trusted-publisher confirmation. That
-process completed historically for 0.1.0. The 0.2.0 preflight additionally
+process completed historically for 0.1.0. The 0.2.1 preflight additionally
 requires CI, Pages, and M6 Large Files evidence for the same candidate SHA;
 future patch releases use a new immutable tag.
 See [`testing.md`](testing.md) and [`releasing.md`](releasing.md).
 
-## Out of scope for 0.2.0
+## Out of scope for 0.2.1
 
 - Third-party adapter distribution or a stable public adapter ABI.
 - Implicit/default remote fetching, multipart ranges, `ReadableStream`, and

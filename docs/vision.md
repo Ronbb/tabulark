@@ -1,6 +1,6 @@
 # Vision
 
-> Tabulark 0.2.0 finalizes the four-format, three-browser, exact-2-GiB local
+> Tabulark 0.2.1 ships the four-format, three-browser, exact-2-GiB local
 > foundation and a stable bounded remote-range capability. The historical
 > `v0.1.0` tag, registry provenance, and artifact checksums remain immutable in
 > [release-0.1.0-evidence.md](release-0.1.0-evidence.md).
@@ -29,7 +29,7 @@ Parquet, or Excel. Official adapters normalize datasets, tables, schemas,
 capabilities, ranges, logical batches, errors, presentation, and lifecycle
 while keeping format-specific options and parsing behind their boundary.
 
-The 0.2.0 release validates that shape with four independently loadable
+The 0.2.1 release validates that shape with four independently loadable
 Rust/WASM adapters:
 
 - CSV/TSV through `tabulark:delimited`.
@@ -122,7 +122,7 @@ copy, merged hit regions, and resizing belong to the view contract. Forced
 colors, reduced motion, touch targets, and small-screen layouts are release
 gates rather than optional polish.
 
-Chromium, Firefox, and WebKit are formal functional gates for 0.2.0. Chromium
+Chromium, Firefox, and WebKit are formal functional gates for 0.2.1. Chromium
 additionally owns exact pixels, performance, real Clipboard API, and the five
 exact-2-GiB container gates; the other engines exercise copy through a
 deterministic clipboard seam.
@@ -136,11 +136,11 @@ measurements, clean packed consumers, an assembled package and Pages site, and
 a real deployed-URL smoke attributable to the same revision.
 
 The M4 record is frozen at `1d79837`; the completed 0.1.0 artifact record is
-separate and immutable. The 0.2.0 preflight requires CI, Pages, M6 Large Files,
+separate and immutable. The 0.2.1 preflight requires CI, Pages, M6 Large Files,
 and Remote RangeSource evidence for the same SHA. A patch release must use a new
 tag and the protected OIDC delivery process.
 
-## Direction after 0.2.0
+## Direction after 0.2.1
 
 Once the stable boundary has real-world feedback, compatible 0.2.x additions
 can improve supported logical types, presentation fidelity, diagnostics, and
