@@ -2531,16 +2531,62 @@ fn encode_typed_batch(
         .max_output_bytes
         .min(limits.max_decoded_bytes.saturating_sub(array_bytes));
     let mut pool = BufferPoolBuilder::new(output_limit);
-    let mut columns = Vec::with_capacity(arrays.len());
+    // Encode every native descriptor before spending a byte on preview text.
+    // This keeps the logical Arrow buffers exact even when display output has
+    // to be shortened aggressively.
+    let mut encoded = Vec::with_capacity(arrays.len());
     for (column_index, array) in arrays {
         let field = schema.field(column_index);
         let native = descriptor_from_array(array.as_ref(), Some(field), &mut pool)?;
+        encoded.push((column_index, array, native));
+    }
+    let structural_bytes = encoded.iter().try_fold(0_usize, |total, (_, array, _)| {
+        total
+            .checked_add(display_structural_bytes(array.as_ref())?)
+            .ok_or_else(|| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "Arrow display structural byte total overflows",
+                )
+            })
+    })?;
+    if structural_bytes > pool.remaining_bytes() {
+        return Err(display_total_limit_error(
+            structural_bytes,
+            pool.remaining_bytes(),
+        ));
+    }
+    let mut remaining_value_bytes = pool.remaining_bytes() - structural_bytes;
+    let mut remaining_cells = encoded.iter().try_fold(0_usize, |total, (_, array, _)| {
+        total
+            .checked_add(logical_value_count(array.as_ref()))
+            .ok_or_else(|| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "Arrow display cell count overflows",
+                )
+            })
+    })?;
+    let mut columns = Vec::with_capacity(encoded.len());
+    for (column_index, array, native) in encoded {
+        let column_structural_bytes = display_structural_bytes(array.as_ref())?;
+        let column_cells = logical_value_count(array.as_ref());
+        let column_value_budget = if remaining_cells == 0 {
+            0
+        } else {
+            remaining_value_bytes
+                .saturating_mul(column_cells)
+                .div_ceil(remaining_cells)
+        };
         let display_array = display_array_with_total_limit(
             array.as_ref(),
             limits.max_display_cell_bytes,
-            pool.remaining_bytes(),
+            column_structural_bytes.saturating_add(column_value_budget),
         )?;
         let display = descriptor_from_array(&display_array, None, &mut pool)?;
+        let used_value_bytes = display_array.value_data().len();
+        remaining_value_bytes = remaining_value_bytes.saturating_sub(used_value_bytes);
+        remaining_cells = remaining_cells.saturating_sub(column_cells);
         columns.push(TypedColumnBatch::new(
             format!("c{column_index}"),
             native,
@@ -4244,32 +4290,12 @@ fn display_array_with_total_limit(
     let formatter = ArrayFormatter::try_new(array, &options)
         .map_err(|error| arrow_error("create display formatter", error))?;
     let binary = is_binary_logical(array.data_type());
-    let offsets_bytes = array
-        .len()
-        .checked_add(1)
-        .and_then(|value| value.checked_mul(std::mem::size_of::<i32>()))
-        .ok_or_else(|| {
-            TabularkError::new(
-                ErrorCode::ResourceLimit,
-                "Arrow display offset buffer size overflows",
-            )
-        })?;
-    let validity_bytes = array.len().checked_add(7).ok_or_else(|| {
-        TabularkError::new(
-            ErrorCode::ResourceLimit,
-            "Arrow display validity buffer size overflows",
-        )
-    })? / 8;
-    let structural_bytes = offsets_bytes.checked_add(validity_bytes).ok_or_else(|| {
-        TabularkError::new(
-            ErrorCode::ResourceLimit,
-            "Arrow display structural buffer size overflows",
-        )
-    })?;
+    let structural_bytes = display_structural_bytes(array)?;
     if structural_bytes > max_total_bytes {
         return Err(display_total_limit_error(structural_bytes, max_total_bytes));
     }
     let mut total_bytes = structural_bytes;
+    let mut remaining_cells = logical_value_count(array);
     let mut values = StringBuilder::new();
     // `Array::nulls` intentionally reports only physical validity. Encoded
     // arrays can be logically null through a referenced dictionary value or a
@@ -4284,31 +4310,14 @@ fn display_array_with_total_limit(
             values.append_null();
             continue;
         }
+        let remaining_total_bytes = max_total_bytes.saturating_sub(total_bytes);
+        let display_limit = if remaining_cells == 0 {
+            0
+        } else {
+            max_cell_bytes.min(remaining_total_bytes.div_ceil(remaining_cells))
+        };
         let value = if nested {
-            let remaining_total_bytes = max_total_bytes
-                .checked_sub(total_bytes)
-                .ok_or_else(|| display_total_limit_error(total_bytes, max_total_bytes))?;
-            let display_limit = max_cell_bytes.min(remaining_total_bytes);
-            let bounded = match format_bounded_nested_display(&formatter, index, display_limit) {
-                Ok(bounded) => bounded,
-                Err(error)
-                    if display_limit < max_cell_bytes
-                        && error.code() == ErrorCode::ResourceLimit =>
-                {
-                    return Err(display_total_limit_error(
-                        max_total_bytes.saturating_add(1),
-                        max_total_bytes,
-                    ));
-                }
-                Err(error) => return Err(error),
-            };
-            if bounded.truncated && display_limit < max_cell_bytes {
-                return Err(display_total_limit_error(
-                    max_total_bytes.saturating_add(1),
-                    max_total_bytes,
-                ));
-            }
-            bounded.value
+            format_bounded_nested_display(&formatter, index, display_limit)?.value
         } else {
             let mut value = match direct_float_display(array, index) {
                 Some(value) => value,
@@ -4321,11 +4330,8 @@ fn display_array_with_total_limit(
             if binary {
                 value.insert_str(0, "0x");
             }
-            value
+            truncate_utf8_display(value, display_limit)
         };
-        if value.len() > max_cell_bytes {
-            return Err(display_cell_limit_error(value.len(), max_cell_bytes));
-        }
         total_bytes = total_bytes.checked_add(value.len()).ok_or_else(|| {
             TabularkError::new(
                 ErrorCode::ResourceLimit,
@@ -4336,8 +4342,57 @@ fn display_array_with_total_limit(
             return Err(display_total_limit_error(total_bytes, max_total_bytes));
         }
         values.append_value(value);
+        remaining_cells = remaining_cells.saturating_sub(1);
     }
     Ok(values.finish())
+}
+
+fn display_structural_bytes(array: &dyn Array) -> Result<usize> {
+    let offsets = array
+        .len()
+        .checked_add(1)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<i32>()))
+        .ok_or_else(|| {
+            TabularkError::new(
+                ErrorCode::ResourceLimit,
+                "Arrow display offset buffer size overflows",
+            )
+        })?;
+    let validity = array.len().checked_add(7).ok_or_else(|| {
+        TabularkError::new(
+            ErrorCode::ResourceLimit,
+            "Arrow display validity buffer size overflows",
+        )
+    })? / 8;
+    offsets.checked_add(validity).ok_or_else(|| {
+        TabularkError::new(
+            ErrorCode::ResourceLimit,
+            "Arrow display structural buffer size overflows",
+        )
+    })
+}
+
+fn logical_value_count(array: &dyn Array) -> usize {
+    array
+        .len()
+        .saturating_sub(array.logical_nulls().map_or(0, |nulls| nulls.null_count()))
+}
+
+fn truncate_utf8_display(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let suffix = if max_bytes >= NESTED_DISPLAY_TRUNCATION_SUFFIX.len() {
+        NESTED_DISPLAY_TRUNCATION_SUFFIX
+    } else {
+        ""
+    };
+    let prefix_bytes = max_bytes - suffix.len();
+    while value.len() > prefix_bytes {
+        value.pop();
+    }
+    value.push_str(suffix);
+    value
 }
 
 fn display_total_limit_error(display_bytes: usize, max_total_bytes: usize) -> TabularkError {
@@ -4347,15 +4402,6 @@ fn display_total_limit_error(display_bytes: usize, max_total_bytes: usize) -> Ta
     )
     .with_detail("displayBytes", display_bytes)
     .with_detail("maxDisplayBytes", max_total_bytes)
-}
-
-fn display_cell_limit_error(display_bytes: usize, max_cell_bytes: usize) -> TabularkError {
-    TabularkError::new(
-        ErrorCode::ResourceLimit,
-        "Arrow display cell exceeds the configured UTF-8 byte limit",
-    )
-    .with_detail("displayCellBytes", display_bytes)
-    .with_detail("maxDisplayCellBytes", max_cell_bytes)
 }
 
 fn format_bounded_nested_display(
@@ -4375,7 +4421,6 @@ fn format_bounded_nested_display(
 
 struct BoundedNestedDisplay {
     value: String,
-    truncated: bool,
 }
 
 struct BoundedEscapedDisplayWriter {
@@ -4399,27 +4444,19 @@ impl BoundedEscapedDisplayWriter {
 
     fn finish(mut self) -> Result<BoundedNestedDisplay> {
         if !self.truncated {
-            return Ok(BoundedNestedDisplay {
-                value: self.value,
-                truncated: false,
-            });
+            return Ok(BoundedNestedDisplay { value: self.value });
         }
-        if self.max_bytes < NESTED_DISPLAY_TRUNCATION_SUFFIX.len() {
-            return Err(display_cell_limit_error(
-                self.max_bytes.saturating_add(1),
-                self.max_bytes,
-            ));
-        }
-
-        let prefix_bytes = self.max_bytes - NESTED_DISPLAY_TRUNCATION_SUFFIX.len();
+        let suffix = if self.max_bytes >= NESTED_DISPLAY_TRUNCATION_SUFFIX.len() {
+            NESTED_DISPLAY_TRUNCATION_SUFFIX
+        } else {
+            ""
+        };
+        let prefix_bytes = self.max_bytes - suffix.len();
         while self.value.len() > prefix_bytes {
             self.value.pop();
         }
-        self.value.push_str(NESTED_DISPLAY_TRUNCATION_SUFFIX);
-        Ok(BoundedNestedDisplay {
-            value: self.value,
-            truncated: true,
-        })
+        self.value.push_str(suffix);
+        Ok(BoundedNestedDisplay { value: self.value })
     }
 
     fn push_escaped(&mut self, value: &str) -> std::fmt::Result {
@@ -6235,29 +6272,28 @@ mod tests {
             .expect("display fits exact total limit");
         assert_eq!(bounded.value(0), value);
 
-        let error = display_array_with_total_limit(&nested, MAX_CELL_BYTES, exact_total_limit - 1)
-            .expect_err("display total limit remains enforced");
-        assert_eq!(error.code(), ErrorCode::ResourceLimit);
-        assert!(error.message().contains("display output"));
+        let shortened =
+            display_array_with_total_limit(&nested, MAX_CELL_BYTES, exact_total_limit - 1)
+                .expect("display text may shrink to fit the aggregate budget");
+        assert!(shortened.value(0).len() <= value.len());
+        assert!(std::str::from_utf8(shortened.value(0).as_bytes()).is_ok());
 
         let tiny_remaining_total = structural_bytes + 4;
-        let error = display_array_with_total_limit(&nested, MAX_CELL_BYTES, tiny_remaining_total)
-            .expect_err("nested formatting must honor the remaining aggregate budget");
-        assert_eq!(error.code(), ErrorCode::ResourceLimit);
-        assert!(error.message().contains("display output"));
-        assert_eq!(error.details()["maxDisplayBytes"], tiny_remaining_total);
+        let tiny = display_array_with_total_limit(&nested, MAX_CELL_BYTES, tiny_remaining_total)
+            .expect("nested formatting may use a tiny deterministic preview budget");
+        assert!(tiny.value(0).len() <= 4);
+        assert!(std::str::from_utf8(tiny.value(0).as_bytes()).is_ok());
     }
 
     #[test]
-    fn oversized_scalar_display_remains_a_resource_limit_error() {
+    fn oversized_scalar_display_is_utf8_truncated_without_changing_native_data() {
         const MAX_CELL_BYTES: usize = 64;
         let scalar = StringArray::from(vec!["x".repeat(MAX_CELL_BYTES + 1)]);
 
-        let error = display_array(&scalar, MAX_CELL_BYTES)
-            .expect_err("scalar displays must not be silently truncated");
-        assert_eq!(error.code(), ErrorCode::ResourceLimit);
-        assert_eq!(error.details()["displayCellBytes"], MAX_CELL_BYTES + 1);
-        assert_eq!(error.details()["maxDisplayCellBytes"], MAX_CELL_BYTES);
+        let display = display_array(&scalar, MAX_CELL_BYTES).expect("bounded scalar display");
+        assert!(display.value(0).ends_with(NESTED_DISPLAY_TRUNCATION_SUFFIX));
+        assert!(display.value(0).len() <= MAX_CELL_BYTES);
+        assert_eq!(scalar.value(0).len(), MAX_CELL_BYTES + 1);
     }
 
     #[test]

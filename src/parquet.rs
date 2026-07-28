@@ -38,7 +38,7 @@ const MAX_LAZY_TRACKED_PAGES: usize = 8_192;
 const MAX_LAZY_PAGE_HEADER_OBSERVATIONS: usize = 32_768;
 const MAX_COMPACT_PARSE_STEPS: usize = 16_384;
 const MIN_LAZY_DECODE_ATTEMPTS: usize = 32;
-const MAX_LAZY_DECODE_ATTEMPTS: usize = 128;
+const MAX_LAZY_DECODE_ATTEMPTS: usize = 4_096;
 const LAZY_DECODE_ATTEMPTS_PER_PREFETCH_WINDOW: usize = 4;
 
 /// Per-operation safety limits for the Parquet adapter.
@@ -249,6 +249,10 @@ struct PageDecompressionGuard {
     reserved_pages: HashMap<PageBodyRange, u64>,
     reserved_uncompressed_bytes: u64,
     header_observations: usize,
+    /// Bodies whose headers have been passed without a corresponding body
+    /// read.  The sparse reader drains these after each decoder attempt so a
+    /// long sequential scan does not retain every compressed page it skipped.
+    skipped_bodies: HashMap<PageBodyRange, u64>,
 }
 
 impl PageDecompressionGuard {
@@ -264,6 +268,7 @@ impl PageDecompressionGuard {
             reserved_pages: HashMap::new(),
             reserved_uncompressed_bytes: 0,
             header_observations: 0,
+            skipped_bodies: HashMap::new(),
         }
     }
 
@@ -328,6 +333,15 @@ impl PageDecompressionGuard {
                     "page-header association range is inconsistent",
                 ));
             }
+            if pending.length > 0 {
+                self.skipped_bodies.insert(
+                    PageBodyRange {
+                        offset: start,
+                        length: pending.length,
+                    },
+                    pending.uncompressed_bytes,
+                );
+            }
         }
         Ok(())
     }
@@ -364,24 +378,14 @@ impl PageDecompressionGuard {
             return Ok(());
         }
         self.ensure_tracking_capacity()?;
-        let required = self
-            .reserved_uncompressed_bytes
-            .checked_add(uncompressed_bytes)
-            .ok_or_else(|| {
-                ParquetError::General(format!(
-                    "{PAGE_DECOMPRESSION_LIMIT_SENTINEL}: output required {} available {}",
-                    u64::MAX,
-                    self.max_uncompressed_bytes,
-                ))
-            })?;
-        if required > self.max_uncompressed_bytes {
+        if uncompressed_bytes > self.max_uncompressed_bytes {
             return Err(ParquetError::General(format!(
-                "{PAGE_DECOMPRESSION_LIMIT_SENTINEL}: output required {required} available {}",
+                "{PAGE_DECOMPRESSION_LIMIT_SENTINEL}: output required {uncompressed_bytes} available {}",
                 self.max_uncompressed_bytes,
             )));
         }
         self.reserved_pages.insert(page, uncompressed_bytes);
-        self.reserved_uncompressed_bytes = required;
+        self.reserved_uncompressed_bytes = self.reserved_uncompressed_bytes.max(uncompressed_bytes);
         Ok(())
     }
 
@@ -414,6 +418,12 @@ impl PageDecompressionGuard {
     fn is_reserved(&self, page: PageBodyRange) -> bool {
         self.reserved_pages.contains_key(&page)
     }
+
+    fn take_skipped_bodies(&mut self) -> Vec<PageBodyRange> {
+        std::mem::take(&mut self.skipped_bodies)
+            .into_keys()
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -429,6 +439,8 @@ struct SparseChunkReader {
     page_guard: Option<Arc<Mutex<PageDecompressionGuard>>>,
     segments: Arc<Mutex<Vec<Segment>>>,
     missing: Arc<Mutex<Option<ParquetReadBytesAction>>>,
+    coalesce_adjacent: bool,
+    max_cache_bytes: Option<usize>,
 }
 
 impl Debug for SparseChunkReader {
@@ -454,10 +466,16 @@ impl SparseChunkReader {
             page_guard: None,
             segments: Arc::new(Mutex::new(Vec::new())),
             missing: Arc::new(Mutex::new(None)),
+            coalesce_adjacent: true,
+            max_cache_bytes: None,
         }
     }
 
-    fn fork(&self, max_page_uncompressed_bytes: Option<usize>) -> Result<Self> {
+    fn fork(
+        &self,
+        max_page_uncompressed_bytes: Option<usize>,
+        max_cache_bytes: Option<usize>,
+    ) -> Result<Self> {
         let segments = self
             .segments
             .lock()
@@ -471,6 +489,8 @@ impl SparseChunkReader {
                 .map(|guard| Arc::new(Mutex::new(guard))),
             segments: Arc::new(Mutex::new(segments)),
             missing: Arc::new(Mutex::new(None)),
+            coalesce_adjacent: max_page_uncompressed_bytes.is_none(),
+            max_cache_bytes,
         })
     }
 
@@ -506,7 +526,9 @@ impl SparseChunkReader {
                         "Parquet cached source segment range overflows u64",
                     )
                 })?;
-            if previous_end >= action.offset {
+            if previous_end > action.offset
+                || (self.coalesce_adjacent && previous_end == action.offset)
+            {
                 first -= 1;
             }
         }
@@ -515,7 +537,9 @@ impl SparseChunkReader {
         let mut merged_end = incoming_end;
         let mut last = first;
         while let Some(segment) = segments.get(last) {
-            if segment.offset > merged_end {
+            if segment.offset > merged_end
+                || (!self.coalesce_adjacent && segment.offset == merged_end)
+            {
                 break;
             }
             let segment_length = u64::try_from(segment.bytes.len()).map_err(|_| {
@@ -606,6 +630,93 @@ impl SparseChunkReader {
             })
     }
 
+    fn cache_limit(&self, fallback: usize) -> usize {
+        self.max_cache_bytes.unwrap_or(fallback)
+    }
+
+    /// Drops page bodies that parquet-rs conclusively skipped while retaining
+    /// any surrounding header and metadata bytes. `Bytes::slice` would keep
+    /// the original allocation alive, so retained fragments are copied into
+    /// fresh buffers before the old segments are released.
+    fn release_skipped_page_bodies(&self) -> Result<()> {
+        let Some(guard) = &self.page_guard else {
+            return Ok(());
+        };
+        let mut discarded = guard
+            .lock()
+            .map_err(|_| runtime_lock_error())?
+            .take_skipped_bodies();
+        if discarded.is_empty() {
+            return Ok(());
+        }
+        discarded.sort_unstable_by_key(|range| range.offset);
+        let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(discarded.len());
+        for range in discarded {
+            let end = range.offset.checked_add(range.length).ok_or_else(|| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "Parquet skipped page range overflows u64",
+                )
+            })?;
+            if let Some(previous) = ranges.last_mut() {
+                if range.offset <= previous.1 {
+                    previous.1 = previous.1.max(end);
+                    continue;
+                }
+            }
+            ranges.push((range.offset, end));
+        }
+        let mut segments = self.segments.lock().map_err(|_| runtime_lock_error())?;
+        let mut kept = Vec::with_capacity(segments.len());
+        for segment in segments.drain(..) {
+            let segment_end = segment
+                .offset
+                .checked_add(u64::try_from(segment.bytes.len()).map_err(|_| {
+                    TabularkError::new(
+                        ErrorCode::ResourceLimit,
+                        "Parquet cached source segment length overflows u64",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    TabularkError::new(
+                        ErrorCode::ResourceLimit,
+                        "Parquet cached source segment range overflows u64",
+                    )
+                })?;
+            let mut cursor = segment.offset;
+            for &(start, end) in &ranges {
+                if end <= cursor || start >= segment_end {
+                    continue;
+                }
+                let kept_end = start.min(segment_end);
+                if cursor < kept_end {
+                    let from = usize::try_from(cursor - segment.offset)
+                        .map_err(|_| runtime_lock_error())?;
+                    let to = usize::try_from(kept_end - segment.offset)
+                        .map_err(|_| runtime_lock_error())?;
+                    kept.push(Segment {
+                        offset: cursor,
+                        bytes: Bytes::copy_from_slice(&segment.bytes[from..to]),
+                    });
+                }
+                cursor = cursor.max(end).min(segment_end);
+                if cursor == segment_end {
+                    break;
+                }
+            }
+            if cursor < segment_end {
+                let from =
+                    usize::try_from(cursor - segment.offset).map_err(|_| runtime_lock_error())?;
+                kept.push(Segment {
+                    offset: cursor,
+                    bytes: Bytes::copy_from_slice(&segment.bytes[from..]),
+                });
+            }
+        }
+        *segments = kept;
+        Ok(())
+    }
+
     /// Returns the maximum compressed-byte allocation live while `insert`
     /// admits this action. Adjacent and overlapping segments are rebuilt into
     /// one allocation, so the old cache, ingress vector, and merged vector all
@@ -633,6 +744,18 @@ impl SparseChunkReader {
                 )
             })
         })?;
+        let ingress_peak = retained.checked_add(incoming).ok_or_else(|| {
+            TabularkError::new(
+                ErrorCode::ResourceLimit,
+                "Parquet ingress source byte accounting overflows",
+            )
+        })?;
+        // Decoder-discovered actions are exact uncovered gaps. Lazy readers
+        // retain adjacent windows separately, so admitting such a gap has no
+        // cache-wide merge allocation.
+        if !self.coalesce_adjacent {
+            return Ok(ingress_peak);
+        }
 
         let mut first = segments.partition_point(|segment| segment.offset < action.offset);
         if first > 0 {
@@ -652,7 +775,9 @@ impl SparseChunkReader {
                         "Parquet cached source segment range overflows u64",
                     )
                 })?;
-            if previous_end >= action.offset {
+            if previous_end > action.offset
+                || (self.coalesce_adjacent && previous_end == action.offset)
+            {
                 first -= 1;
             }
         }
@@ -661,7 +786,9 @@ impl SparseChunkReader {
         let mut merged_end = incoming_end;
         let mut last = first;
         while let Some(segment) = segments.get(last) {
-            if segment.offset > merged_end {
+            if segment.offset > merged_end
+                || (!self.coalesce_adjacent && segment.offset == merged_end)
+            {
                 break;
             }
             let segment_length = u64::try_from(segment.bytes.len()).map_err(|_| {
@@ -681,12 +808,6 @@ impl SparseChunkReader {
             last += 1;
         }
 
-        let ingress_peak = retained.checked_add(incoming).ok_or_else(|| {
-            TabularkError::new(
-                ErrorCode::ResourceLimit,
-                "Parquet ingress source byte accounting overflows",
-            )
-        })?;
         if first == last {
             return Ok(ingress_peak);
         }
@@ -739,7 +860,38 @@ impl SparseChunkReader {
             })?;
             return Ok(Some(segment.bytes.slice(start..start + length)));
         }
-        Ok(None)
+        // Lazy reads deliberately keep adjacent ingress windows split to
+        // avoid a full-cache merge allocation. Assemble only the exact
+        // decoder request when it happens to straddle those windows.
+        let mut cursor = segment_end;
+        let mut last = candidate;
+        while cursor < end {
+            let Some(next) = segments.get(last) else {
+                return Ok(None);
+            };
+            if next.offset != cursor {
+                return Ok(None);
+            }
+            cursor = cursor
+                .checked_add(u64::try_from(next.bytes.len()).map_err(|_| {
+                    ParquetError::General("cached source segment length overflows u64".into())
+                })?)
+                .ok_or_else(|| {
+                    ParquetError::General("cached source segment range overflows u64".into())
+                })?;
+            last += 1;
+        }
+        let mut joined = Vec::with_capacity(length);
+        let first_start = usize::try_from(offset - segment.offset).map_err(|_| {
+            ParquetError::General("cached source slice offset overflows usize".into())
+        })?;
+        joined.extend_from_slice(&segment.bytes[first_start..]);
+        for next in &segments[candidate..last] {
+            let remaining = length.saturating_sub(joined.len());
+            joined.extend_from_slice(&next.bytes[..remaining.min(next.bytes.len())]);
+        }
+        debug_assert_eq!(joined.len(), length);
+        Ok(Some(Bytes::from(joined)))
     }
 
     fn locate_suffix(&self, offset: u64, max_length: usize) -> ParquetResult<Option<Bytes>> {
@@ -773,7 +925,27 @@ impl SparseChunkReader {
             ParquetError::General("cached source slice offset overflows usize".into())
         })?;
         let end = start.saturating_add(max_length).min(segment.bytes.len());
-        Ok(Some(segment.bytes.slice(start..end)))
+        if end - start == max_length || candidate == segments.len() {
+            return Ok(Some(segment.bytes.slice(start..end)));
+        }
+        let mut joined = Vec::with_capacity(max_length);
+        joined.extend_from_slice(&segment.bytes[start..end]);
+        let mut cursor = segment_end;
+        for next in &segments[candidate..] {
+            if joined.len() >= max_length || next.offset != cursor {
+                break;
+            }
+            let remaining = max_length - joined.len();
+            joined.extend_from_slice(&next.bytes[..remaining.min(next.bytes.len())]);
+            cursor = cursor
+                .checked_add(u64::try_from(next.bytes.len()).map_err(|_| {
+                    ParquetError::General("cached source segment length overflows u64".into())
+                })?)
+                .ok_or_else(|| {
+                    ParquetError::General("cached source segment range overflows u64".into())
+                })?;
+        }
+        Ok(Some(Bytes::from(joined)))
     }
 
     fn request(&self, offset: u64, length: usize) -> ParquetResult<Bytes> {
@@ -802,6 +974,26 @@ impl SparseChunkReader {
             *missing = Some(action);
         }
         Err(ParquetError::General(MISSING_BYTES_SENTINEL.into()))
+    }
+
+    fn request_scan(&self, offset: u64, minimum_length: usize) -> ParquetResult<Bytes> {
+        let length = if let Some(max_cache_bytes) = self.max_cache_bytes {
+            let retained = self
+                .retained_bytes()
+                .map_err(|error| ParquetError::General(error.to_string()))?;
+            // Keep half the compressed-page reservation available for an
+            // exact body discovered at the end of the scan window.
+            max_cache_bytes
+                .div_ceil(2)
+                .min(self.read_prefetch_bytes.saturating_mul(32))
+                .saturating_sub(retained)
+                .max(minimum_length)
+        } else {
+            minimum_length
+        };
+        let remaining =
+            usize::try_from(self.source_length.saturating_sub(offset)).unwrap_or(usize::MAX);
+        self.request(offset, length.min(remaining))
     }
 
     fn first_missing_action(
@@ -882,10 +1074,30 @@ impl SparseChunkReader {
                     return Ok(());
                 }
             }
+            // parquet-rs may reopen a previously admitted body with get_read
+            // while replaying a decoder attempt. Its offset is not a page
+            // header, so do not try to compact-parse compressed payload bytes.
+            if guard.reserved_pages.keys().any(|page| {
+                page.length > 0
+                    && page.offset <= offset
+                    && page.offset.saturating_add(page.length) > offset
+            }) {
+                return Ok(());
+            }
+            if guard.skipped_bodies.keys().any(|page| {
+                page.length > 0
+                    && page.offset <= offset
+                    && page.offset.saturating_add(page.length) > offset
+            }) {
+                return Ok(());
+            }
             guard.observe_page_header()?;
         }
         let page_header = compact_page_header(bytes).ok_or_else(|| {
-            page_header_guard_error("page header prefix is malformed or incomplete")
+            ParquetError::General(format!(
+                "{PAGE_HEADER_GUARD_SENTINEL}: page header prefix at offset {offset} with {} bytes is malformed or incomplete",
+                bytes.len(),
+            ))
         })?;
         // parquet-rs deliberately skips INDEX_PAGE bodies in its sequential
         // reader path, so they must not leave an association behind.
@@ -934,7 +1146,9 @@ impl SparseChunkReader {
             let mut guard = guard.lock().map_err(|_| {
                 ParquetError::General("Parquet page-header guard lock is poisoned".into())
             })?;
-            let associated = guard.take_association(page)?;
+            let associated = guard
+                .take_association(page)?
+                .or_else(|| guard.skipped_bodies.remove(&page));
             let already_reserved = guard.is_reserved(page);
             (associated, already_reserved)
         };
@@ -1035,7 +1249,7 @@ impl ChunkReader for SparseChunkReader {
                 self.remember_page_header(start, bytes.as_ref())?;
                 Ok(Cursor::new(bytes))
             }
-            None => self.request(start, length).map(Cursor::new),
+            None => self.request_scan(start, length).map(Cursor::new),
         }
     }
 
@@ -1631,6 +1845,15 @@ impl OpenedParquetSource {
             &projection,
             &self.limits,
         )?;
+        let metadata_headroom = self
+            .limits
+            .max_metadata_bytes
+            .saturating_sub(self.retained_bytes()?);
+        let compressed_page_budget = self
+            .limits
+            .max_operation_bytes
+            .saturating_add(self.limits.arrow.max_decoded_bytes)
+            .saturating_add(metadata_headroom);
         let mut operation = ParquetReadOperation {
             options: self.options.clone(),
             limits: self.limits.clone(),
@@ -1639,6 +1862,7 @@ impl OpenedParquetSource {
                 projected
                     .lazy_page_reads
                     .then_some(self.limits.arrow.max_decoded_bytes),
+                projected.lazy_page_reads.then_some(compressed_page_budget),
             )?,
             plan,
             source_columns,
@@ -1754,7 +1978,7 @@ impl ParquetReadOperation {
                 &self.reader,
                 action,
                 live_ingress.saturating_sub(incoming),
-                self.limits.max_operation_bytes,
+                self.reader.cache_limit(self.limits.max_operation_bytes),
                 "compressed-pages",
             )?;
         }
@@ -1846,7 +2070,7 @@ impl ParquetReadOperation {
                 &self.reader,
                 action,
                 other_live_ingress,
-                self.limits.max_operation_bytes,
+                self.reader.cache_limit(self.limits.max_operation_bytes),
                 "compressed-pages",
             )?;
             self.reader.insert(action, bytes)?;
@@ -1904,6 +2128,22 @@ impl ParquetReadOperation {
                     u64::try_from(self.limits.arrow.max_decoded_bytes).unwrap_or(u64::MAX),
                 ));
             }
+            let combined_bytes = decoded_bytes
+                .checked_add(self.reader.retained_bytes()?)
+                .ok_or_else(|| {
+                    TabularkError::new(
+                        ErrorCode::ResourceLimit,
+                        "Parquet combined compressed and decoded byte accounting overflows",
+                    )
+                })?;
+            if combined_bytes > self.reader.cache_limit(self.limits.max_operation_bytes) {
+                return Err(resource_limit(
+                    "parquet-operation",
+                    u64::try_from(combined_bytes).unwrap_or(u64::MAX),
+                    u64::try_from(self.reader.cache_limit(self.limits.max_operation_bytes))
+                        .unwrap_or(u64::MAX),
+                ));
+            }
             batches.push(batch);
         }
         let batch = encode_projected_record_batches(
@@ -1914,6 +2154,7 @@ impl ParquetReadOperation {
             self.plan.complete,
             &self.limits.arrow,
         )?;
+        self.reader.release_skipped_page_bodies()?;
         Ok(Some(batch))
     }
 
@@ -1928,11 +2169,15 @@ impl ParquetReadOperation {
                 .with_detail("length", action.length)
                 .with_detail("reason", error.to_string()));
             }
-            ensure_lazy_decode_attempt_budget(self.decode_attempts, &self.limits)?;
+            ensure_lazy_decode_attempt_budget(
+                self.decode_attempts,
+                self.reader.source_length,
+                &self.limits,
+            )?;
             ensure_action_peak_budget(
                 &self.reader,
                 action,
-                self.limits.max_operation_bytes,
+                self.reader.cache_limit(self.limits.max_operation_bytes),
                 "compressed-pages",
             )?;
             self.expected = Some(action);
@@ -2437,14 +2682,13 @@ impl Default for ParquetRuntime {
     }
 }
 
-fn max_lazy_decode_attempts(limits: &ParquetLimits) -> usize {
+fn max_lazy_decode_attempts(source_length: u64, limits: &ParquetLimits) -> usize {
     // Sequential pages normally need one header-window restart and at most one
     // body restart. Indexed pages can add a prefix-validation restart. Four
     // attempts per cache-sized window leaves headroom for column transitions,
     // while the hard ceiling bounds pathological tiny-page layouts.
-    let prefetch_windows = limits
-        .max_operation_bytes
-        .div_ceil(limits.read_prefetch_bytes);
+    let prefetch = u64::try_from(limits.read_prefetch_bytes).unwrap_or(u64::MAX);
+    let prefetch_windows = usize::try_from(source_length.div_ceil(prefetch)).unwrap_or(usize::MAX);
     prefetch_windows
         .saturating_mul(LAZY_DECODE_ATTEMPTS_PER_PREFETCH_WINDOW)
         .saturating_add(8)
@@ -2453,9 +2697,10 @@ fn max_lazy_decode_attempts(limits: &ParquetLimits) -> usize {
 
 fn ensure_lazy_decode_attempt_budget(
     completed_attempts: usize,
+    source_length: u64,
     limits: &ParquetLimits,
 ) -> Result<()> {
-    let attempt_limit = max_lazy_decode_attempts(limits);
+    let attempt_limit = max_lazy_decode_attempts(source_length, limits);
     let required_attempts = completed_attempts.checked_add(1).ok_or_else(|| {
         count_limit(
             "decode-attempts",
@@ -2735,7 +2980,7 @@ mod tests {
     }
 
     #[test]
-    fn lazy_page_guard_reserves_unique_decompressed_pages_cumulatively() {
+    fn lazy_page_guard_limits_each_decompressed_page_without_summing_history() {
         let first_header = compact_test_page_header(60, 4);
         let second_header = compact_test_page_header(60, 4);
         let second_header_start = first_header.len() + 4;
@@ -2747,7 +2992,7 @@ mod tests {
             u64::try_from(bytes.len()).expect("source length"),
             bytes.len(),
         )
-        .fork(Some(100))
+        .fork(Some(100), None)
         .expect("guarded reader");
         cache_segment(&reader, 0, &bytes);
 
@@ -2769,18 +3014,21 @@ mod tests {
         reader
             .get_read(u64::try_from(second_header_start).expect("second header offset"))
             .expect("second page header");
-        let error = reader
+        reader
             .get_bytes(
                 u64::try_from(second_header_start + second_header.len())
                     .expect("second body offset"),
                 4,
             )
-            .expect_err("cumulative decompressed pages must remain within the limit");
-        let error = parquet_error("validate lazy page reservation", error);
-        assert_eq!(error.code(), ErrorCode::ResourceLimit);
-        assert_eq!(error.details()["resource"], "decompressed-pages");
-        assert_eq!(error.details()["requiredBytes"], 120);
-        assert_eq!(error.details()["availableBytes"], 100);
+            .expect("individually bounded pages do not consume historical decode budget");
+        let guard = reader
+            .page_guard
+            .as_ref()
+            .expect("page guard")
+            .lock()
+            .expect("page guard lock");
+        assert_eq!(guard.reserved_pages.len(), 2);
+        assert_eq!(guard.reserved_uncompressed_bytes, 60);
     }
 
     #[test]
@@ -2799,7 +3047,7 @@ mod tests {
             u64::try_from(bytes.len()).expect("source length"),
             bytes.len(),
         )
-        .fork(Some(4 * LAZY_PAGE_TRACKING_BYTES))
+        .fork(Some(4 * LAZY_PAGE_TRACKING_BYTES), None)
         .expect("guarded reader");
         cache_segment(&reader, 0, &bytes);
 
@@ -2835,6 +3083,31 @@ mod tests {
     }
 
     #[test]
+    fn lazy_page_guard_restores_a_skipped_page_when_decoder_replays_its_body() {
+        let page = PageBodyRange {
+            offset: 10,
+            length: 4,
+        };
+        let mut guard = PageDecompressionGuard::new(128);
+        guard.associate(page, 60).expect("page association");
+        guard
+            .discard_skipped_through(20)
+            .expect("advance beyond skipped page");
+        assert_eq!(guard.skipped_bodies.get(&page), Some(&60));
+
+        let restored = guard
+            .take_association(page)
+            .expect("pending lookup")
+            .or_else(|| guard.skipped_bodies.remove(&page));
+        assert_eq!(restored, Some(60));
+        guard
+            .reserve(page, restored.expect("restored size"))
+            .expect("reserve replayed page");
+        assert!(guard.skipped_bodies.is_empty());
+        assert_eq!(guard.reserved_pages.get(&page), Some(&60));
+    }
+
+    #[test]
     fn lazy_page_guard_advances_past_a_zero_byte_page() {
         let zero_header = compact_test_page_header(0, 0);
         let next_header = compact_test_page_header(1, 1);
@@ -2849,7 +3122,7 @@ mod tests {
                 u64::try_from(bytes.len()).expect("source length"),
                 bytes.len(),
             )
-            .fork(Some(64))
+            .fork(Some(64), None)
             .expect("guarded reader");
             cache_segment(&reader, 0, &bytes);
             reader
@@ -2905,7 +3178,7 @@ mod tests {
             u64::try_from(final_zero_header.len()).expect("final source length"),
             final_zero_header.len(),
         )
-        .fork(Some(64))
+        .fork(Some(64), None)
         .expect("final guarded reader");
         cache_segment(&final_zero, 0, &final_zero_header);
         final_zero.get_read(0).expect("final zero-byte header");
@@ -2952,7 +3225,7 @@ mod tests {
             u64::try_from(bytes.len()).expect("source length"),
             bytes.len(),
         )
-        .fork(Some(4 * LAZY_PAGE_TRACKING_BYTES))
+        .fork(Some(4 * LAZY_PAGE_TRACKING_BYTES), None)
         .expect("guarded reader");
         cache_segment(&reader, 0, &bytes);
 
@@ -3046,7 +3319,7 @@ mod tests {
             u64::try_from(total_length).expect("source length"),
             header.len(),
         )
-        .fork(Some(128))
+        .fork(Some(128), None)
         .expect("guarded reader");
 
         assert_eq!(
@@ -3094,7 +3367,7 @@ mod tests {
             u64::try_from(bytes.len()).expect("source length"),
             bytes.len(),
         )
-        .fork(Some(64))
+        .fork(Some(64), None)
         .expect("guarded reader");
         cache_segment(&reader, 0, &bytes);
 
@@ -3115,7 +3388,7 @@ mod tests {
             u64::try_from(padded_bytes.len()).expect("padded source length"),
             padded_bytes.len(),
         )
-        .fork(Some(64))
+        .fork(Some(64), None)
         .expect("padded guarded reader");
         cache_segment(&padded, 0, &padded_bytes);
         padded.get_read(0).expect("padded page header");
@@ -3300,10 +3573,13 @@ mod tests {
             read_prefetch_bytes: 1,
             ..ParquetLimits::default()
         };
-        assert_eq!(max_lazy_decode_attempts(&limits), MAX_LAZY_DECODE_ATTEMPTS);
-        ensure_lazy_decode_attempt_budget(MAX_LAZY_DECODE_ATTEMPTS - 1, &limits)
+        assert_eq!(
+            max_lazy_decode_attempts(u64::MAX, &limits),
+            MAX_LAZY_DECODE_ATTEMPTS
+        );
+        ensure_lazy_decode_attempt_budget(MAX_LAZY_DECODE_ATTEMPTS - 1, u64::MAX, &limits)
             .expect("the final bounded decoder construction is allowed");
-        let error = ensure_lazy_decode_attempt_budget(MAX_LAZY_DECODE_ATTEMPTS, &limits)
+        let error = ensure_lazy_decode_attempt_budget(MAX_LAZY_DECODE_ATTEMPTS, u64::MAX, &limits)
             .expect_err("another lazy decoder construction must be rejected");
         assert_eq!(error.code(), ErrorCode::ResourceLimit);
         assert_eq!(error.details()["resource"], "decode-attempts");
@@ -3811,18 +4087,23 @@ mod tests {
     }
 
     #[test]
-    fn late_large_row_group_viewport_fails_at_the_compressed_page_budget() {
+    fn late_large_row_group_viewport_releases_skipped_compressed_pages() {
         let bytes = large_nested_row_group_fixture();
-        let limits = viewport_limits();
+        let mut limits = viewport_limits();
+        // The declared row group remains far larger than the decoded limit,
+        // so this stays on lazy page ingress while leaving room for a target
+        // body beside the scan window.
+        limits.max_operation_bytes = 64 * 1024;
         let (source, _) = open(&bytes, limits.clone());
-        let request = RangeRequest::new(63, 1, 0, 1).expect("late-row viewport");
+        let request = RangeRequest::new(15, 1, 0, 1).expect("late-row viewport");
         let mut operation = match source.begin_read(request).expect("begin lazy read") {
             ParquetReadStart::Pending(operation) => operation,
             ParquetReadStart::Complete(_) => panic!("late row must request page bytes"),
         };
         assert!(operation.lazy_page_reads);
 
-        let error = loop {
+        let mut peak_retained = operation.reader.retained_bytes().expect("retained bytes");
+        let batch = loop {
             let action = operation.next_action().expect("lazy page action");
             let start = usize::try_from(action.offset).expect("offset");
             let length = usize::try_from(action.length).expect("length");
@@ -3831,16 +4112,19 @@ mod tests {
                 bytes[start..start + length].to_vec(),
                 start + length == bytes.len(),
             ) {
-                Ok(Some(_)) => panic!("late row must not bypass the compressed-page budget"),
-                Ok(None) => {}
-                Err(error) => break error,
+                Ok(Some(batch)) => break batch,
+                Ok(None) => {
+                    peak_retained = peak_retained
+                        .max(operation.reader.retained_bytes().expect("retained bytes"));
+                }
+                Err(error) => panic!("late row must remain readable: {error:?}"),
             }
         };
-        assert_eq!(error.code(), ErrorCode::ResourceLimit, "{error:?}");
-        assert_eq!(error.details()["resource"], "compressed-pages");
+        assert_eq!(batch.range(), request);
         assert!(
-            operation.reader.retained_bytes().expect("retained bytes")
-                <= limits.max_operation_bytes
+            peak_retained <= limits.max_operation_bytes,
+            "peak retained {peak_retained} exceeds {}",
+            limits.max_operation_bytes,
         );
     }
 
@@ -3914,7 +4198,9 @@ mod tests {
 
         let header = operation.next_action().expect("page-header action");
         assert!(
-            header.length <= u64::try_from(limits.read_prefetch_bytes).expect("prefetch limit")
+            header.length
+                <= u64::try_from(limits.max_operation_bytes.div_ceil(2))
+                    .expect("scan-window limit")
         );
         let start = usize::try_from(header.offset).expect("offset");
         let length = usize::try_from(header.length).expect("length");
@@ -4200,5 +4486,55 @@ mod tests {
         .expect_err("source limit");
         assert_eq!(error.code(), ErrorCode::ResourceLimit);
         assert_eq!(error.details()["resource"], "encoded-source");
+    }
+
+    #[test]
+    #[ignore = "requires TABULARK_LOCAL_PARQUET_FIXTURE"]
+    fn local_large_parquet_scroll_acceptance() {
+        let path = std::env::var("TABULARK_LOCAL_PARQUET_FIXTURE")
+            .expect("TABULARK_LOCAL_PARQUET_FIXTURE");
+        let bytes = std::fs::read(path).expect("read local Parquet fixture");
+        let limits = ParquetLimits::from_memory_budget(128 * 1024 * 1024).expect("limits");
+        let (source, _) = open(&bytes, limits.clone());
+        for row_start in [0_u64, 463, 927, 1_390, 1_822, 0] {
+            let request = RangeRequest::new(row_start, 32.min(1_854 - row_start), 0, 3)
+                .expect("scroll range");
+            let mut operation = match source.begin_read(request).expect("begin local read") {
+                ParquetReadStart::Pending(operation) => operation,
+                ParquetReadStart::Complete(batch) => {
+                    assert_eq!(batch.range(), request);
+                    continue;
+                }
+            };
+            let batch = loop {
+                let action = operation.next_action().expect("local source action");
+                let start = usize::try_from(action.offset).expect("offset");
+                let length = usize::try_from(action.length).expect("length");
+                match operation.feed_owned(
+                    action.offset,
+                    bytes[start..start + length].to_vec(),
+                    start + length == bytes.len(),
+                ) {
+                    Ok(Some(batch)) => break batch,
+                    Ok(None) => {}
+                    Err(error) => {
+                        let guard = operation.reader.page_guard.as_ref().map(|guard| {
+                            let guard = guard.lock().expect("guard");
+                            (
+                                guard.pending_pages.len(),
+                                guard.reserved_pages.len(),
+                                guard.skipped_bodies.len(),
+                            )
+                        });
+                        panic!(
+                            "row {row_start} failed after {} attempts, retained {}, guard {guard:?}: {error:?}",
+                            operation.decode_attempts,
+                            operation.reader.retained_bytes().expect("retained")
+                        );
+                    }
+                }
+            };
+            assert_eq!(batch.range(), request);
+        }
     }
 }
