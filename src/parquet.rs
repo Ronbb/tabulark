@@ -14,15 +14,23 @@ use ::parquet::arrow::ProjectionMask;
 use ::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
-use ::parquet::basic::{Compression, LogicalType};
+use ::parquet::basic::{Compression, Encoding, LogicalType, Type as ParquetPhysicalType};
+use ::parquet::column::page::{Page, PageReader};
 use ::parquet::errors::{ParquetError, Result as ParquetResult};
+use ::parquet::file::metadata::ColumnChunkMetaData;
 use ::parquet::file::reader::{ChunkReader, Length};
+use ::parquet::file::serialized_reader::SerializedPageReader;
+use ::parquet::schema::types::ColumnDescPtr;
+use arrow_array::StringArray;
+use arrow_array::builder::{Float64Builder, ListBuilder, TimestampMillisecondBuilder};
+use arrow_schema::{DataType as ArrowDataType, TimeUnit as ArrowTimeUnit};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::arrow::{
-    ArrowIpcLimits, encode_projected_record_batches, encode_projected_record_batches_for_display,
-    exact_metadata,
+    ArrowIpcLimits, display_bounded_list_preview, encode_display_string_arrays,
+    encode_projected_record_batches, encode_projected_record_batches_for_display, exact_metadata,
+    projected_record_batches_to_display_arrays,
 };
 use crate::error::{ErrorCode, Result, TabularkError, zstd_decompression_limit_error};
 use crate::model::{RangeRequest, TableMetadata, TypedTableBatch};
@@ -43,6 +51,10 @@ const MAX_COMPACT_PARSE_STEPS: usize = 16_384;
 const MIN_LAZY_DECODE_ATTEMPTS: usize = 32;
 const MAX_LAZY_DECODE_ATTEMPTS: usize = 4_096;
 const LAZY_DECODE_ATTEMPTS_PER_PREFETCH_WINDOW: usize = 4;
+const DISPLAY_PREVIEW_MAX_LIST_ELEMENTS: usize = 256;
+const DISPLAY_PREVIEW_DECODED_BUDGET_DIVISOR: usize = 2;
+const DISPLAY_PREVIEW_ELEMENT_ESTIMATED_BYTES: usize = 128;
+const OVERSIZED_DISPLAY_CELL: &str = "<oversized cell>";
 
 /// Per-operation safety limits for the Parquet adapter.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -380,13 +392,18 @@ impl PageDecompressionGuard {
             }
             return Ok(());
         }
-        self.ensure_tracking_capacity()?;
         if uncompressed_bytes > self.max_uncompressed_bytes {
+            // The bounded display decoder can safely fall back to a
+            // placeholder for this column. Keep the compressed body
+            // discoverable long enough for that path to release it from the
+            // sparse cache before scanning another column.
+            self.skipped_bodies.insert(page, uncompressed_bytes);
             return Err(ParquetError::General(format!(
                 "{PAGE_DECOMPRESSION_LIMIT_SENTINEL}: output required {uncompressed_bytes} available {}",
                 self.max_uncompressed_bytes,
             )));
         }
+        self.ensure_tracking_capacity()?;
         self.reserved_pages.insert(page, uncompressed_bytes);
         self.reserved_uncompressed_bytes = self.reserved_uncompressed_bytes.max(uncompressed_bytes);
         Ok(())
@@ -426,6 +443,26 @@ impl PageDecompressionGuard {
         std::mem::take(&mut self.skipped_bodies)
             .into_keys()
             .collect()
+    }
+
+    fn take_reserved_bodies(&mut self) -> Vec<PageBodyRange> {
+        std::mem::take(&mut self.reserved_pages)
+            .into_keys()
+            .collect()
+    }
+
+    fn take_abandoned_bodies(&mut self) -> Vec<PageBodyRange> {
+        let mut bodies = std::mem::take(&mut self.pending_pages)
+            .into_iter()
+            .map(|(offset, pending)| PageBodyRange {
+                offset,
+                length: pending.length,
+            })
+            .collect::<Vec<_>>();
+        self.pending_ends.clear();
+        bodies.extend(std::mem::take(&mut self.reserved_pages).into_keys());
+        bodies.extend(std::mem::take(&mut self.skipped_bodies).into_keys());
+        bodies
     }
 }
 
@@ -637,6 +674,38 @@ impl SparseChunkReader {
         self.max_cache_bytes.unwrap_or(fallback)
     }
 
+    /// Ensures the body associated with the header most recently observed by
+    /// `SerializedPageReader::peek_next_page` is cached before advancing that
+    /// reader. The upstream reader advances its cursor before requesting the
+    /// body, so this preflight keeps restartable sparse reads resumable.
+    fn ensure_next_page_body(&self) -> ParquetResult<()> {
+        let Some(guard) = &self.page_guard else {
+            return Ok(());
+        };
+        let page = {
+            let guard = guard.lock().map_err(|_| {
+                ParquetError::General("Parquet page-header guard lock is poisoned".into())
+            })?;
+            guard
+                .pending_pages
+                .first_key_value()
+                .map(|(&offset, pending)| PageBodyRange {
+                    offset,
+                    length: pending.length,
+                })
+                .or_else(|| guard.reserved_pages.keys().copied().next())
+        };
+        if let Some(page) = page {
+            drop(self.get_bytes(
+                page.offset,
+                usize::try_from(page.length).map_err(|_| {
+                    ParquetError::General("Parquet page body length exceeds usize".into())
+                })?,
+            )?);
+        }
+        Ok(())
+    }
+
     /// Drops page bodies that parquet-rs conclusively skipped while retaining
     /// any surrounding header and metadata bytes. `Bytes::slice` would keep
     /// the original allocation alive, so retained fragments are copied into
@@ -645,10 +714,46 @@ impl SparseChunkReader {
         let Some(guard) = &self.page_guard else {
             return Ok(());
         };
-        let mut discarded = guard
+        let discarded = guard
             .lock()
             .map_err(|_| runtime_lock_error())?
             .take_skipped_bodies();
+        self.release_page_bodies(discarded, "skipped")
+    }
+
+    /// Drops compressed page bodies after the bounded preview decoder has
+    /// consumed them. The decoder owns any small dictionary/preview data it
+    /// still needs, so retaining the source page would only inflate the sparse
+    /// cache across a long list cell.
+    fn release_consumed_page_bodies(&self) -> Result<()> {
+        let Some(guard) = &self.page_guard else {
+            return Ok(());
+        };
+        let discarded = guard
+            .lock()
+            .map_err(|_| runtime_lock_error())?
+            .take_reserved_bodies();
+        self.release_page_bodies(discarded, "consumed")
+    }
+
+    /// Drops every page body tracked for a preview column that has switched to
+    /// its safe placeholder fallback. No decoder will replay these ranges.
+    fn release_abandoned_page_bodies(&self) -> Result<()> {
+        let Some(guard) = &self.page_guard else {
+            return Ok(());
+        };
+        let discarded = guard
+            .lock()
+            .map_err(|_| runtime_lock_error())?
+            .take_abandoned_bodies();
+        self.release_page_bodies(discarded, "abandoned")
+    }
+
+    fn release_page_bodies(
+        &self,
+        mut discarded: Vec<PageBodyRange>,
+        disposition: &'static str,
+    ) -> Result<()> {
         if discarded.is_empty() {
             return Ok(());
         }
@@ -658,7 +763,7 @@ impl SparseChunkReader {
             let end = range.offset.checked_add(range.length).ok_or_else(|| {
                 TabularkError::new(
                     ErrorCode::ResourceLimit,
-                    "Parquet skipped page range overflows u64",
+                    format!("Parquet {disposition} page range overflows u64"),
                 )
             })?;
             if let Some(previous) = ranges.last_mut() {
@@ -686,8 +791,21 @@ impl SparseChunkReader {
                         "Parquet cached source segment range overflows u64",
                     )
                 })?;
+            let first_overlap = ranges.partition_point(|(_, end)| *end <= segment.offset);
+            if ranges
+                .get(first_overlap)
+                .is_none_or(|(start, _)| *start >= segment_end)
+            {
+                // Move untouched allocations as-is. Only fragments cut out of
+                // an overlapping `Bytes` allocation need a defensive copy.
+                kept.push(segment);
+                continue;
+            }
             let mut cursor = segment.offset;
-            for &(start, end) in &ranges {
+            for &(start, end) in &ranges[first_overlap..] {
+                if start >= segment_end {
+                    break;
+                }
                 if end <= cursor || start >= segment_end {
                     continue;
                 }
@@ -1851,7 +1969,7 @@ impl OpenedParquetSource {
             )?));
         }
         let source_columns = projected_source_columns(&plan)?;
-        let projection = ProjectionMask::roots(
+        let planned_projection = ProjectionMask::roots(
             self.reader_metadata.parquet_schema(),
             source_columns.iter().copied(),
         );
@@ -1859,9 +1977,27 @@ impl OpenedParquetSource {
             &self.reader_metadata,
             &self.reader,
             &plan,
-            &projection,
+            &planned_projection,
             &self.limits,
         )?;
+        let preview_specs = if display_only {
+            fixed_list_preview_specs(&self.reader_metadata, &source_columns)
+        } else {
+            Vec::new()
+        };
+        let standard_source_columns = source_columns
+            .iter()
+            .copied()
+            .filter(|source_column| {
+                !preview_specs
+                    .iter()
+                    .any(|spec| spec.source_column == *source_column)
+            })
+            .collect::<Vec<_>>();
+        let projection = ProjectionMask::roots(
+            self.reader_metadata.parquet_schema(),
+            standard_source_columns.iter().copied(),
+        );
         let metadata_headroom = self
             .limits
             .max_metadata_bytes
@@ -1871,18 +2007,48 @@ impl OpenedParquetSource {
             .max_operation_bytes
             .saturating_add(self.limits.arrow.max_decoded_bytes)
             .saturating_add(metadata_headroom);
+        let reader = self.reader.fork(
+            projected
+                .lazy_page_reads
+                .then_some(self.limits.arrow.max_decoded_bytes),
+            projected.lazy_page_reads.then_some(compressed_page_budget),
+        )?;
+        let row_count = usize::try_from(plan.returned_range.row_count()).map_err(|_| {
+            TabularkError::new(
+                ErrorCode::ResourceLimit,
+                "Parquet returned row count exceeds usize",
+            )
+        })?;
+        let preview_decoded_budget = self
+            .limits
+            .arrow
+            .max_decoded_bytes
+            .checked_div(DISPLAY_PREVIEW_DECODED_BUDGET_DIVISOR)
+            .unwrap_or(0)
+            .checked_div(preview_specs.len().max(1))
+            .unwrap_or(0);
+        let preview_scanners = preview_specs
+            .into_iter()
+            .map(|spec| {
+                FixedListPreviewScanner::new(
+                    spec,
+                    &self.reader_metadata,
+                    reader.clone(),
+                    &projected.row_groups,
+                    projected.row_offset,
+                    row_count,
+                    preview_decoded_budget,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut operation = ParquetReadOperation {
             options: self.options.clone(),
             limits: self.limits.clone(),
             reader_metadata: self.reader_metadata.clone(),
-            reader: self.reader.fork(
-                projected
-                    .lazy_page_reads
-                    .then_some(self.limits.arrow.max_decoded_bytes),
-                projected.lazy_page_reads.then_some(compressed_page_budget),
-            )?,
+            reader,
             plan,
             source_columns,
+            standard_source_columns,
             projection,
             row_groups: projected.row_groups,
             row_offset: projected.row_offset,
@@ -1891,6 +2057,8 @@ impl OpenedParquetSource {
             display_only,
             expected: None,
             decode_attempts: 0,
+            preview_scanners,
+            standard_display_arrays: None,
         };
         match operation.advance()? {
             Some(batch) => Ok(ParquetReadStart::Complete(batch)),
@@ -1917,6 +2085,7 @@ pub struct ParquetReadOperation {
     reader: SparseChunkReader,
     plan: RangePlan,
     source_columns: Vec<usize>,
+    standard_source_columns: Vec<usize>,
     projection: ProjectionMask,
     row_groups: Vec<usize>,
     row_offset: usize,
@@ -1925,6 +2094,1317 @@ pub struct ParquetReadOperation {
     display_only: bool,
     expected: Option<ParquetReadBytesAction>,
     decode_attempts: usize,
+    preview_scanners: Vec<FixedListPreviewScanner>,
+    standard_display_arrays: Option<Vec<(usize, StringArray)>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FixedListPreviewKind {
+    TimestampMillisecond,
+    Float64,
+}
+
+#[derive(Clone, Debug)]
+struct FixedListPreviewSpec {
+    source_column: usize,
+    leaf_column: usize,
+    descriptor: ColumnDescPtr,
+    kind: FixedListPreviewKind,
+}
+
+#[derive(Clone, Debug)]
+struct FixedListPreviewRowGroup {
+    metadata: ColumnChunkMetaData,
+    rows: usize,
+    selected_start: usize,
+    selected_end: usize,
+}
+
+#[derive(Clone, Debug)]
+enum FixedListPreviewCell {
+    Null,
+    Values {
+        values: Vec<Option<u64>>,
+        truncated: bool,
+    },
+}
+
+impl Default for FixedListPreviewCell {
+    fn default() -> Self {
+        Self::Values {
+            values: Vec::new(),
+            truncated: false,
+        }
+    }
+}
+
+impl FixedListPreviewCell {
+    fn observe_null_list(&mut self) {
+        *self = Self::Null;
+    }
+
+    fn observe_empty_list(&mut self) {
+        if !matches!(self, Self::Null) {
+            *self = Self::default();
+        }
+    }
+
+    fn observe_element(&mut self, value: Option<u64>, max_list_elements: usize) {
+        let Self::Values { values, truncated } = self else {
+            return;
+        };
+        if values.len() < max_list_elements {
+            values.push(value);
+        } else {
+            *truncated = true;
+        }
+    }
+
+    fn can_retain_element(&self, max_list_elements: usize) -> bool {
+        matches!(
+            self,
+            Self::Values { values, .. } if values.len() < max_list_elements
+        )
+    }
+
+    fn observe_omitted_element(&mut self) {
+        if let Self::Values { truncated, .. } = self {
+            *truncated = true;
+        }
+    }
+}
+
+fn fixed_list_preview_element_limit(
+    row_count: usize,
+    decoded_budget_bytes: usize,
+) -> Result<Option<usize>> {
+    let retained_cell_bytes = row_count
+        .checked_mul(std::mem::size_of::<FixedListPreviewCell>())
+        .ok_or_else(|| {
+            TabularkError::new(
+                ErrorCode::ResourceLimit,
+                "Parquet preview cell memory estimate overflows",
+            )
+        })?;
+    if retained_cell_bytes > decoded_budget_bytes {
+        return Ok(None);
+    }
+    if row_count == 0 {
+        return Ok(Some(0));
+    }
+    Ok(Some(
+        decoded_budget_bytes
+            .saturating_sub(retained_cell_bytes)
+            .checked_div(row_count)
+            .unwrap_or(0)
+            .checked_div(DISPLAY_PREVIEW_ELEMENT_ESTIMATED_BYTES)
+            .unwrap_or(0)
+            .min(DISPLAY_PREVIEW_MAX_LIST_ELEMENTS),
+    ))
+}
+
+struct ActiveFixedListPreviewRow {
+    index: usize,
+    cell: Option<FixedListPreviewCell>,
+}
+
+struct FixedListPreviewRowGroupScanner {
+    page_reader: SerializedPageReader<SparseChunkReader>,
+    selected_start: usize,
+    selected_end: usize,
+    expected_rows: usize,
+    next_row: usize,
+    active: Option<ActiveFixedListPreviewRow>,
+    dictionary: Option<FixedWidthDictionary>,
+}
+
+impl Debug for FixedListPreviewRowGroupScanner {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FixedListPreviewRowGroupScanner")
+            .field("selected_start", &self.selected_start)
+            .field("selected_end", &self.selected_end)
+            .field("expected_rows", &self.expected_rows)
+            .field("next_row", &self.next_row)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+struct FixedListPreviewScanner {
+    source_column: usize,
+    descriptor: ColumnDescPtr,
+    kind: FixedListPreviewKind,
+    reader: SparseChunkReader,
+    row_groups: VecDeque<FixedListPreviewRowGroup>,
+    current: Option<FixedListPreviewRowGroupScanner>,
+    cells: Vec<FixedListPreviewCell>,
+    output_rows: usize,
+    max_list_elements: usize,
+    fallback: bool,
+    complete: bool,
+}
+
+impl FixedListPreviewScanner {
+    fn new(
+        spec: FixedListPreviewSpec,
+        metadata: &ArrowReaderMetadata,
+        reader: SparseChunkReader,
+        row_groups: &[usize],
+        row_offset: usize,
+        row_count: usize,
+        decoded_budget_bytes: usize,
+    ) -> Result<Self> {
+        let mut remaining_skip = row_offset;
+        let mut remaining_rows = row_count;
+        let mut planned = VecDeque::new();
+        for &row_group_index in row_groups {
+            if remaining_rows == 0 {
+                break;
+            }
+            let row_group = metadata
+                .metadata()
+                .row_groups()
+                .get(row_group_index)
+                .ok_or_else(|| {
+                    TabularkError::new(
+                        ErrorCode::ParseFailed,
+                        "Parquet preview row group lies outside the footer metadata",
+                    )
+                })?;
+            let rows = usize::try_from(row_group.num_rows()).map_err(|_| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "Parquet preview row-group count exceeds usize",
+                )
+            })?;
+            if remaining_skip >= rows {
+                remaining_skip -= rows;
+                continue;
+            }
+            let selected_start = remaining_skip;
+            let selected_rows = remaining_rows.min(rows - selected_start);
+            let selected_end = selected_start.checked_add(selected_rows).ok_or_else(|| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "Parquet preview row range overflows usize",
+                )
+            })?;
+            let column = row_group.columns().get(spec.leaf_column).ok_or_else(|| {
+                TabularkError::new(
+                    ErrorCode::ParseFailed,
+                    "Parquet preview leaf column is missing from a row group",
+                )
+            })?;
+            planned.push_back(FixedListPreviewRowGroup {
+                metadata: column.clone(),
+                rows,
+                selected_start,
+                selected_end,
+            });
+            remaining_rows -= selected_rows;
+            remaining_skip = 0;
+        }
+        if remaining_rows != 0 {
+            return Err(TabularkError::new(
+                ErrorCode::InvalidRange,
+                "Parquet preview row groups do not cover the returned range",
+            ));
+        }
+        let element_limit = fixed_list_preview_element_limit(row_count, decoded_budget_bytes)?;
+        let fallback = element_limit.is_none();
+        let max_list_elements = element_limit.unwrap_or(0);
+        Ok(Self {
+            source_column: spec.source_column,
+            descriptor: spec.descriptor,
+            kind: spec.kind,
+            reader,
+            row_groups: planned,
+            current: None,
+            cells: if fallback {
+                Vec::new()
+            } else {
+                Vec::with_capacity(row_count)
+            },
+            output_rows: row_count,
+            max_list_elements,
+            fallback,
+            complete: row_count == 0 || fallback,
+        })
+    }
+
+    fn advance(&mut self) -> ParquetResult<()> {
+        while !self.complete {
+            if self.current.is_none() {
+                let Some(row_group) = self.row_groups.pop_front() else {
+                    self.complete = true;
+                    break;
+                };
+                let page_reader = SerializedPageReader::new(
+                    Arc::new(self.reader.clone()),
+                    &row_group.metadata,
+                    row_group.rows,
+                    None,
+                )?;
+                self.current = Some(FixedListPreviewRowGroupScanner {
+                    page_reader,
+                    selected_start: row_group.selected_start,
+                    selected_end: row_group.selected_end,
+                    expected_rows: row_group.rows,
+                    next_row: 0,
+                    active: None,
+                    dictionary: None,
+                });
+            }
+
+            let result = self.advance_current_row_group();
+            match result {
+                Ok(true) => {
+                    self.current = None;
+                    if self.row_groups.is_empty() {
+                        self.complete = true;
+                    }
+                }
+                Ok(false) => {}
+                Err(ParquetError::NYI(_)) => {
+                    self.reader
+                        .release_abandoned_page_bodies()
+                        .map_err(|error| preview_parse_error(error.to_string()))?;
+                    self.fallback = true;
+                    self.complete = true;
+                    self.current = None;
+                    self.row_groups.clear();
+                }
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains(PAGE_DECOMPRESSION_LIMIT_SENTINEL) =>
+                {
+                    self.reader
+                        .release_abandoned_page_bodies()
+                        .map_err(|error| preview_parse_error(error.to_string()))?;
+                    self.fallback = true;
+                    self.complete = true;
+                    self.current = None;
+                    self.row_groups.clear();
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns true when the current row group has supplied every selected row.
+    fn advance_current_row_group(&mut self) -> ParquetResult<bool> {
+        let current = self.current.as_mut().expect("preview row-group scanner");
+        if current.page_reader.peek_next_page()?.is_none() {
+            finish_active_preview_row(current, &mut self.cells)?;
+            if current.next_row != current.expected_rows {
+                return Err(preview_parse_error(format!(
+                    "Parquet fixed-list preview decoded {} rows, expected {}",
+                    current.next_row, current.expected_rows,
+                )));
+            }
+            return Ok(true);
+        }
+        self.reader.ensure_next_page_body()?;
+        let Some(page) = current.page_reader.get_next_page()? else {
+            return Err(preview_parse_error(
+                "Parquet fixed-list preview page disappeared after preflight",
+            ));
+        };
+        let processed = process_fixed_list_preview_page(
+            current,
+            page,
+            &self.descriptor,
+            self.kind,
+            self.max_list_elements,
+            &mut self.cells,
+        );
+        let released = self
+            .reader
+            .release_consumed_page_bodies()
+            .map_err(|error| preview_parse_error(error.to_string()));
+        match (processed, released) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(finished), Ok(())) => Ok(finished),
+        }
+    }
+
+    fn take_display_array(&mut self, max_cell_bytes: usize) -> Result<StringArray> {
+        if !self.complete {
+            return Err(TabularkError::new(
+                ErrorCode::RuntimeFailure,
+                "Parquet fixed-list preview was consumed before completion",
+            ));
+        }
+        if self.fallback {
+            self.cells.clear();
+            return Ok(StringArray::from_iter_values(std::iter::repeat_n(
+                OVERSIZED_DISPLAY_CELL,
+                self.output_rows,
+            )));
+        }
+        if self.cells.len() != self.output_rows {
+            return Err(TabularkError::new(
+                ErrorCode::RuntimeFailure,
+                "Parquet fixed-list preview produced an inconsistent row count",
+            )
+            .with_detail("previewRows", self.cells.len())
+            .with_detail("expectedRows", self.output_rows));
+        }
+        let cells = std::mem::take(&mut self.cells);
+        match self.kind {
+            FixedListPreviewKind::TimestampMillisecond => {
+                let mut builder = ListBuilder::new(TimestampMillisecondBuilder::new());
+                let mut truncated = Vec::with_capacity(cells.len());
+                for cell in cells {
+                    match cell {
+                        FixedListPreviewCell::Null => {
+                            builder.append(false);
+                            truncated.push(false);
+                        }
+                        FixedListPreviewCell::Values {
+                            values,
+                            truncated: was_truncated,
+                        } => {
+                            for value in values {
+                                match value {
+                                    Some(bits) => builder.values().append_value(bits as i64),
+                                    None => builder.values().append_null(),
+                                }
+                            }
+                            builder.append(true);
+                            truncated.push(was_truncated);
+                        }
+                    }
+                }
+                let array = builder.finish();
+                display_bounded_list_preview(&array, &truncated, max_cell_bytes)
+            }
+            FixedListPreviewKind::Float64 => {
+                let mut builder = ListBuilder::new(Float64Builder::new());
+                let mut truncated = Vec::with_capacity(cells.len());
+                for cell in cells {
+                    match cell {
+                        FixedListPreviewCell::Null => {
+                            builder.append(false);
+                            truncated.push(false);
+                        }
+                        FixedListPreviewCell::Values {
+                            values,
+                            truncated: was_truncated,
+                        } => {
+                            for value in values {
+                                match value {
+                                    Some(bits) => {
+                                        builder.values().append_value(f64::from_bits(bits));
+                                    }
+                                    None => builder.values().append_null(),
+                                }
+                            }
+                            builder.append(true);
+                            truncated.push(was_truncated);
+                        }
+                    }
+                }
+                let array = builder.finish();
+                display_bounded_list_preview(&array, &truncated, max_cell_bytes)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FixedWidthDictionary {
+    values: Bytes,
+    len: usize,
+}
+
+impl FixedWidthDictionary {
+    fn new(mut values: Bytes, len: usize, encoding: Encoding) -> ParquetResult<Self> {
+        if encoding != Encoding::PLAIN {
+            return Err(preview_unsupported(format!(
+                "dictionary encoding {encoding} is not supported by bounded preview",
+            )));
+        }
+        let required = len
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or_else(|| preview_parse_error("Parquet preview dictionary size overflows"))?;
+        if values.len() < required {
+            return Err(preview_parse_error(
+                "Parquet preview dictionary is shorter than declared",
+            ));
+        }
+        values.truncate(required);
+        Ok(Self { values, len })
+    }
+
+    fn value(&self, index: u32) -> ParquetResult<u64> {
+        let index = usize::try_from(index)?;
+        if index >= self.len {
+            return Err(preview_parse_error(
+                "Parquet preview dictionary index is out of bounds",
+            ));
+        }
+        let start = index * std::mem::size_of::<u64>();
+        let bytes: [u8; 8] = self.values[start..start + 8]
+            .try_into()
+            .expect("validated fixed-width dictionary slice");
+        Ok(u64::from_le_bytes(bytes))
+    }
+}
+
+fn process_fixed_list_preview_page(
+    scanner: &mut FixedListPreviewRowGroupScanner,
+    page: Page,
+    descriptor: &ColumnDescPtr,
+    _kind: FixedListPreviewKind,
+    max_list_elements: usize,
+    cells: &mut Vec<FixedListPreviewCell>,
+) -> ParquetResult<bool> {
+    match page {
+        Page::DictionaryPage {
+            buf,
+            num_values,
+            encoding,
+            ..
+        } => {
+            scanner.dictionary = Some(FixedWidthDictionary::new(
+                buf,
+                usize::try_from(num_values)?,
+                encoding,
+            )?);
+            Ok(false)
+        }
+        Page::DataPage {
+            mut buf,
+            num_values,
+            encoding,
+            def_level_encoding,
+            rep_level_encoding,
+            ..
+        } => {
+            let count = usize::try_from(num_values)?;
+            let repetition = take_v1_level_decoder(
+                &mut buf,
+                descriptor.max_rep_level(),
+                rep_level_encoding,
+                count,
+            )?;
+            let definition = take_v1_level_decoder(
+                &mut buf,
+                descriptor.max_def_level(),
+                def_level_encoding,
+                count,
+            )?;
+            let dictionary = scanner.dictionary.clone();
+            let values = FixedWidthValueDecoder::new(buf, encoding, count, dictionary.as_ref())?;
+            process_fixed_list_preview_values(
+                scanner,
+                repetition,
+                definition,
+                values,
+                FixedListPreviewPagePlan {
+                    max_definition: descriptor.max_def_level(),
+                    value_count: count,
+                    max_list_elements,
+                },
+                cells,
+            )
+        }
+        Page::DataPageV2 {
+            buf,
+            num_values,
+            encoding,
+            def_levels_byte_len,
+            rep_levels_byte_len,
+            ..
+        } => {
+            let count = usize::try_from(num_values)?;
+            let repetition_length = usize::try_from(rep_levels_byte_len)?;
+            let definition_length = usize::try_from(def_levels_byte_len)?;
+            let values_start = repetition_length
+                .checked_add(definition_length)
+                .ok_or_else(|| preview_parse_error("Parquet V2 level lengths overflow"))?;
+            if values_start > buf.len() {
+                return Err(preview_parse_error(
+                    "Parquet V2 level streams exceed the page body",
+                ));
+            }
+            let repetition = LevelValueDecoder::new(
+                buf.slice(..repetition_length),
+                descriptor.max_rep_level(),
+                count,
+            )?;
+            let definition = LevelValueDecoder::new(
+                buf.slice(repetition_length..values_start),
+                descriptor.max_def_level(),
+                count,
+            )?;
+            let dictionary = scanner.dictionary.clone();
+            let values = FixedWidthValueDecoder::new(
+                buf.slice(values_start..),
+                encoding,
+                count,
+                dictionary.as_ref(),
+            )?;
+            process_fixed_list_preview_values(
+                scanner,
+                repetition,
+                definition,
+                values,
+                FixedListPreviewPagePlan {
+                    max_definition: descriptor.max_def_level(),
+                    value_count: count,
+                    max_list_elements,
+                },
+                cells,
+            )
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FixedListPreviewPagePlan {
+    max_definition: i16,
+    value_count: usize,
+    max_list_elements: usize,
+}
+
+fn process_fixed_list_preview_values(
+    scanner: &mut FixedListPreviewRowGroupScanner,
+    mut repetition: LevelValueDecoder,
+    mut definition: LevelValueDecoder,
+    mut values: FixedWidthValueDecoder<'_>,
+    plan: FixedListPreviewPagePlan,
+    cells: &mut Vec<FixedListPreviewCell>,
+) -> ParquetResult<bool> {
+    let FixedListPreviewPagePlan {
+        max_definition,
+        value_count: count,
+        max_list_elements,
+    } = plan;
+    let mut processed = 0_usize;
+    while processed < count {
+        let can_skip_tail = scanner.active.as_ref().is_some_and(|active| {
+            active.cell.as_ref().is_none_or(|cell| {
+                matches!(
+                    cell,
+                    FixedListPreviewCell::Values { values, .. }
+                        if values.len() >= max_list_elements
+                )
+            })
+        });
+        if can_skip_tail {
+            let skipped = skip_fixed_list_preview_tail(
+                &mut repetition,
+                &mut definition,
+                &mut values,
+                max_definition,
+                count - processed,
+            )?;
+            if skipped > 0 {
+                processed += skipped;
+                if let Some(cell) = scanner
+                    .active
+                    .as_mut()
+                    .and_then(|active| active.cell.as_mut())
+                {
+                    cell.observe_omitted_element();
+                }
+                continue;
+            }
+        }
+
+        let repetition_level = repetition
+            .next()?
+            .ok_or_else(|| preview_parse_error("Parquet preview repetition levels ended early"))?;
+        let definition_level = definition
+            .next()?
+            .ok_or_else(|| preview_parse_error("Parquet preview definition levels ended early"))?;
+        processed += 1;
+        if !(0..=max_definition).contains(&definition_level) {
+            return Err(preview_parse_error(
+                "Parquet preview definition level exceeds the LIST maximum",
+            ));
+        }
+        if repetition_level == 0 {
+            finish_active_preview_row(scanner, cells)?;
+            if scanner.next_row >= scanner.selected_end {
+                return Ok(true);
+            }
+            let row = scanner.next_row;
+            scanner.next_row += 1;
+            scanner.active = Some(ActiveFixedListPreviewRow {
+                index: row,
+                cell: (row >= scanner.selected_start).then(FixedListPreviewCell::default),
+            });
+        } else if repetition_level != 1
+            || scanner.active.is_none()
+            || definition_level < max_definition - 1
+            || scanner
+                .active
+                .as_ref()
+                .and_then(|active| active.cell.as_ref())
+                .is_some_and(|cell| matches!(cell, FixedListPreviewCell::Null))
+        {
+            return Err(preview_parse_error(
+                "Parquet preview encountered invalid LIST repetition levels",
+            ));
+        }
+
+        let retain_element = scanner
+            .active
+            .as_ref()
+            .and_then(|active| active.cell.as_ref())
+            .is_some_and(|cell| cell.can_retain_element(max_list_elements));
+        let physical_value = if definition_level == max_definition && retain_element {
+            Some(values.next()?.ok_or_else(|| {
+                preview_parse_error("Parquet preview values ended before definition levels")
+            })?)
+        } else if definition_level == max_definition {
+            values.skip_one()?;
+            None
+        } else {
+            None
+        };
+        if let Some(cell) = scanner
+            .active
+            .as_mut()
+            .and_then(|active| active.cell.as_mut())
+        {
+            match definition_level {
+                0 => cell.observe_null_list(),
+                1 => cell.observe_empty_list(),
+                2 if retain_element => cell.observe_element(None, max_list_elements),
+                2 => cell.observe_omitted_element(),
+                level if level == max_definition && retain_element => {
+                    cell.observe_element(physical_value, max_list_elements);
+                }
+                level if level == max_definition => cell.observe_omitted_element(),
+                _ => {
+                    return Err(preview_parse_error(
+                        "Parquet preview encountered invalid LIST definition levels",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Skips continuation elements after an unselected row or a retained preview
+/// prefix. Long LIST tails normally use one RLE repetition run, so this avoids
+/// decoding millions of identical levels or dictionary indices one at a time.
+fn skip_fixed_list_preview_tail(
+    repetition: &mut LevelValueDecoder,
+    definition: &mut LevelValueDecoder,
+    values: &mut FixedWidthValueDecoder<'_>,
+    max_definition: i16,
+    max_count: usize,
+) -> ParquetResult<usize> {
+    let skipped = repetition.skip_repeated(1, max_count)?;
+    let mut definitions = 0_usize;
+    let mut physical_values = 0_usize;
+    while definitions < skipped {
+        let (level, run_length) = definition
+            .consume_run(skipped - definitions)?
+            .ok_or_else(|| preview_parse_error("Parquet preview definition levels ended early"))?;
+        if level != max_definition - 1 && level != max_definition {
+            return Err(preview_parse_error(
+                "Parquet preview encountered invalid LIST continuation levels",
+            ));
+        }
+        if level == max_definition {
+            physical_values = physical_values.checked_add(run_length).ok_or_else(|| {
+                preview_parse_error("Parquet preview physical value count overflows")
+            })?;
+        }
+        definitions += run_length;
+    }
+    values.skip_exact(physical_values)?;
+    Ok(skipped)
+}
+
+fn finish_active_preview_row(
+    scanner: &mut FixedListPreviewRowGroupScanner,
+    cells: &mut Vec<FixedListPreviewCell>,
+) -> ParquetResult<()> {
+    let Some(active) = scanner.active.take() else {
+        return Ok(());
+    };
+    if active.index >= scanner.selected_start && active.index < scanner.selected_end {
+        cells.push(active.cell.ok_or_else(|| {
+            preview_parse_error("Parquet selected preview row did not retain a cell")
+        })?);
+    }
+    Ok(())
+}
+
+enum FixedWidthValueDecoder<'a> {
+    Plain {
+        bytes: Bytes,
+        offset: usize,
+        values_left: usize,
+    },
+    Dictionary {
+        indices: HybridRleDecoder,
+        dictionary: &'a FixedWidthDictionary,
+    },
+}
+
+impl<'a> FixedWidthValueDecoder<'a> {
+    fn new(
+        bytes: Bytes,
+        encoding: Encoding,
+        values_upper_bound: usize,
+        dictionary: Option<&'a FixedWidthDictionary>,
+    ) -> ParquetResult<Self> {
+        match encoding {
+            Encoding::PLAIN => Ok(Self::Plain {
+                bytes,
+                offset: 0,
+                values_left: values_upper_bound,
+            }),
+            Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => {
+                let dictionary = dictionary.ok_or_else(|| {
+                    preview_parse_error("Parquet dictionary data page has no dictionary")
+                })?;
+                let bit_width = bytes.first().copied().ok_or_else(|| {
+                    preview_parse_error("Parquet dictionary index stream is empty")
+                })?;
+                if bit_width > 32 {
+                    return Err(preview_parse_error(
+                        "Parquet dictionary index bit width exceeds 32",
+                    ));
+                }
+                Ok(Self::Dictionary {
+                    indices: HybridRleDecoder::new(bytes.slice(1..), bit_width, values_upper_bound),
+                    dictionary,
+                })
+            }
+            _ => Err(preview_unsupported(format!(
+                "value encoding {encoding} is not supported by bounded preview",
+            ))),
+        }
+    }
+
+    fn next(&mut self) -> ParquetResult<Option<u64>> {
+        match self {
+            Self::Plain {
+                bytes,
+                offset,
+                values_left,
+            } => {
+                if *values_left == 0 {
+                    return Ok(None);
+                }
+                let end = offset
+                    .checked_add(8)
+                    .ok_or_else(|| preview_parse_error("Parquet plain value offset overflows"))?;
+                let slice = bytes
+                    .get(*offset..end)
+                    .ok_or_else(|| preview_parse_error("Parquet plain values ended early"))?;
+                let raw = u64::from_le_bytes(slice.try_into().expect("eight-byte value slice"));
+                *offset = end;
+                *values_left -= 1;
+                Ok(Some(raw))
+            }
+            Self::Dictionary {
+                indices,
+                dictionary,
+            } => indices
+                .next()?
+                .map(|index| dictionary.value(index))
+                .transpose(),
+        }
+    }
+
+    fn skip_one(&mut self) -> ParquetResult<()> {
+        self.skip_exact(1)
+    }
+
+    fn skip_exact(&mut self, count: usize) -> ParquetResult<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        match self {
+            Self::Plain {
+                bytes,
+                offset,
+                values_left,
+            } => {
+                if *values_left < count {
+                    return Err(preview_parse_error(
+                        "Parquet plain values ended before definition levels",
+                    ));
+                }
+                let byte_length = count
+                    .checked_mul(8)
+                    .ok_or_else(|| preview_parse_error("Parquet plain value length overflows"))?;
+                let end = offset
+                    .checked_add(byte_length)
+                    .ok_or_else(|| preview_parse_error("Parquet plain value offset overflows"))?;
+                if end > bytes.len() {
+                    return Err(preview_parse_error("Parquet plain values ended early"));
+                }
+                *offset = end;
+                *values_left -= count;
+                Ok(())
+            }
+            Self::Dictionary { indices, .. } => {
+                if indices.skip(count)? == count {
+                    Ok(())
+                } else {
+                    Err(preview_parse_error(
+                        "Parquet dictionary indices ended before definition levels",
+                    ))
+                }
+            }
+        }
+    }
+}
+
+enum LevelValueDecoder {
+    Constant { value: i16, remaining: usize },
+    Hybrid(HybridRleDecoder),
+}
+
+impl LevelValueDecoder {
+    fn new(bytes: Bytes, max_level: i16, count: usize) -> ParquetResult<Self> {
+        if max_level < 0 {
+            return Err(preview_parse_error(
+                "Parquet preview level maximum is negative",
+            ));
+        }
+        if max_level == 0 {
+            return Ok(Self::Constant {
+                value: 0,
+                remaining: count,
+            });
+        }
+        let bit_width = u16::BITS - (max_level as u16).leading_zeros();
+        Ok(Self::Hybrid(HybridRleDecoder::new(
+            bytes,
+            u8::try_from(bit_width)?,
+            count,
+        )))
+    }
+
+    fn next(&mut self) -> ParquetResult<Option<i16>> {
+        self.consume_run(1).map(|run| run.map(|(value, _)| value))
+    }
+
+    fn consume_run(&mut self, max_count: usize) -> ParquetResult<Option<(i16, usize)>> {
+        if max_count == 0 {
+            return Ok(None);
+        }
+        match self {
+            Self::Constant { value, remaining } => {
+                if *remaining == 0 {
+                    Ok(None)
+                } else {
+                    let consumed = max_count.min(*remaining);
+                    *remaining -= consumed;
+                    Ok(Some((*value, consumed)))
+                }
+            }
+            Self::Hybrid(decoder) => decoder
+                .consume_run(max_count)
+                .map(|run| run.map(|(value, count)| (value as i16, count))),
+        }
+    }
+
+    fn skip_repeated(&mut self, expected: i16, max_count: usize) -> ParquetResult<usize> {
+        match self {
+            Self::Constant { value, remaining } => {
+                if *value != expected {
+                    Ok(0)
+                } else {
+                    let skipped = max_count.min(*remaining);
+                    *remaining -= skipped;
+                    Ok(skipped)
+                }
+            }
+            Self::Hybrid(decoder) => decoder.skip_repeated(expected as u32, max_count),
+        }
+    }
+}
+
+fn take_v1_level_decoder(
+    bytes: &mut Bytes,
+    max_level: i16,
+    encoding: Encoding,
+    count: usize,
+) -> ParquetResult<LevelValueDecoder> {
+    if max_level == 0 {
+        return LevelValueDecoder::new(Bytes::new(), max_level, count);
+    }
+    if encoding != Encoding::RLE {
+        return Err(preview_unsupported(format!(
+            "level encoding {encoding} is not supported by bounded preview",
+        )));
+    }
+    let length_bytes = bytes
+        .get(..4)
+        .ok_or_else(|| preview_parse_error("Parquet V1 level stream has no length prefix"))?;
+    let length = i32::from_le_bytes(
+        length_bytes
+            .try_into()
+            .expect("four-byte level length prefix"),
+    );
+    let length = usize::try_from(length)
+        .map_err(|_| preview_parse_error("Parquet V1 level stream has a negative length"))?;
+    let end = 4_usize
+        .checked_add(length)
+        .ok_or_else(|| preview_parse_error("Parquet V1 level stream length overflows"))?;
+    if end > bytes.len() {
+        return Err(preview_parse_error(
+            "Parquet V1 level stream exceeds the page body",
+        ));
+    }
+    let encoded = bytes.slice(4..end);
+    *bytes = bytes.slice(end..);
+    LevelValueDecoder::new(encoded, max_level, count)
+}
+
+#[derive(Debug)]
+enum HybridRleRun {
+    Empty,
+    Repeated {
+        value: u32,
+        remaining: usize,
+    },
+    BitPacked {
+        bytes: Bytes,
+        bit_offset: usize,
+        remaining: usize,
+    },
+}
+
+#[derive(Debug)]
+struct HybridRleDecoder {
+    bytes: Bytes,
+    offset: usize,
+    bit_width: u8,
+    values_left: usize,
+    run: HybridRleRun,
+}
+
+impl HybridRleDecoder {
+    fn new(bytes: Bytes, bit_width: u8, values_left: usize) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            bit_width,
+            values_left,
+            run: HybridRleRun::Empty,
+        }
+    }
+
+    fn next(&mut self) -> ParquetResult<Option<u32>> {
+        self.consume_run(1).map(|run| run.map(|(value, _)| value))
+    }
+
+    fn peek(&mut self) -> ParquetResult<Option<u32>> {
+        if self.values_left == 0 {
+            return Ok(None);
+        }
+        self.ensure_run()?;
+        match &self.run {
+            HybridRleRun::Repeated { value, .. } => Ok(Some(*value)),
+            HybridRleRun::BitPacked {
+                bytes, bit_offset, ..
+            } => read_packed_u32(bytes, *bit_offset, self.bit_width).map(Some),
+            HybridRleRun::Empty => unreachable!("ensure_run populated a run"),
+        }
+    }
+
+    /// Consumes the longest same-valued prefix of the active hybrid run, up
+    /// to `max_count`. RLE runs are handled in O(1); bit-packed runs scan only
+    /// until their next value transition.
+    fn consume_run(&mut self, max_count: usize) -> ParquetResult<Option<(u32, usize)>> {
+        if max_count == 0 || self.values_left == 0 {
+            return Ok(None);
+        }
+        self.ensure_run()?;
+        let (value, consumed) = match &mut self.run {
+            HybridRleRun::Repeated { value, remaining } => {
+                let consumed = max_count.min(*remaining).min(self.values_left);
+                (*value, consumed)
+            }
+            HybridRleRun::BitPacked {
+                bytes,
+                bit_offset,
+                remaining,
+            } => {
+                let available = max_count.min(*remaining).min(self.values_left);
+                let first = read_packed_u32(bytes, *bit_offset, self.bit_width)?;
+                let mut consumed = 1_usize;
+                while consumed < available {
+                    let relative_bits = consumed
+                        .checked_mul(usize::from(self.bit_width))
+                        .ok_or_else(|| preview_parse_error("Parquet bit offset overflows"))?;
+                    let next_offset = bit_offset
+                        .checked_add(relative_bits)
+                        .ok_or_else(|| preview_parse_error("Parquet bit offset overflows"))?;
+                    if read_packed_u32(bytes, next_offset, self.bit_width)? != first {
+                        break;
+                    }
+                    consumed += 1;
+                }
+                (first, consumed)
+            }
+            HybridRleRun::Empty => unreachable!("ensure_run populated a run"),
+        };
+        match &mut self.run {
+            HybridRleRun::Repeated { remaining, .. } => *remaining -= consumed,
+            HybridRleRun::BitPacked {
+                bit_offset,
+                remaining,
+                ..
+            } => {
+                let consumed_bits = consumed
+                    .checked_mul(usize::from(self.bit_width))
+                    .ok_or_else(|| preview_parse_error("Parquet bit offset overflows"))?;
+                *bit_offset = bit_offset
+                    .checked_add(consumed_bits)
+                    .ok_or_else(|| preview_parse_error("Parquet bit offset overflows"))?;
+                *remaining -= consumed;
+            }
+            HybridRleRun::Empty => unreachable!("ensure_run populated a run"),
+        }
+        self.values_left -= consumed;
+        if matches!(
+            self.run,
+            HybridRleRun::Repeated { remaining: 0, .. }
+                | HybridRleRun::BitPacked { remaining: 0, .. }
+        ) {
+            self.run = HybridRleRun::Empty;
+        }
+        Ok(Some((value, consumed)))
+    }
+
+    fn skip_repeated(&mut self, expected: u32, max_count: usize) -> ParquetResult<usize> {
+        let mut skipped = 0_usize;
+        while skipped < max_count && self.peek()? == Some(expected) {
+            let (_, consumed) = self
+                .consume_run(max_count - skipped)?
+                .expect("peeked hybrid RLE value");
+            skipped += consumed;
+        }
+        Ok(skipped)
+    }
+
+    fn skip(&mut self, mut count: usize) -> ParquetResult<usize> {
+        let requested = count;
+        while count > 0 && self.values_left > 0 {
+            self.ensure_run()?;
+            let available = match &self.run {
+                HybridRleRun::Repeated { remaining, .. }
+                | HybridRleRun::BitPacked { remaining, .. } => *remaining,
+                HybridRleRun::Empty => unreachable!("ensure_run populated a run"),
+            };
+            let skipped = count.min(available).min(self.values_left);
+            match &mut self.run {
+                HybridRleRun::Repeated { remaining, .. } => *remaining -= skipped,
+                HybridRleRun::BitPacked {
+                    bit_offset,
+                    remaining,
+                    ..
+                } => {
+                    *bit_offset = bit_offset
+                        .checked_add(skipped.saturating_mul(usize::from(self.bit_width)))
+                        .ok_or_else(|| preview_parse_error("Parquet bit offset overflows"))?;
+                    *remaining -= skipped;
+                }
+                HybridRleRun::Empty => unreachable!("ensure_run populated a run"),
+            }
+            self.values_left -= skipped;
+            count -= skipped;
+            if matches!(
+                self.run,
+                HybridRleRun::Repeated { remaining: 0, .. }
+                    | HybridRleRun::BitPacked { remaining: 0, .. }
+            ) {
+                self.run = HybridRleRun::Empty;
+            }
+        }
+        Ok(requested - count)
+    }
+
+    fn ensure_run(&mut self) -> ParquetResult<()> {
+        if !matches!(self.run, HybridRleRun::Empty) {
+            return Ok(());
+        }
+        let header = read_unsigned_varint(&self.bytes, &mut self.offset)?;
+        if header == 0 {
+            return Err(preview_parse_error("Parquet RLE run header is zero"));
+        }
+        if header & 1 == 0 {
+            let remaining = usize::try_from(header >> 1)?;
+            let byte_width = usize::from(self.bit_width).div_ceil(8);
+            let end = self.offset.checked_add(byte_width).ok_or_else(|| {
+                preview_parse_error("Parquet RLE repeated value length overflows")
+            })?;
+            let encoded = self
+                .bytes
+                .get(self.offset..end)
+                .ok_or_else(|| preview_parse_error("Parquet RLE repeated value ended early"))?;
+            let mut value = 0_u32;
+            for (shift, byte) in encoded.iter().copied().enumerate() {
+                value |= u32::from(byte) << (shift * 8);
+            }
+            self.offset = end;
+            self.run = HybridRleRun::Repeated { value, remaining };
+        } else {
+            let groups = usize::try_from(header >> 1)?;
+            let remaining = groups
+                .checked_mul(8)
+                .ok_or_else(|| preview_parse_error("Parquet bit-packed run length overflows"))?;
+            if remaining == 0 {
+                return Err(preview_parse_error(
+                    "Parquet bit-packed run has no value groups",
+                ));
+            }
+            let byte_length = groups
+                .checked_mul(usize::from(self.bit_width))
+                .ok_or_else(|| preview_parse_error("Parquet bit-packed byte length overflows"))?;
+            let end = self
+                .offset
+                .checked_add(byte_length)
+                .ok_or_else(|| preview_parse_error("Parquet bit-packed stream offset overflows"))?;
+            if end > self.bytes.len() {
+                return Err(preview_parse_error("Parquet bit-packed stream ended early"));
+            }
+            let bytes = self.bytes.slice(self.offset..end);
+            self.offset = end;
+            self.run = HybridRleRun::BitPacked {
+                bytes,
+                bit_offset: 0,
+                remaining,
+            };
+        }
+        Ok(())
+    }
+}
+
+fn read_unsigned_varint(bytes: &[u8], offset: &mut usize) -> ParquetResult<u64> {
+    let mut value = 0_u64;
+    for shift in (0..70).step_by(7) {
+        let byte = *bytes
+            .get(*offset)
+            .ok_or_else(|| preview_parse_error("Parquet RLE run header ended early"))?;
+        *offset = offset
+            .checked_add(1)
+            .ok_or_else(|| preview_parse_error("Parquet RLE offset overflows"))?;
+        if shift == 63 && byte & 0x7e != 0 {
+            return Err(preview_parse_error("Parquet RLE run header overflows u64"));
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(preview_parse_error(
+        "Parquet RLE run header exceeds ten bytes",
+    ))
+}
+
+fn read_packed_u32(bytes: &[u8], bit_offset: usize, bit_width: u8) -> ParquetResult<u32> {
+    if bit_width == 0 {
+        return Ok(0);
+    }
+    let mut value = 0_u32;
+    for bit in 0..usize::from(bit_width) {
+        let source = bit_offset
+            .checked_add(bit)
+            .ok_or_else(|| preview_parse_error("Parquet packed bit offset overflows"))?;
+        let byte = *bytes
+            .get(source / 8)
+            .ok_or_else(|| preview_parse_error("Parquet packed value exceeds its run buffer"))?;
+        value |= u32::from((byte >> (source % 8)) & 1) << bit;
+    }
+    Ok(value)
+}
+
+fn preview_parse_error(message: impl Into<String>) -> ParquetError {
+    ParquetError::General(message.into())
+}
+
+fn preview_unsupported(message: impl Into<String>) -> ParquetError {
+    ParquetError::NYI(message.into())
+}
+
+fn fixed_list_preview_specs(
+    metadata: &ArrowReaderMetadata,
+    source_columns: &[usize],
+) -> Vec<FixedListPreviewSpec> {
+    let parquet_schema = metadata.parquet_schema();
+    let arrow_schema = metadata.schema();
+    let leaves = parquet_schema.columns();
+    source_columns
+        .iter()
+        .copied()
+        .filter_map(|source_column| {
+            let field = arrow_schema.fields().get(source_column)?;
+            if !field.is_nullable() {
+                return None;
+            }
+            let (child, kind, physical) = match field.data_type() {
+                ArrowDataType::List(child)
+                    if child.is_nullable()
+                        && child.data_type()
+                            == &ArrowDataType::Timestamp(ArrowTimeUnit::Millisecond, None) =>
+                {
+                    (
+                        child,
+                        FixedListPreviewKind::TimestampMillisecond,
+                        ParquetPhysicalType::INT64,
+                    )
+                }
+                ArrowDataType::List(child)
+                    if child.is_nullable() && child.data_type() == &ArrowDataType::Float64 =>
+                {
+                    (
+                        child,
+                        FixedListPreviewKind::Float64,
+                        ParquetPhysicalType::DOUBLE,
+                    )
+                }
+                _ => return None,
+            };
+            let projection = ProjectionMask::roots(parquet_schema, [source_column]);
+            let mut projected = leaves
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| projection.leaf_included(*index));
+            let (leaf_column, descriptor) = projected.next()?;
+            if projected.next().is_some()
+                || descriptor.physical_type() != physical
+                || descriptor.max_rep_level() != 1
+                || descriptor.max_def_level() != 3
+            {
+                return None;
+            }
+            let path = descriptor.path().parts();
+            if path.len() != 3
+                || path.first().map(String::as_str) != Some(field.name())
+                || path.get(1).map(String::as_str) != Some("list")
+                || path.get(2).map(String::as_str) != Some(child.name())
+            {
+                return None;
+            }
+            Some(FixedListPreviewSpec {
+                source_column,
+                leaf_column,
+                descriptor: descriptor.clone(),
+                kind,
+            })
+        })
+        .collect()
 }
 
 impl ParquetReadOperation {
@@ -2112,59 +3592,106 @@ impl ParquetReadOperation {
         self.reader.clear_missing()?;
         let row_count =
             usize::try_from(self.plan.returned_range.row_count()).map_err(|_| invalid_range())?;
-        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
-            self.reader.clone(),
-            self.reader_metadata.clone(),
-        )
-        .with_projection(self.projection.clone())
-        .with_row_groups(self.row_groups.clone())
-        .with_offset(self.row_offset)
-        .with_limit(row_count)
-        .with_batch_size(self.limits.max_batch_rows.min(row_count.max(1)));
-        let reader = match builder.build() {
-            Ok(reader) => reader,
-            Err(error) => return self.resolve_missing_or_error(error),
-        };
-        let mut decoded_bytes = 0_usize;
+        let bounded_preview = !self.preview_scanners.is_empty();
         let mut batches = Vec::new();
-        for batch in reader {
-            let batch = match batch {
-                Ok(batch) => batch,
-                Err(error) => return self.resolve_missing_or_error(error.into()),
+        let needs_standard_decode = !self.standard_source_columns.is_empty()
+            && (!bounded_preview || self.standard_display_arrays.is_none());
+        if needs_standard_decode {
+            let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                self.reader.clone(),
+                self.reader_metadata.clone(),
+            )
+            .with_projection(self.projection.clone())
+            .with_row_groups(self.row_groups.clone())
+            .with_offset(self.row_offset)
+            .with_limit(row_count)
+            .with_batch_size(self.limits.max_batch_rows.min(row_count.max(1)));
+            let reader = match builder.build() {
+                Ok(reader) => reader,
+                Err(error) => return self.resolve_missing_or_error(error),
             };
-            decoded_bytes = decoded_bytes
-                .checked_add(batch.get_array_memory_size())
-                .ok_or_else(|| {
-                    TabularkError::new(
-                        ErrorCode::ResourceLimit,
-                        "Parquet decoded array accounting overflows",
-                    )
-                })?;
-            if decoded_bytes > self.limits.arrow.max_decoded_bytes {
-                return Err(resource_limit(
-                    "decompressed-pages",
-                    u64::try_from(decoded_bytes).unwrap_or(u64::MAX),
-                    u64::try_from(self.limits.arrow.max_decoded_bytes).unwrap_or(u64::MAX),
-                ));
+            let mut decoded_bytes = 0_usize;
+            for batch in reader {
+                let batch = match batch {
+                    Ok(batch) => batch,
+                    Err(error) => return self.resolve_missing_or_error(error.into()),
+                };
+                decoded_bytes = decoded_bytes
+                    .checked_add(batch.get_array_memory_size())
+                    .ok_or_else(|| {
+                        TabularkError::new(
+                            ErrorCode::ResourceLimit,
+                            "Parquet decoded array accounting overflows",
+                        )
+                    })?;
+                if decoded_bytes > self.limits.arrow.max_decoded_bytes {
+                    return Err(resource_limit(
+                        "decompressed-pages",
+                        u64::try_from(decoded_bytes).unwrap_or(u64::MAX),
+                        u64::try_from(self.limits.arrow.max_decoded_bytes).unwrap_or(u64::MAX),
+                    ));
+                }
+                let combined_bytes = decoded_bytes
+                    .checked_add(self.reader.retained_bytes()?)
+                    .ok_or_else(|| {
+                        TabularkError::new(
+                            ErrorCode::ResourceLimit,
+                            "Parquet combined compressed and decoded byte accounting overflows",
+                        )
+                    })?;
+                if combined_bytes > self.reader.cache_limit(self.limits.max_operation_bytes) {
+                    return Err(resource_limit(
+                        "parquet-operation",
+                        u64::try_from(combined_bytes).unwrap_or(u64::MAX),
+                        u64::try_from(self.reader.cache_limit(self.limits.max_operation_bytes))
+                            .unwrap_or(u64::MAX),
+                    ));
+                }
+                batches.push(batch);
             }
-            let combined_bytes = decoded_bytes
-                .checked_add(self.reader.retained_bytes()?)
-                .ok_or_else(|| {
-                    TabularkError::new(
-                        ErrorCode::ResourceLimit,
-                        "Parquet combined compressed and decoded byte accounting overflows",
-                    )
-                })?;
-            if combined_bytes > self.reader.cache_limit(self.limits.max_operation_bytes) {
-                return Err(resource_limit(
-                    "parquet-operation",
-                    u64::try_from(combined_bytes).unwrap_or(u64::MAX),
-                    u64::try_from(self.reader.cache_limit(self.limits.max_operation_bytes))
-                        .unwrap_or(u64::MAX),
-                ));
-            }
-            batches.push(batch);
         }
+
+        if bounded_preview {
+            if self.standard_display_arrays.is_none() {
+                let displays = if self.standard_source_columns.is_empty() {
+                    Vec::new()
+                } else {
+                    projected_record_batches_to_display_arrays(
+                        self.reader_metadata.schema(),
+                        &batches,
+                        &self.standard_source_columns,
+                        self.plan.returned_range,
+                        &self.limits.arrow,
+                    )?
+                };
+                self.standard_display_arrays = Some(displays);
+                drop(batches);
+                self.reader.release_consumed_page_bodies()?;
+            }
+            for index in 0..self.preview_scanners.len() {
+                let result = self.preview_scanners[index].advance();
+                if let Err(error) = result {
+                    return self.resolve_missing_or_error(error);
+                }
+            }
+            let mut displays = self.standard_display_arrays.take().unwrap_or_default();
+            for scanner in &mut self.preview_scanners {
+                displays.push((
+                    scanner.source_column,
+                    scanner.take_display_array(self.limits.arrow.max_display_cell_bytes)?,
+                ));
+            }
+            displays.sort_by_key(|(source_column, _)| *source_column);
+            let batch = encode_display_string_arrays(
+                displays,
+                self.plan.returned_range,
+                self.plan.complete,
+                &self.limits.arrow,
+            )?;
+            self.reader.release_skipped_page_bodies()?;
+            return Ok(Some(batch));
+        }
+
         let batch = if self.display_only {
             encode_projected_record_batches_for_display(
                 self.reader_metadata.schema(),
@@ -2938,24 +4465,29 @@ mod tests {
     use std::sync::Arc;
 
     use ::parquet::arrow::ArrowWriter;
-    use ::parquet::basic::Compression;
+    use ::parquet::basic::{Compression, Encoding};
     use ::parquet::data_type::{Int96, Int96Type};
     use ::parquet::errors::ParquetError;
     use ::parquet::file::properties::{WriterProperties, WriterVersion};
     use ::parquet::file::reader::ChunkReader;
     use ::parquet::file::writer::SerializedFileWriter;
     use ::parquet::schema::parser::parse_message_type;
-    use arrow_array::types::Int32Type;
-    use arrow_array::{Decimal128Array, Int32Array, ListArray, RecordBatch, StringArray};
+    use ::parquet::schema::types::ColumnPath;
+    use arrow_array::types::{Float64Type, Int32Type, TimestampMillisecondType};
+    use arrow_array::{Array, Decimal128Array, Int32Array, ListArray, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+    use bytes::Bytes;
 
     use super::{
-        CompactPageHeader, LAZY_PAGE_TRACKING_BYTES, MAX_LAZY_DECODE_ATTEMPTS,
-        MAX_LAZY_PAGE_HEADER_OBSERVATIONS, OpenedParquetSource, PAGE_HEADER_GUARD_SENTINEL,
+        CompactPageHeader, DISPLAY_PREVIEW_ELEMENT_ESTIMATED_BYTES,
+        DISPLAY_PREVIEW_MAX_LIST_ELEMENTS, FixedListPreviewCell, HybridRleDecoder,
+        LAZY_PAGE_TRACKING_BYTES, MAX_LAZY_DECODE_ATTEMPTS, MAX_LAZY_PAGE_HEADER_OBSERVATIONS,
+        OVERSIZED_DISPLAY_CELL, OpenedParquetSource, PAGE_HEADER_GUARD_SENTINEL,
         PageBodyGuardDecision, PageBodyRange, PageDecompressionGuard, ParquetLimits,
         ParquetOpenOperation, ParquetOptions, ParquetReadBytesAction, ParquetReadStart,
         SparseChunkReader, coalesce_source_ranges, compact_page_header, ensure_action_peak_budget,
-        ensure_lazy_decode_attempt_budget, max_lazy_decode_attempts, parquet_error,
+        ensure_lazy_decode_attempt_budget, fixed_list_preview_element_limit,
+        max_lazy_decode_attempts, parquet_error,
     };
     use crate::arrow::ArrowIpcLimits;
     use crate::error::ErrorCode;
@@ -2979,6 +4511,56 @@ mod tests {
             ParquetError::General("zstd content checksum mismatch".into()),
         );
         assert_eq!(malformed.code(), ErrorCode::ParseFailed);
+    }
+
+    #[test]
+    fn hybrid_rle_preview_decoder_skips_runs_without_losing_alignment() {
+        // Five repeated 2-bit values followed by one bit-packed group:
+        // [3, 3, 3, 3, 3, 0, 1, 2, 3, 0, 1, 2, 3].
+        let encoded = Bytes::from_static(&[0x0a, 0x03, 0x03, 0xe4, 0xe4]);
+        let mut decoder = HybridRleDecoder::new(encoded, 2, 13);
+        assert_eq!(decoder.skip_repeated(3, usize::MAX).expect("RLE skip"), 5);
+        assert_eq!(decoder.next().expect("first packed value"), Some(0));
+        assert_eq!(decoder.next().expect("second packed value"), Some(1));
+        assert_eq!(decoder.skip(3).expect("packed skip"), 3);
+        assert_eq!(decoder.next().expect("aligned packed value"), Some(1));
+        assert_eq!(decoder.skip(2).expect("remaining packed values"), 2);
+        assert_eq!(decoder.next().expect("decoder exhausted"), None);
+    }
+
+    #[test]
+    fn hybrid_rle_preview_decoder_rejects_malformed_run_headers() {
+        let mut empty_bitpacked = HybridRleDecoder::new(Bytes::from_static(&[0x01]), 1, 1);
+        assert!(empty_bitpacked.next().is_err());
+
+        let mut overflowing = HybridRleDecoder::new(Bytes::from(vec![0x80; 10]), 1, 1);
+        assert!(overflowing.next().is_err());
+    }
+
+    #[test]
+    fn fixed_list_preview_prefix_scales_down_to_its_total_decoded_budget() {
+        let rows = 1_000_usize;
+        let cell_bytes = rows * std::mem::size_of::<FixedListPreviewCell>();
+        assert_eq!(
+            fixed_list_preview_element_limit(rows, cell_bytes - 1).expect("fallback plan"),
+            None,
+        );
+        assert_eq!(
+            fixed_list_preview_element_limit(rows, cell_bytes).expect("zero-prefix plan"),
+            Some(0),
+        );
+        assert_eq!(
+            fixed_list_preview_element_limit(
+                rows,
+                cell_bytes + rows * DISPLAY_PREVIEW_ELEMENT_ESTIMATED_BYTES * 7,
+            )
+            .expect("seven-element plan"),
+            Some(7),
+        );
+        assert_eq!(
+            fixed_list_preview_element_limit(rows, usize::MAX).expect("capped plan"),
+            Some(DISPLAY_PREVIEW_MAX_LIST_ELEMENTS),
+        );
     }
 
     fn cache_segment(reader: &SparseChunkReader, offset: u64, bytes: &[u8]) {
@@ -3833,6 +5415,81 @@ mod tests {
         }
     }
 
+    fn read_display(
+        source: &OpenedParquetSource,
+        bytes: &[u8],
+        request: RangeRequest,
+    ) -> TypedTableBatch {
+        let mut operation = match source
+            .begin_display_read(request)
+            .expect("begin display read")
+        {
+            ParquetReadStart::Pending(operation) => operation,
+            ParquetReadStart::Complete(batch) => return batch,
+        };
+        loop {
+            let action = operation.next_action().expect("display read action");
+            let start = usize::try_from(action.offset).expect("offset");
+            let length = usize::try_from(action.length).expect("length");
+            let result = operation
+                .feed_owned(
+                    action.offset,
+                    bytes[start..start + length].to_vec(),
+                    start + length == bytes.len(),
+                )
+                .expect("advance display read");
+            if let Some(batch) = result {
+                return batch;
+            }
+        }
+    }
+
+    fn display_values(batch: &TypedTableBatch, column: usize) -> Vec<Option<String>> {
+        fn slice(batch: &TypedTableBatch, buffer: crate::model::BufferSlice) -> &[u8] {
+            let bytes = batch.buffers()
+                [usize::try_from(buffer.buffer_index()).expect("buffer index")]
+            .data();
+            let start = usize::try_from(buffer.byte_offset()).expect("buffer offset");
+            let end = start + usize::try_from(buffer.byte_length()).expect("buffer length");
+            &bytes[start..end]
+        }
+
+        let descriptor = batch.columns()[column].display();
+        let (offsets, values) = match descriptor.layout() {
+            ArrayLayout::VariableWidth { offsets, values } => (*offsets, *values),
+            layout => panic!("display column must be variable-width, got {layout:?}"),
+        };
+        let offsets = slice(batch, offsets)
+            .chunks_exact(4)
+            .map(|bytes| {
+                usize::try_from(i32::from_le_bytes(
+                    bytes.try_into().expect("four-byte display offset"),
+                ))
+                .expect("non-negative display offset")
+            })
+            .collect::<Vec<_>>();
+        let values = slice(batch, values);
+        let validity = descriptor.validity().map(|bitmap| {
+            (
+                slice(batch, bitmap.buffer()),
+                usize::try_from(bitmap.bit_offset()).expect("validity bit offset"),
+            )
+        });
+        (0..usize::try_from(descriptor.len()).expect("display length"))
+            .map(|index| {
+                let valid = validity.as_ref().is_none_or(|(bytes, bit_offset)| {
+                    let bit = bit_offset + index;
+                    bytes[bit / 8] & (1 << (bit % 8)) != 0
+                });
+                valid.then(|| {
+                    std::str::from_utf8(&values[offsets[index]..offsets[index + 1]])
+                        .expect("UTF-8 display value")
+                        .to_owned()
+                })
+            })
+            .collect()
+    }
+
     fn int96_fixture(nanos_since_epoch: u64) -> Vec<u8> {
         let schema = Arc::new(
             parse_message_type("message schema { REQUIRED INT96 ts; }").expect("INT96 schema"),
@@ -3899,6 +5556,71 @@ mod tests {
         .expect("nested/logical writer");
         writer.write(&batch).expect("write nested/logical batch");
         writer.close().expect("close nested/logical writer");
+        bytes
+    }
+
+    fn fixed_width_list_preview_fixture(
+        dictionary_enabled: bool,
+        writer_version: WriterVersion,
+        force_plain_encoding: bool,
+    ) -> Vec<u8> {
+        let timestamp_rows = vec![
+            Some(vec![Some(0_i64), Some(1_000), None]),
+            None,
+            Some(Vec::new()),
+            Some((0..300_i64).map(|value| Some(value * 1_000)).collect()),
+        ];
+        let target_rows = vec![
+            Some(vec![Some(1.5_f64), Some(-0.0), None]),
+            None,
+            Some(Vec::new()),
+            Some(
+                (0..300)
+                    .map(|value| Some(f64::from(value) / 10.0))
+                    .collect(),
+            ),
+        ];
+        let timestamps =
+            ListArray::from_iter_primitive::<TimestampMillisecondType, _, _>(timestamp_rows);
+        let targets = ListArray::from_iter_primitive::<Float64Type, _, _>(target_rows);
+        let timestamp_element_name = match timestamps.data_type() {
+            DataType::List(child) => child.name().to_owned(),
+            data_type => panic!("timestamp fixture must be a LIST, got {data_type:?}"),
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", timestamps.data_type().clone(), true),
+            Field::new("target", targets.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(timestamps), Arc::new(targets)],
+        )
+        .expect("fixed-width LIST batch");
+        let mut properties = WriterProperties::builder()
+            .set_writer_version(writer_version)
+            .set_compression(Compression::SNAPPY)
+            .set_dictionary_enabled(dictionary_enabled)
+            .set_data_page_row_count_limit(2)
+            .set_write_batch_size(2)
+            .set_offset_index_disabled(true);
+        if force_plain_encoding {
+            properties = properties.set_encoding(Encoding::PLAIN);
+        } else {
+            properties = properties.set_column_encoding(
+                ColumnPath::new(vec![
+                    "timestamp".to_owned(),
+                    "list".to_owned(),
+                    timestamp_element_name,
+                ]),
+                Encoding::DELTA_BINARY_PACKED,
+            );
+        }
+        let properties = properties.build();
+        let mut bytes = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(properties))
+            .expect("fixed-width LIST writer");
+        writer.write(&batch).expect("write fixed-width LIST batch");
+        writer.close().expect("close fixed-width LIST writer");
         bytes
     }
 
@@ -4371,6 +6093,63 @@ mod tests {
     }
 
     #[test]
+    fn display_only_fixed_width_lists_materialize_only_a_bounded_prefix() {
+        for dictionary_enabled in [false, true] {
+            for writer_version in [WriterVersion::PARQUET_1_0, WriterVersion::PARQUET_2_0] {
+                let bytes =
+                    fixed_width_list_preview_fixture(dictionary_enabled, writer_version, true);
+                let limits = ParquetLimits::from_memory_budget(32 * 1024 * 1024).expect("limits");
+                let (source, _) = open(&bytes, limits);
+                let request = RangeRequest::new(0, 4, 0, 2).expect("fixed-list range");
+                let typed = read(&source, &bytes, request);
+                let display = read_display(&source, &bytes, request);
+
+                assert!(display.columns().iter().all(|column| {
+                    column.native().data_type() == &TableDataType::Null
+                        && matches!(column.native().layout(), ArrayLayout::Null)
+                }));
+                for column in 0..2 {
+                    let typed_values = display_values(&typed, column);
+                    let preview_values = display_values(&display, column);
+                    assert_eq!(preview_values.len(), 4);
+                    assert_eq!(preview_values[0], typed_values[0]);
+                    assert_eq!(preview_values[1], None);
+                    assert_eq!(preview_values[2].as_deref(), Some("[]"));
+                    let truncated = preview_values[3]
+                        .as_deref()
+                        .expect("large LIST preview value");
+                    assert!(
+                        truncated.ends_with("... [truncated]"),
+                        "dictionary={dictionary_enabled}, version={writer_version:?}, value={truncated}",
+                    );
+                    assert!(truncated.len() <= 16 * 1024);
+                    assert_ne!(preview_values[3], typed_values[3]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_fixed_width_preview_encoding_degrades_to_a_placeholder() {
+        let bytes = fixed_width_list_preview_fixture(false, WriterVersion::PARQUET_1_0, false);
+        let limits = ParquetLimits::from_memory_budget(32 * 1024 * 1024).expect("limits");
+        let (source, _) = open(&bytes, limits);
+        let display = read_display(
+            &source,
+            &bytes,
+            RangeRequest::new(0, 4, 0, 2).expect("fixed-list range"),
+        );
+        assert_eq!(
+            display_values(&display, 0),
+            vec![Some(OVERSIZED_DISPLAY_CELL.to_owned()); 4],
+        );
+        assert!(display.columns().iter().all(|column| {
+            column.native().data_type() == &TableDataType::Null
+                && matches!(column.native().layout(), ArrayLayout::Null)
+        }));
+    }
+
+    #[test]
     fn rejects_oversized_metadata_cardinality_before_page_reads() {
         let bytes = fixture(Compression::UNCOMPRESSED);
         let mut limits = ParquetLimits::from_memory_budget(32 * 1024 * 1024).expect("limits");
@@ -4533,9 +6312,10 @@ mod tests {
         let path = std::env::var("TABULARK_LOCAL_PARQUET_FIXTURE")
             .expect("TABULARK_LOCAL_PARQUET_FIXTURE");
         let bytes = std::fs::read(path).expect("read local Parquet fixture");
-        // Mirrors Parquet's weight-4 share of a 512 MiB engine that registers
-        // all four official adapters (total runtime weight 8).
-        let limits = ParquetLimits::from_memory_budget(128 * 1024 * 1024).expect("limits");
+        // Production receives Parquet's 128 MiB weight-4 share of a 512 MiB
+        // four-adapter engine. Exercise the fixture at half that allowance so
+        // this regression proves bounded decoding rather than budget headroom.
+        let limits = ParquetLimits::from_memory_budget(64 * 1024 * 1024).expect("limits");
         let (source, _) = open(&bytes, limits.clone());
         for row_start in [0_u64, 463, 927, 1_390, 1_822, 0] {
             let request = RangeRequest::new(row_start, 32.min(1_854 - row_start), 0, 3)
@@ -4583,6 +6363,18 @@ mod tests {
                 column.native().data_type() == &TableDataType::Null
                     && matches!(column.native().layout(), ArrayLayout::Null)
             }));
+            if row_start == 0 {
+                let timestamps = display_values(&batch, 1);
+                let targets = display_values(&batch, 2);
+                let timestamp = timestamps[0].as_deref().expect("timestamp preview");
+                let target = targets[0].as_deref().expect("target preview");
+                assert!(timestamp.starts_with("[2012-10-13T00:00:01"));
+                assert!(target.starts_with("[0.263, 0.269"));
+                assert!(timestamp.ends_with("... [truncated]"));
+                assert!(target.ends_with("... [truncated]"));
+                assert_ne!(timestamp, OVERSIZED_DISPLAY_CELL);
+                assert_ne!(target, OVERSIZED_DISPLAY_CELL);
+            }
         }
     }
 }

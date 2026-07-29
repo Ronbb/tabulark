@@ -2533,6 +2533,182 @@ pub(crate) fn encode_projected_record_batches_for_display(
     )
 }
 
+/// Formats projected Arrow batches into bounded UTF-8 columns without
+/// constructing native output descriptors. Parquet's display-only preview
+/// decoder uses this for ordinary columns while decoding oversized fixed-width
+/// lists through its bounded column path.
+#[cfg(feature = "parquet")]
+pub(crate) fn projected_record_batches_to_display_arrays(
+    schema: &ArrowSchemaRef,
+    batches: &[RecordBatch],
+    source_column_indices: &[usize],
+    returned_range: RangeRequest,
+    limits: &ArrowIpcLimits,
+) -> Result<Vec<(usize, StringArray)>> {
+    let row_count = usize::try_from(returned_range.row_count()).map_err(|_| {
+        TabularkError::new(
+            ErrorCode::ResourceLimit,
+            "projected Arrow display row count exceeds usize",
+        )
+    })?;
+    // Bounded-list previews use the other half of decoded memory while these
+    // ordinary display columns remain live. Share one aggregate output budget
+    // across all ordinary columns instead of applying it once per column.
+    let decoded_array_bytes = batches.iter().try_fold(0_usize, |total, batch| {
+        total
+            .checked_add(batch.get_array_memory_size())
+            .ok_or_else(|| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "projected Arrow display source size overflows",
+                )
+                .with_detail("resource", "typed-batch-decoded")
+            })
+    })?;
+    if decoded_array_bytes > limits.max_decoded_bytes {
+        return Err(TabularkError::new(
+            ErrorCode::ResourceLimit,
+            "projected Arrow display source exceeds the decoded-memory limit",
+        )
+        .with_detail("resource", "typed-batch-decoded")
+        .with_detail("arrayBytes", decoded_array_bytes)
+        .with_detail("maxDecodedBytes", limits.max_decoded_bytes));
+    }
+    let mut remaining_display_bytes = limits
+        .max_output_bytes
+        .min(limits.max_decoded_bytes.checked_div(2).unwrap_or(0))
+        .min(limits.max_decoded_bytes - decoded_array_bytes);
+    let mut arrays = Vec::with_capacity(source_column_indices.len());
+    for (projected_index, source_index) in source_column_indices.iter().copied().enumerate() {
+        let data_type = schema
+            .fields()
+            .get(source_index)
+            .ok_or_else(|| {
+                TabularkError::new(
+                    ErrorCode::InvalidRange,
+                    "projected Arrow display column lies outside the source schema",
+                )
+            })?
+            .data_type();
+        let mut parts = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .columns()
+                    .get(projected_index)
+                    .cloned()
+                    .ok_or_else(|| {
+                        TabularkError::new(
+                            ErrorCode::InvalidArgument,
+                            "projected Arrow display batch column count is inconsistent",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let array = match parts.len() {
+            0 => new_empty_array(data_type),
+            1 => parts.pop().expect("one projected array part"),
+            _ => normalize_array_parts(parts, data_type)?,
+        };
+        if array.len() != row_count {
+            return Err(TabularkError::new(
+                ErrorCode::InvalidArgument,
+                "projected Arrow display row count is inconsistent",
+            ));
+        }
+        let display = display_array_with_total_limit(
+            array.as_ref(),
+            limits
+                .max_display_cell_bytes
+                .min(DISPLAY_ONLY_MAX_CELL_BYTES),
+            remaining_display_bytes,
+        )?;
+        let display_bytes = display_structural_bytes(&display)?
+            .checked_add(display.value_data().len())
+            .ok_or_else(|| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "projected Arrow display byte total overflows",
+                )
+            })?;
+        remaining_display_bytes = remaining_display_bytes.saturating_sub(display_bytes);
+        arrays.push((source_index, display));
+    }
+    Ok(arrays)
+}
+
+/// Encodes already formatted UTF-8 display columns into one display-only
+/// typed batch. All native arrays are null placeholders, so callers never
+/// duplicate the source values at the Worker boundary.
+#[cfg(feature = "parquet")]
+pub(crate) fn encode_display_string_arrays(
+    arrays: Vec<(usize, StringArray)>,
+    returned_range: RangeRequest,
+    complete: bool,
+    limits: &ArrowIpcLimits,
+) -> Result<TypedTableBatch> {
+    if u64::try_from(arrays.len()).ok() != Some(returned_range.column_count()) {
+        return Err(TabularkError::new(
+            ErrorCode::InvalidArgument,
+            "display-only Arrow column count does not match the returned range",
+        ));
+    }
+    let retained_array_bytes = arrays.iter().try_fold(0_usize, |total, (_, array)| {
+        total
+            .checked_add(array.get_array_memory_size())
+            .ok_or_else(|| {
+                TabularkError::new(
+                    ErrorCode::ResourceLimit,
+                    "display-only Arrow array size overflows",
+                )
+                .with_detail("resource", "typed-batch-decoded")
+            })
+    })?;
+    if retained_array_bytes > limits.max_decoded_bytes {
+        return Err(TabularkError::new(
+            ErrorCode::ResourceLimit,
+            "display-only Arrow arrays exceed the configured decoded-memory limit",
+        )
+        .with_detail("resource", "typed-batch-decoded")
+        .with_detail("arrayBytes", retained_array_bytes)
+        .with_detail("maxDecodedBytes", limits.max_decoded_bytes));
+    }
+    let output_limit = limits
+        .max_output_bytes
+        .min(limits.max_decoded_bytes - retained_array_bytes);
+    let mut pool = BufferPoolBuilder::new(output_limit);
+    let mut columns = Vec::with_capacity(arrays.len());
+    for (source_index, array) in arrays {
+        if u64::try_from(array.len()).ok() != Some(returned_range.row_count()) {
+            return Err(TabularkError::new(
+                ErrorCode::InvalidArgument,
+                "display-only Arrow array length does not match the returned range",
+            ));
+        }
+        let native = ArrayDescriptor::new(
+            TableDataType::Null,
+            returned_range.row_count(),
+            None,
+            ArrayLayout::Null,
+        )?;
+        let display = descriptor_from_array(&array, None, &mut pool)?;
+        columns.push(TypedColumnBatch::new(
+            format!("c{source_index}"),
+            native,
+            display,
+        )?);
+    }
+    TypedTableBatch::new(
+        "table-0",
+        0,
+        1,
+        returned_range,
+        complete,
+        pool.finish(),
+        columns,
+    )
+}
+
 fn encode_projected_record_batches_with_mode(
     schema: &ArrowSchemaRef,
     batches: &[RecordBatch],
@@ -4478,6 +4654,72 @@ fn display_array_with_total_limit(
         remaining_cells = remaining_cells.saturating_sub(1);
     }
     Ok(values.finish())
+}
+
+/// Formats a bounded nested preview and marks cells whose child values were
+/// deliberately omitted by a format-specific decoder.
+#[cfg(feature = "parquet")]
+pub(crate) fn display_bounded_list_preview(
+    array: &dyn Array,
+    truncated: &[bool],
+    max_cell_bytes: usize,
+) -> Result<StringArray> {
+    if array.len() != truncated.len() {
+        return Err(TabularkError::new(
+            ErrorCode::InvalidArgument,
+            "bounded list preview truncation flags do not match the array length",
+        ));
+    }
+    let max_cell_bytes = max_cell_bytes.min(DISPLAY_ONLY_MAX_CELL_BYTES);
+    let options = FormatOptions::new()
+        .with_display_error(false)
+        .with_quoted_strings(true);
+    let formatter = ArrayFormatter::try_new(array, &options)
+        .map_err(|error| arrow_error("create bounded list display formatter", error))?;
+    let logical_nulls = array.logical_nulls();
+    let mut values = StringBuilder::new();
+    for (index, was_truncated) in truncated.iter().copied().enumerate() {
+        if logical_nulls
+            .as_ref()
+            .is_some_and(|nulls| nulls.is_null(index))
+        {
+            values.append_null();
+        } else {
+            let formatted = format_bounded_nested_display(&formatter, index, max_cell_bytes)?.value;
+            if was_truncated {
+                values.append_value(mark_bounded_nested_truncation(&formatted, max_cell_bytes));
+            } else {
+                values.append_value(formatted);
+            }
+        }
+    }
+    Ok(values.finish())
+}
+
+#[cfg(feature = "parquet")]
+fn mark_bounded_nested_truncation(value: &str, max_bytes: usize) -> String {
+    if value.ends_with(NESTED_DISPLAY_TRUNCATION_SUFFIX) {
+        return value.to_owned();
+    }
+    let suffix = if max_bytes >= NESTED_DISPLAY_TRUNCATION_SUFFIX.len() {
+        NESTED_DISPLAY_TRUNCATION_SUFFIX
+    } else {
+        ""
+    };
+    let mut prefix = value.to_owned();
+    if prefix.ends_with(']') {
+        prefix.pop();
+    }
+    if prefix != "[" && !prefix.ends_with("[ ") {
+        prefix.push_str(", ");
+    }
+    while prefix.len().saturating_add(suffix.len()) > max_bytes {
+        if prefix.pop().is_none() {
+            break;
+        }
+    }
+    prefix.push_str(suffix);
+    prefix
 }
 
 fn display_structural_bytes(array: &dyn Array) -> Result<usize> {
@@ -6440,10 +6682,12 @@ mod tests {
             false,
         )]));
         let range = RangeRequest::new(0, 1, 0, 1).expect("range");
-        let mut limits = ArrowIpcLimits::default();
-        limits.max_decoded_bytes = 1024 * 1024;
-        limits.max_output_bytes = 32 * 1024;
-        limits.max_display_cell_bytes = 1024 * 1024;
+        let limits = ArrowIpcLimits {
+            max_decoded_bytes: 1024 * 1024,
+            max_output_bytes: 32 * 1024,
+            max_display_cell_bytes: 1024 * 1024,
+            ..ArrowIpcLimits::default()
+        };
 
         let error = encode_batch(
             &schema,
