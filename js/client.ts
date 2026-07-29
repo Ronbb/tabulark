@@ -88,6 +88,7 @@ const MAX_DIAGNOSTIC_MESSAGE_LENGTH = 512;
 const MAX_PERFORMANCE_SAMPLES = 128;
 const MIN_BATCH_CACHE_ENTRY_BYTES = 4 * 1024;
 const MAX_BATCH_CACHE_ENTRIES = 512;
+const DISPLAY_ONLY_READ = Symbol.for("tabulark.internal.display-only-read.v1");
 // The core and HTTP helper are separate bundles. A shared weak store lets both
 // see the same open-options reservation without adding any observable key to
 // the public RangeSourceOpenOptions object.
@@ -151,6 +152,10 @@ export interface EngineOptions {
 
 export interface ReadRangeOptions {
   readonly signal?: AbortSignal;
+}
+
+function isDisplayOnlyRead(options: ReadRangeOptions): boolean {
+  return (options as ReadRangeOptions & Record<symbol, unknown>)[DISPLAY_ONLY_READ] === true;
 }
 
 export interface RuntimeProgress {
@@ -1099,12 +1104,14 @@ class Engine implements TabularkEngine {
         throw cancelledError();
       }
       const metadata = table.metadata;
+      const displayOnly = isDisplayOnlyRead(options);
       const key = rangeCacheKey(
         table.datasetHandle,
         metadata.tableId,
         metadata.revision,
         metadata.schema.version,
         normalized,
+        displayOnly ? "display" : undefined,
       );
       const cached = this.#rangeCache.get(key);
       if (cached) {
@@ -1120,6 +1127,7 @@ class Engine implements TabularkEngine {
           metadata.revision,
           metadata.schema.version,
           startedAt !== undefined,
+          displayOnly,
         );
       }
       const backing = await this.#joinRangeSingleflight(flight, options.signal);
@@ -1154,6 +1162,7 @@ class Engine implements TabularkEngine {
     revision: number,
     schemaVersion: number,
     measure: boolean,
+    displayOnly: boolean,
   ): RangeSingleflight {
     const controller = new AbortController();
     const flight: RangeSingleflight = {
@@ -1184,7 +1193,11 @@ class Engine implements TabularkEngine {
     };
     flight.promise = this.#rpc.request<WireTableBatch>(
       "readRange",
-      { tableHandle: table.handle, range },
+      {
+        tableHandle: table.handle,
+        range,
+        ...(displayOnly ? { displayOnly: true } : {}),
+      },
       "batch",
       {
         signal: controller.signal,

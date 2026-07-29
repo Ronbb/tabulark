@@ -29,6 +29,11 @@ test("official adapter manifest owns stable IDs, entrypoints, exports, and artif
     "./parquet",
     "./excel",
   ]);
+  assert.equal(
+    manifest.adapters.find(({ id }) => id === "tabulark:parquet")?.resources.runtimeWeight,
+    4,
+    "Parquet keeps a 128 MiB runtime share under the 512 MiB all-adapter budget",
+  );
   assert.equal(new Set(manifest.adapters.map(({ id }) => id)).size, manifest.adapters.length);
   assert.equal(
     new Set(manifest.adapters.map(({ wasm }) => wasm.outputDirectory)).size,

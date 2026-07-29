@@ -20,7 +20,10 @@ use ::parquet::file::reader::{ChunkReader, Length};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::arrow::{ArrowIpcLimits, encode_projected_record_batches, exact_metadata};
+use crate::arrow::{
+    ArrowIpcLimits, encode_projected_record_batches, encode_projected_record_batches_for_display,
+    exact_metadata,
+};
 use crate::error::{ErrorCode, Result, TabularkError, zstd_decompression_limit_error};
 use crate::model::{RangeRequest, TableMetadata, TypedTableBatch};
 
@@ -1808,6 +1811,20 @@ impl OpenedParquetSource {
     /// only a partial row-group viewport, parquet-rs discovers page bytes
     /// lazily instead.
     pub fn begin_read(&self, request: RangeRequest) -> Result<ParquetReadStart> {
+        self.begin_read_with_display(request, false)
+    }
+
+    /// Starts a projected read that emits bounded display values without
+    /// retaining native Arrow value buffers in the result.
+    pub fn begin_display_read(&self, request: RangeRequest) -> Result<ParquetReadStart> {
+        self.begin_read_with_display(request, true)
+    }
+
+    fn begin_read_with_display(
+        &self,
+        request: RangeRequest,
+        display_only: bool,
+    ) -> Result<ParquetReadStart> {
         let plan = plan_range(
             request,
             self.metadata
@@ -1871,6 +1888,7 @@ impl OpenedParquetSource {
             row_offset: projected.row_offset,
             planned_ranges: projected.ranges.into(),
             lazy_page_reads: projected.lazy_page_reads,
+            display_only,
             expected: None,
             decode_attempts: 0,
         };
@@ -1904,6 +1922,7 @@ pub struct ParquetReadOperation {
     row_offset: usize,
     planned_ranges: VecDeque<ParquetReadBytesAction>,
     lazy_page_reads: bool,
+    display_only: bool,
     expected: Option<ParquetReadBytesAction>,
     decode_attempts: usize,
 }
@@ -2146,14 +2165,25 @@ impl ParquetReadOperation {
             }
             batches.push(batch);
         }
-        let batch = encode_projected_record_batches(
-            self.reader_metadata.schema(),
-            &batches,
-            &self.source_columns,
-            self.plan.returned_range,
-            self.plan.complete,
-            &self.limits.arrow,
-        )?;
+        let batch = if self.display_only {
+            encode_projected_record_batches_for_display(
+                self.reader_metadata.schema(),
+                &batches,
+                &self.source_columns,
+                self.plan.returned_range,
+                self.plan.complete,
+                &self.limits.arrow,
+            )?
+        } else {
+            encode_projected_record_batches(
+                self.reader_metadata.schema(),
+                &batches,
+                &self.source_columns,
+                self.plan.returned_range,
+                self.plan.complete,
+                &self.limits.arrow,
+            )?
+        };
         self.reader.release_skipped_page_bodies()?;
         Ok(Some(batch))
     }
@@ -2610,6 +2640,15 @@ impl ParquetRuntime {
         request: RangeRequest,
     ) -> Result<ParquetReadStart> {
         self.source_for_table(table)?.begin_read(request)
+    }
+
+    /// Starts a bounded display-only sparse range read for preview surfaces.
+    pub fn begin_display_read(
+        &self,
+        table: ParquetTableHandle,
+        request: RangeRequest,
+    ) -> Result<ParquetReadStart> {
+        self.source_for_table(table)?.begin_display_read(request)
     }
 
     /// Idempotently closes one table handle.
@@ -4494,12 +4533,17 @@ mod tests {
         let path = std::env::var("TABULARK_LOCAL_PARQUET_FIXTURE")
             .expect("TABULARK_LOCAL_PARQUET_FIXTURE");
         let bytes = std::fs::read(path).expect("read local Parquet fixture");
+        // Mirrors Parquet's weight-4 share of a 512 MiB engine that registers
+        // all four official adapters (total runtime weight 8).
         let limits = ParquetLimits::from_memory_budget(128 * 1024 * 1024).expect("limits");
         let (source, _) = open(&bytes, limits.clone());
         for row_start in [0_u64, 463, 927, 1_390, 1_822, 0] {
             let request = RangeRequest::new(row_start, 32.min(1_854 - row_start), 0, 3)
                 .expect("scroll range");
-            let mut operation = match source.begin_read(request).expect("begin local read") {
+            let mut operation = match source
+                .begin_display_read(request)
+                .expect("begin local display read")
+            {
                 ParquetReadStart::Pending(operation) => operation,
                 ParquetReadStart::Complete(batch) => {
                     assert_eq!(batch.range(), request);
@@ -4535,6 +4579,10 @@ mod tests {
                 }
             };
             assert_eq!(batch.range(), request);
+            assert!(batch.columns().iter().all(|column| {
+                column.native().data_type() == &TableDataType::Null
+                    && matches!(column.native().layout(), ArrayLayout::Null)
+            }));
         }
     }
 }

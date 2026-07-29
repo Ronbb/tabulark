@@ -1,4 +1,4 @@
-import type { TableHandle, TableEvent, Unsubscribe } from "../client.js";
+import type { ReadRangeOptions, TableHandle, TableEvent, Unsubscribe } from "../client.js";
 import { TabularkError, closedError, invalidArgument } from "../errors.js";
 import {
   MAX_RANGE_CELLS,
@@ -41,6 +41,11 @@ import {
 } from "./types.js";
 
 const DEFAULT_MAX_WINDOW_CELLS = 100_000;
+// Keep one outlier from permanently turning every later viewport into one
+// request per row; the current failing range is still bisected down to 1x1.
+const MIN_ADAPTIVE_ROW_LIMIT = 4;
+const OVERSIZED_CELL_PREVIEW = "[Value exceeds the preview byte limit]";
+const DISPLAY_ONLY_READ = Symbol.for("tabulark.internal.display-only-read.v1");
 
 interface LoadedWindow {
   readonly range: Readonly<GridRange>;
@@ -108,6 +113,8 @@ class Controller implements TableViewController {
   #windows: readonly LoadedWindow[] = [];
   #loadingRanges: readonly Readonly<GridRange>[] = [];
   #requestAbort: AbortController | null = null;
+  #adaptiveRowLimit = Number.MAX_SAFE_INTEGER;
+  #adaptiveColumnLimit = Number.MAX_SAFE_INTEGER;
   #generation = 0;
   #loadQueued = false;
   #disposed = false;
@@ -475,6 +482,16 @@ class Controller implements TableViewController {
       this.#rebuildSnapshot("ready");
       return;
     }
+    visible = partitionGridRanges(
+      visible,
+      this.#adaptiveRowLimit,
+      this.#adaptiveColumnLimit,
+    );
+    overscan = partitionGridRanges(
+      overscan,
+      this.#adaptiveRowLimit,
+      this.#adaptiveColumnLimit,
+    );
     if (visible.every((range) => this.#windows.some(
       (window) => rangeContainsRange(window.range, range),
     ))) {
@@ -496,19 +513,13 @@ class Controller implements TableViewController {
     try {
       for (let index = 0; index < ranges.length; index += 1) {
         const range = ranges[index]!;
-        const batch = await this.#table.readRange(
-          gridRangeToRequest(range),
-          { signal: abort.signal },
-        );
+        const windows = await this.#readRangeWindows(range, abort.signal);
         if (this.#disposed || generation !== this.#generation || abort.signal.aborted) {
           return;
         }
-        const returnedRange = batchGridRange(batch);
-        if (returnedRange.rowStart < returnedRange.rowEnd
-          && returnedRange.columnStart < returnedRange.columnEnd) {
-          const window = Object.freeze({ range: returnedRange, rows: batchRows(batch) });
+        for (const window of windows) {
           loaded = [window, ...loaded.filter(
-            (candidate) => !rangeContainsRange(returnedRange, candidate.range),
+            (candidate) => !rangeContainsRange(window.range, candidate.range),
           )];
         }
         this.#windows = Object.freeze([...loaded]);
@@ -527,6 +538,72 @@ class Controller implements TableViewController {
         this.#requestAbort = null;
       }
     }
+  }
+
+  async #readRangeWindows(
+    range: Readonly<GridRange>,
+    signal: AbortSignal,
+  ): Promise<readonly LoadedWindow[]> {
+    try {
+      const batch = await this.#table.readRange(
+        gridRangeToRequest(range),
+        displayOnlyReadOptions(signal),
+      );
+      const returnedRange = batchGridRange(batch);
+      return returnedRange.rowStart < returnedRange.rowEnd
+        && returnedRange.columnStart < returnedRange.columnEnd
+        ? Object.freeze([Object.freeze({ range: returnedRange, rows: batchRows(batch) })])
+        : Object.freeze([]);
+    } catch (error) {
+      if (signal.aborted || !isAdaptiveRangeByteLimit(error)) {
+        throw error;
+      }
+      const split = this.#splitRangeAfterByteLimit(range);
+      if (split === null) {
+        return Object.freeze([Object.freeze({
+          range,
+          rows: Object.freeze([Object.freeze([OVERSIZED_CELL_PREVIEW])]),
+        })]);
+      }
+      const windows: LoadedWindow[] = [];
+      for (const child of split) {
+        windows.push(...await this.#readRangeWindows(child, signal));
+      }
+      return Object.freeze(windows);
+    }
+  }
+
+  #splitRangeAfterByteLimit(
+    range: Readonly<GridRange>,
+  ): readonly [Readonly<GridRange>, Readonly<GridRange>] | null {
+    const rowCount = range.rowEnd - range.rowStart;
+    if (rowCount > 1) {
+      const firstRowCount = Math.floor(rowCount / 2);
+      const rowMiddle = range.rowStart + firstRowCount;
+      this.#adaptiveRowLimit = Math.min(
+        this.#adaptiveRowLimit,
+        Math.max(MIN_ADAPTIVE_ROW_LIMIT, rowCount - firstRowCount),
+      );
+      return Object.freeze([
+        Object.freeze({ ...range, rowEnd: rowMiddle }),
+        Object.freeze({ ...range, rowStart: rowMiddle }),
+      ]);
+    }
+
+    const columnCount = range.columnEnd - range.columnStart;
+    if (columnCount > 1) {
+      const firstColumnCount = Math.floor(columnCount / 2);
+      const columnMiddle = range.columnStart + firstColumnCount;
+      this.#adaptiveColumnLimit = Math.min(
+        this.#adaptiveColumnLimit,
+        columnCount - firstColumnCount,
+      );
+      return Object.freeze([
+        Object.freeze({ ...range, columnEnd: columnMiddle }),
+        Object.freeze({ ...range, columnStart: columnMiddle }),
+      ]);
+    }
+    return null;
   }
 
   #scrollCellIntoView(cell: CellPosition): boolean {
@@ -1086,6 +1163,10 @@ function gridRangeToRequest(range: GridRange): Readonly<RangeRequest> {
   });
 }
 
+function displayOnlyReadOptions(signal: AbortSignal): ReadRangeOptions {
+  return { signal, [DISPLAY_ONLY_READ]: true } as ReadRangeOptions;
+}
+
 function batchGridRange(batch: TableBatch): Readonly<GridRange> {
   return Object.freeze({
     rowStart: batch.range.rowStart,
@@ -1099,6 +1180,51 @@ function batchRows(batch: TableBatch): readonly (readonly (string | null)[])[] {
   return Object.freeze(batch.toDisplayRows({
     maxCells: Math.max(1, batch.range.rowCount * batch.range.columnCount),
   }).map((row) => Object.freeze(row)));
+}
+
+function partitionGridRanges(
+  ranges: readonly Readonly<GridRange>[],
+  rowLimit: number,
+  columnLimit: number,
+): readonly Readonly<GridRange>[] {
+  const partitions: Readonly<GridRange>[] = [];
+  for (const range of ranges) {
+    for (let rowStart = range.rowStart; rowStart < range.rowEnd;) {
+      const rowEnd = nextPartitionEnd(rowStart, range.rowEnd, rowLimit);
+      for (let columnStart = range.columnStart; columnStart < range.columnEnd;) {
+        const columnEnd = nextPartitionEnd(columnStart, range.columnEnd, columnLimit);
+        partitions.push(Object.freeze({ rowStart, rowEnd, columnStart, columnEnd }));
+        columnStart = columnEnd;
+      }
+      rowStart = rowEnd;
+    }
+  }
+  return Object.freeze(partitions);
+}
+
+function nextPartitionEnd(start: number, end: number, limit: number): number {
+  const remaining = end - start;
+  if (remaining <= limit) {
+    return end;
+  }
+  const offset = start % limit;
+  const distance = offset === 0 ? limit : limit - offset;
+  return start + Math.min(distance, remaining);
+}
+
+function isAdaptiveRangeByteLimit(error: unknown): boolean {
+  if (!isRecord(error) || error.code !== "RESOURCE_LIMIT" || !isRecord(error.details)) {
+    return false;
+  }
+  return error.details.resource === "typed-batch-output"
+    || error.details.resource === "typed-batch-decoded"
+    || error.details.resource === "compressed-pages"
+    || error.details.resource === "decompressed-pages"
+    || error.details.resource === "parquet-operation";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function rowsToTsv(rows: readonly (readonly (string | null)[])[]): string {

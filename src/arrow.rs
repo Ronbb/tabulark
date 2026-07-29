@@ -47,6 +47,16 @@ const EXTENSION_NAME_KEY: &str = "ARROW:extension:name";
 const EXTENSION_METADATA_KEY: &str = "ARROW:extension:metadata";
 const DEFAULT_ARROW_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const NESTED_DISPLAY_TRUNCATION_SUFFIX: &str = "... [truncated]";
+// Canvas text is clipped to a small visible area. Keeping a generous 16 KiB
+// ceiling still preserves useful nested previews while preventing one cell
+// from dominating a display-only batch.
+const DISPLAY_ONLY_MAX_CELL_BYTES: usize = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ArrowBatchMode {
+    Typed,
+    DisplayOnly,
+}
 
 /// Selects which Arrow IPC container reader is used.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -533,6 +543,18 @@ impl ArrowIpcSource {
 
     /// Reads a projected range into typed-buffer layout v1.
     pub fn read_range(&self, request: RangeRequest) -> Result<TypedTableBatch> {
+        self.read_range_with_mode(request, ArrowBatchMode::Typed)
+    }
+
+    fn read_display_range(&self, request: RangeRequest) -> Result<TypedTableBatch> {
+        self.read_range_with_mode(request, ArrowBatchMode::DisplayOnly)
+    }
+
+    fn read_range_with_mode(
+        &self,
+        request: RangeRequest,
+        mode: ArrowBatchMode,
+    ) -> Result<TypedTableBatch> {
         let total_rows = *self.row_offsets.last().unwrap_or(&0);
         let total_columns = self.arrow_schema.fields().len();
         let plan = plan_range(request, total_rows, total_columns, &self.limits)?;
@@ -543,12 +565,13 @@ impl ArrowIpcSource {
                 self.project_column(column_index, plan.row_start, plan.returned_rows)?,
             ));
         }
-        encode_typed_batch(
+        encode_batch(
             &self.arrow_schema,
             arrays,
             plan.returned_range,
             plan.complete,
             &self.limits,
+            mode,
         )
     }
 
@@ -678,16 +701,31 @@ impl OpenedArrowIpcSource {
 
     /// Starts a range read, either completing from Stream arrays or requesting File blocks.
     pub fn begin_read(&self, request: RangeRequest) -> Result<ArrowReadStart> {
+        self.begin_read_with_mode(request, ArrowBatchMode::Typed)
+    }
+
+    fn begin_display_read(&self, request: RangeRequest) -> Result<ArrowReadStart> {
+        self.begin_read_with_mode(request, ArrowBatchMode::DisplayOnly)
+    }
+
+    fn begin_read_with_mode(
+        &self,
+        request: RangeRequest,
+        mode: ArrowBatchMode,
+    ) -> Result<ArrowReadStart> {
         match self {
             Self::File(source) => {
-                let operation = ArrowFileReadOperation::new(source.clone(), request)?;
+                let operation = ArrowFileReadOperation::new(source.clone(), request, mode)?;
                 if operation.is_ready() {
                     Ok(ArrowReadStart::Complete(operation.into_ready()?))
                 } else {
                     Ok(ArrowReadStart::File(Box::new(operation)))
                 }
             }
-            Self::Stream(source) => Ok(ArrowReadStart::Complete(source.read_range(request)?)),
+            Self::Stream(source) => Ok(ArrowReadStart::Complete(match mode {
+                ArrowBatchMode::Typed => source.read_range(request)?,
+                ArrowBatchMode::DisplayOnly => source.read_display_range(request)?,
+            })),
         }
     }
 }
@@ -1908,6 +1946,7 @@ enum RequiredBlockKind {
 pub struct ArrowFileReadOperation {
     source: ArrowIndexedFileSource,
     plan: RangePlan,
+    mode: ArrowBatchMode,
     required: Vec<RequiredFileBlock>,
     decoder: Option<FileDecoder>,
     decoded: Vec<(usize, RecordBatch)>,
@@ -1919,7 +1958,11 @@ pub struct ArrowFileReadOperation {
 }
 
 impl ArrowFileReadOperation {
-    fn new(source: ArrowIndexedFileSource, request: RangeRequest) -> Result<Self> {
+    fn new(
+        source: ArrowIndexedFileSource,
+        request: RangeRequest,
+        mode: ArrowBatchMode,
+    ) -> Result<Self> {
         let total_rows = usize::try_from(source.metadata.extent().rows().value().unwrap_or(0))
             .map_err(|_| invalid_range())?;
         let plan = plan_range(
@@ -1966,6 +2009,7 @@ impl ArrowFileReadOperation {
         let mut operation = Self {
             source,
             plan,
+            mode,
             required,
             decoder,
             decoded: Vec::new(),
@@ -2164,12 +2208,13 @@ impl ArrowFileReadOperation {
                     )
                 })
                 .collect::<Vec<_>>();
-            return encode_typed_batch(
+            return encode_batch(
                 &self.source.schema,
                 arrays,
                 self.plan.returned_range,
                 self.plan.complete,
                 &self.source.limits,
+                self.mode,
             );
         }
 
@@ -2204,12 +2249,13 @@ impl ArrowFileReadOperation {
         drop(decoded);
         self.decoded_bytes = 0;
         self.retained_dictionary_bytes = 0;
-        encode_typed_batch(
+        encode_batch(
             &self.source.schema,
             arrays,
             self.plan.returned_range,
             self.plan.complete,
             &self.source.limits,
+            self.mode,
         )
     }
 }
@@ -2454,6 +2500,48 @@ pub fn encode_projected_record_batches(
     complete: bool,
     limits: &ArrowIpcLimits,
 ) -> Result<TypedTableBatch> {
+    encode_projected_record_batches_with_mode(
+        schema,
+        batches,
+        source_column_indices,
+        returned_range,
+        complete,
+        limits,
+        ArrowBatchMode::Typed,
+    )
+}
+
+/// Encodes only the bounded display representation for an Arrow-backed
+/// preview. Native descriptors are null placeholders and retain no buffers.
+#[cfg(feature = "parquet")]
+pub(crate) fn encode_projected_record_batches_for_display(
+    schema: &ArrowSchemaRef,
+    batches: &[RecordBatch],
+    source_column_indices: &[usize],
+    returned_range: RangeRequest,
+    complete: bool,
+    limits: &ArrowIpcLimits,
+) -> Result<TypedTableBatch> {
+    encode_projected_record_batches_with_mode(
+        schema,
+        batches,
+        source_column_indices,
+        returned_range,
+        complete,
+        limits,
+        ArrowBatchMode::DisplayOnly,
+    )
+}
+
+fn encode_projected_record_batches_with_mode(
+    schema: &ArrowSchemaRef,
+    batches: &[RecordBatch],
+    source_column_indices: &[usize],
+    returned_range: RangeRequest,
+    complete: bool,
+    limits: &ArrowIpcLimits,
+    mode: ArrowBatchMode,
+) -> Result<TypedTableBatch> {
     if u64::try_from(source_column_indices.len()).ok() != Some(returned_range.column_count()) {
         return Err(TabularkError::new(
             ErrorCode::InvalidArgument,
@@ -2499,15 +2587,16 @@ pub fn encode_projected_record_batches(
             .collect::<Vec<_>>();
         arrays.push((source_index, normalize_array_parts(parts, data_type)?));
     }
-    encode_typed_batch(schema, arrays, returned_range, complete, limits)
+    encode_batch(schema, arrays, returned_range, complete, limits, mode)
 }
 
-fn encode_typed_batch(
+fn encode_batch(
     schema: &ArrowSchemaRef,
     arrays: Vec<(usize, ArrayRef)>,
     returned_range: RangeRequest,
     complete: bool,
     limits: &ArrowIpcLimits,
+    mode: ArrowBatchMode,
 ) -> Result<TypedTableBatch> {
     let array_bytes = arrays.iter().try_fold(0_usize, |total, (_, array)| {
         total
@@ -2517,6 +2606,7 @@ fn encode_typed_batch(
                     ErrorCode::ResourceLimit,
                     "typed batch retained-array size overflows",
                 )
+                .with_detail("resource", "typed-batch-decoded")
             })
     })?;
     if array_bytes > limits.max_decoded_bytes {
@@ -2524,6 +2614,7 @@ fn encode_typed_batch(
             ErrorCode::ResourceLimit,
             "typed batch arrays exceed the configured decoded-memory limit",
         )
+        .with_detail("resource", "typed-batch-decoded")
         .with_detail("arrayBytes", array_bytes)
         .with_detail("maxDecodedBytes", limits.max_decoded_bytes));
     }
@@ -2531,13 +2622,28 @@ fn encode_typed_batch(
         .max_output_bytes
         .min(limits.max_decoded_bytes.saturating_sub(array_bytes));
     let mut pool = BufferPoolBuilder::new(output_limit);
-    // Encode every native descriptor before spending a byte on preview text.
-    // This keeps the logical Arrow buffers exact even when display output has
-    // to be shortened aggressively.
+    // Typed reads encode native descriptors before spending a byte on preview
+    // text. Display-only reads intentionally omit those buffers and use null
+    // native placeholders with the same logical length.
     let mut encoded = Vec::with_capacity(arrays.len());
     for (column_index, array) in arrays {
-        let field = schema.field(column_index);
-        let native = descriptor_from_array(array.as_ref(), Some(field), &mut pool)?;
+        let native = match mode {
+            ArrowBatchMode::Typed => {
+                let field = schema.field(column_index);
+                descriptor_from_array(array.as_ref(), Some(field), &mut pool)?
+            }
+            ArrowBatchMode::DisplayOnly => ArrayDescriptor::new(
+                TableDataType::Null,
+                u64::try_from(array.len()).map_err(|_| {
+                    TabularkError::new(
+                        ErrorCode::ResourceLimit,
+                        "display-only batch row count exceeds u64",
+                    )
+                })?,
+                None,
+                ArrayLayout::Null,
+            )?,
+        };
         encoded.push((column_index, array, native));
     }
     let structural_bytes = encoded.iter().try_fold(0_usize, |total, (_, array, _)| {
@@ -2578,9 +2684,15 @@ fn encode_typed_batch(
                 .saturating_mul(column_cells)
                 .div_ceil(remaining_cells)
         };
+        let max_display_cell_bytes = match mode {
+            ArrowBatchMode::Typed => limits.max_display_cell_bytes,
+            ArrowBatchMode::DisplayOnly => limits
+                .max_display_cell_bytes
+                .min(DISPLAY_ONLY_MAX_CELL_BYTES),
+        };
         let display_array = display_array_with_total_limit(
             array.as_ref(),
-            limits.max_display_cell_bytes,
+            max_display_cell_bytes,
             column_structural_bytes.saturating_add(column_value_budget),
         )?;
         let display = descriptor_from_array(&display_array, None, &mut pool)?;
@@ -3249,6 +3361,15 @@ impl RuntimeSource {
             Self::Incremental(source) => source.begin_read(request),
         }
     }
+
+    fn begin_display_read(&self, request: RangeRequest) -> Result<ArrowReadStart> {
+        match self {
+            Self::Decoded(source) => Ok(ArrowReadStart::Complete(
+                source.read_display_range(request)?,
+            )),
+            Self::Incremental(source) => source.begin_display_read(request),
+        }
+    }
 }
 
 impl ArrowIpcRuntime {
@@ -3516,6 +3637,16 @@ impl ArrowIpcRuntime {
         request: RangeRequest,
     ) -> Result<ArrowReadStart> {
         self.source_for_table(table)?.begin_read(request)
+    }
+
+    /// Starts a display-only range read whose native descriptors contain no
+    /// value buffers. This is reserved for bounded preview surfaces.
+    pub fn begin_display_read(
+        &self,
+        table: ArrowTableHandle,
+        request: RangeRequest,
+    ) -> Result<ArrowReadStart> {
+        self.source_for_table(table)?.begin_display_read(request)
     }
 
     /// Reads one range from an open table.
@@ -4066,12 +4197,14 @@ impl BufferPoolBuilder {
                 ErrorCode::ResourceLimit,
                 "typed batch output size overflows",
             )
+            .with_detail("resource", "typed-batch-output")
         })?;
         if next_bytes > self.max_bytes {
             return Err(TabularkError::new(
                 ErrorCode::ResourceLimit,
                 "typed batch output exceeds the configured byte limit",
             )
+            .with_detail("resource", "typed-batch-output")
             .with_detail("outputBytes", next_bytes)
             .with_detail("maxOutputBytes", self.max_bytes));
         }
@@ -4400,6 +4533,7 @@ fn display_total_limit_error(display_bytes: usize, max_total_bytes: usize) -> Ta
         ErrorCode::ResourceLimit,
         "Arrow display output exceeds the remaining typed-batch byte limit",
     )
+    .with_detail("resource", "typed-batch-output")
     .with_detail("displayBytes", display_bytes)
     .with_detail("maxDisplayBytes", max_total_bytes)
 }
@@ -4660,12 +4794,12 @@ mod tests {
     use flatbuffers::{FlatBufferBuilder, UnionWIPOffset, WIPOffset};
 
     use super::{
-        ARROW_MAGIC, ArrowIpcContainer, ArrowIpcLimits, ArrowIpcOpenOperation, ArrowIpcOptions,
-        ArrowIpcRuntime, ArrowIpcSource, ArrowReadStart, ArrowRuntimeConfig, BufferPoolBuilder,
-        NESTED_DISPLAY_TRUNCATION_SUFFIX, ResolvedArrowIpcContainer, arrow_error,
-        compressed_buffer_specs, descriptor_from_array, display_array,
-        display_array_with_total_limit, encapsulated_message, file_block_spec,
-        flatbuffer_verifier_options, model_data_type, normalize_array_parts,
+        ARROW_MAGIC, ArrowBatchMode, ArrowIpcContainer, ArrowIpcLimits, ArrowIpcOpenOperation,
+        ArrowIpcOptions, ArrowIpcRuntime, ArrowIpcSource, ArrowReadStart, ArrowRuntimeConfig,
+        BufferPoolBuilder, DISPLAY_ONLY_MAX_CELL_BYTES, NESTED_DISPLAY_TRUNCATION_SUFFIX,
+        ResolvedArrowIpcContainer, arrow_error, compressed_buffer_specs, descriptor_from_array,
+        display_array, display_array_with_total_limit, encapsulated_message, encode_batch,
+        file_block_spec, flatbuffer_verifier_options, model_data_type, normalize_array_parts,
         validate_stream_message,
     };
     use crate::error::ErrorCode;
@@ -6297,6 +6431,56 @@ mod tests {
     }
 
     #[test]
+    fn display_only_batch_omits_native_buffers_and_bounds_large_cells() {
+        let value = "x".repeat(128 * 1024);
+        let array: ArrayRef = Arc::new(StringArray::from(vec![value]));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "value",
+            DataType::Utf8,
+            false,
+        )]));
+        let range = RangeRequest::new(0, 1, 0, 1).expect("range");
+        let mut limits = ArrowIpcLimits::default();
+        limits.max_decoded_bytes = 1024 * 1024;
+        limits.max_output_bytes = 32 * 1024;
+        limits.max_display_cell_bytes = 1024 * 1024;
+
+        let error = encode_batch(
+            &schema,
+            vec![(0, array.clone())],
+            range,
+            true,
+            &limits,
+            ArrowBatchMode::Typed,
+        )
+        .expect_err("the native string cannot fit the output pool");
+        assert_eq!(error.code(), ErrorCode::ResourceLimit);
+        assert_eq!(error.details()["resource"], "typed-batch-output");
+
+        let display = encode_batch(
+            &schema,
+            vec![(0, array)],
+            range,
+            true,
+            &limits,
+            ArrowBatchMode::DisplayOnly,
+        )
+        .expect("bounded display-only output");
+        let column = &display.columns()[0];
+        assert_eq!(column.native().data_type(), &TableDataType::Null);
+        assert!(matches!(column.native().layout(), ArrayLayout::Null));
+        assert_eq!(column.native().len(), 1);
+        assert!(
+            display
+                .buffers()
+                .iter()
+                .map(|buffer| buffer.data().len())
+                .sum::<usize>()
+                <= DISPLAY_ONLY_MAX_CELL_BYTES + 16
+        );
+    }
+
+    #[test]
     fn incremental_open_never_requests_a_full_file_or_stream_source() {
         let file = encode(TestContainer::File, Some(CompressionType::ZSTD));
         let mut file_open =
@@ -6576,6 +6760,7 @@ mod tests {
             .read_range(table, RangeRequest::new(0, 3, 0, 5).expect("wide range"))
             .expect_err("wide output must exceed the batch budget");
         assert_eq!(error.code(), ErrorCode::ResourceLimit);
+        assert_eq!(error.details()["resource"], "typed-batch-output");
         let narrow = runtime
             .read_range(table, RangeRequest::new(0, 1, 0, 1).expect("narrow range"))
             .expect("smaller read after a budget failure");

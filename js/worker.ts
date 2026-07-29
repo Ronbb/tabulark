@@ -1311,6 +1311,13 @@ async function readRange(
   const dataset = requireDataset(table.datasetHandle);
   const runtime = dataset.adapter;
   const request = normalizeRange(payload.range);
+  if (payload.displayOnly !== undefined && typeof payload.displayOnly !== "boolean") {
+    throw new ProtocolFault(
+      "INVALID_ARGUMENT",
+      "readRange displayOnly must be a boolean when supplied",
+    );
+  }
+  const displayOnly = payload.displayOnly === true;
   if (rangeRequestsInFlight >= MAX_IN_FLIGHT_RANGES) {
     throw new ProtocolFault(
       "RESOURCE_LIMIT",
@@ -1362,7 +1369,10 @@ async function readRange(
     }
     throwIfCancelled(active);
     const beginningRead = Promise.resolve().then(() =>
-      runtime.beginRead(table.adapterTableHandle, request),
+      runtime.beginRead(
+        table.adapterTableHandle,
+        displayOnly ? { ...request, displayOnly: true } : request,
+      ),
     );
     void beginningRead.then(
       (lateStep) => {

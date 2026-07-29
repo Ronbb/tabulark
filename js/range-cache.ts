@@ -215,8 +215,9 @@ export function rangeCacheKey(
   revision: number,
   schemaVersion: number,
   range: RangeRequest,
+  variant?: "display",
 ): string {
-  return JSON.stringify([
+  const fields: (string | number)[] = [
     datasetHandle,
     tableId,
     revision,
@@ -225,7 +226,9 @@ export function rangeCacheKey(
     range.rowCount,
     range.columnStart,
     range.columnCount,
-  ]);
+  ];
+  if (variant !== undefined) fields.push(variant);
+  return JSON.stringify(fields);
 }
 
 export function rangeCacheKeyBelongsToDataset(key: string, datasetHandle: string): boolean {
@@ -250,7 +253,7 @@ export function rangeCacheKeyMatchesVersion(
   try {
     const fields = JSON.parse(key) as unknown;
     return Array.isArray(fields)
-      && fields.length === 8
+      && (fields.length === 8 || (fields.length === 9 && fields[8] === "display"))
       && fields[2] === revision
       && fields[3] === schemaVersion;
   } catch {

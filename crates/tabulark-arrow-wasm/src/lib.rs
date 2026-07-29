@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use js_sys::{Array, Object, Reflect, Uint8Array};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tabulark::arrow::{
     ArrowFileReadOperation, ArrowIpcLimits, ArrowIpcOpenOperation, ArrowIpcOptions,
     ArrowIpcRuntime, ArrowReadStart, ArrowRuntimeConfig, ArrowSourceHandle, ArrowTableHandle,
@@ -26,6 +26,15 @@ use wasm_bindgen::{JsCast, JsValue};
 /// range source never materializes the source in WASM and may use the full
 /// 32-bit byte address space (`2^32 - 1`).
 const MAX_RANGE_SOURCE_BYTES: u64 = u32::MAX as u64;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WasmReadRequest {
+    #[serde(flatten)]
+    range: RangeRequest,
+    #[serde(default)]
+    display_only: bool,
+}
 
 struct PendingOpen {
     operation: ArrowIpcOpenOperation,
@@ -333,7 +342,7 @@ impl WasmRuntime {
                 {
                     Some(batch) => {
                         let revision = cursor.complete_revision().map_err(error_to_js)?;
-                        complete_batch(operation_handle, revision, &batch)
+                        complete_batch(operation_handle, revision, batch)
                     }
                     None => {
                         let action = pending
@@ -496,7 +505,7 @@ impl WasmRuntime {
         table_handle: u32,
         request: JsValue,
     ) -> std::result::Result<JsValue, JsValue> {
-        let request: RangeRequest = from_js(request)?;
+        let request: WasmReadRequest = from_js(request)?;
         let table = ArrowTableHandle::from_raw(table_handle);
         let mut state = self.state.borrow_mut();
         let source = *state.table_sources.get(&table).ok_or_else(|| {
@@ -505,16 +514,18 @@ impl WasmRuntime {
                 "Arrow table handle is closed",
             ))
         })?;
-        match state
-            .runtime
-            .begin_read(table, request)
-            .map_err(error_to_js)?
-        {
+        let read = if request.display_only {
+            state.runtime.begin_display_read(table, request.range)
+        } else {
+            state.runtime.begin_read(table, request.range)
+        }
+        .map_err(error_to_js)?;
+        match read {
             ArrowReadStart::Complete(batch) => {
                 let handle = state.allocate_operation()?;
                 let mut cursor = AdapterOperationCursor::new();
                 let revision = cursor.complete_revision().map_err(error_to_js)?;
-                complete_batch(handle, revision, &batch)
+                complete_batch(handle, revision, batch)
             }
             ArrowReadStart::File(operation) => {
                 let action = operation
@@ -925,7 +936,7 @@ fn set_open_progress(
 fn complete_batch(
     operation_handle: u32,
     operation_revision: u64,
-    batch: &TypedTableBatch,
+    batch: TypedTableBatch,
 ) -> std::result::Result<JsValue, JsValue> {
     let result = Object::new();
     set(&result, "kind", JsValue::from_str("complete"))?;
@@ -1045,7 +1056,8 @@ fn invalid_operation_result(index: u32, reason: &str) -> JsValue {
     )
 }
 
-fn batch_to_js(batch: &TypedTableBatch) -> std::result::Result<JsValue, JsValue> {
+fn batch_to_js(batch: TypedTableBatch) -> std::result::Result<JsValue, JsValue> {
+    let columns = to_js(batch.columns())?;
     let result = Object::new();
     set(
         &result,
@@ -1066,11 +1078,12 @@ fn batch_to_js(batch: &TypedTableBatch) -> std::result::Result<JsValue, JsValue>
     set(&result, "range", to_js(&batch.range())?)?;
     set(&result, "complete", JsValue::from_bool(batch.complete()))?;
     let buffers = Array::new();
-    for buffer in batch.buffers() {
-        buffers.push(&Uint8Array::from(buffer.data()));
+    for buffer in batch.into_buffers() {
+        let data = buffer.into_data();
+        buffers.push(&Uint8Array::from(data.as_slice()));
     }
     set(&result, "buffers", buffers.into())?;
-    set(&result, "columns", to_js(batch.columns())?)?;
+    set(&result, "columns", columns)?;
     Ok(result.into())
 }
 

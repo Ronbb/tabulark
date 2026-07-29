@@ -82,6 +82,42 @@ test("range cache isolates mutable facades, survives table handles, and clears w
   }
 });
 
+test("display-only range reads use a distinct cache entry and Worker request", async () => {
+  const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  Object.defineProperty(globalThis, "Worker", {
+    configurable: true,
+    writable: true,
+    value: FakeWorker,
+  });
+
+  let engine;
+  try {
+    engine = await createTestEngine();
+    const worker = FakeWorker.latest;
+    const dataset = await engine.open(new Blob(["value\na\n"]), csvOptions());
+    const table = await dataset.openTable("table-0");
+    const range = { rowStart: 0, rowCount: 1, columnStart: 0, columnCount: 1 };
+    const displayOptions = {
+      [Symbol.for("tabulark.internal.display-only-read.v1")]: true,
+    };
+
+    await table.readRange(range);
+    await table.readRange(range, displayOptions);
+    await table.readRange(range);
+    await table.readRange(range, displayOptions);
+
+    assert.equal(worker.readRangeCount, 2);
+    assert.deepEqual(
+      worker.readRangePayloads.map((payload) => payload.displayOnly),
+      [undefined, true],
+    );
+  } finally {
+    await engine?.close();
+    if (originalWorker) Object.defineProperty(globalThis, "Worker", originalWorker);
+    else delete globalThis.Worker;
+  }
+});
+
 test("twenty identical misses share one RPC and caller cancellation is independent", async () => {
   const originalWorker = Object.getOwnPropertyDescriptor(globalThis, "Worker");
   Object.defineProperty(globalThis, "Worker", {
@@ -537,6 +573,7 @@ class FakeWorker {
   static latest;
 
   readRangeCount = 0;
+  readRangePayloads = [];
   cancelCount = 0;
   deferReads = false;
   batchRevision = 0;
@@ -604,6 +641,7 @@ class FakeWorker {
         break;
       case "readRange":
         this.readRangeCount += 1;
+        this.readRangePayloads.push(request.payload);
         kind = "batch";
         data = typeof this.batchOverride === "function"
           ? this.batchOverride(request.payload.range, this.readRangeCount)

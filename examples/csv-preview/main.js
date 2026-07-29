@@ -72,7 +72,9 @@ const optionControls = [
 
 let currentState = "idle";
 let engine;
+let engineAdapterId;
 let enginePromise;
+let enginePromiseAdapterId;
 let dataset;
 let table;
 let view;
@@ -192,7 +194,9 @@ window.addEventListener("pagehide", () => {
   activeAbort = undefined;
   const closingEngine = engine;
   engine = undefined;
+  engineAdapterId = undefined;
   enginePromise = undefined;
+  enginePromiseAdapterId = undefined;
   activeSource = undefined;
   void closeCurrentSession();
   void safelyClose(closingEngine);
@@ -321,12 +325,12 @@ async function openSource(source, displayName) {
   let operationEngine;
   let openedDataset;
   try {
-    operationEngine = await ensureEngine();
+    const openOptions = readOpenOptions();
+    operationEngine = await ensureEngine(openOptions.adapter);
     if (!isCurrent(operation)) {
       return;
     }
 
-    const openOptions = readOpenOptions();
     openedDataset = await operationEngine.open(source, {
       ...openOptions,
       sourceMode,
@@ -440,31 +444,49 @@ async function cancelCurrentOperation() {
   await closeCurrentSession();
 }
 
-async function ensureEngine() {
-  if (engine !== undefined) {
+async function ensureEngine(adapter) {
+  const adapterId = adapter.id;
+  if (engine !== undefined && engineAdapterId === adapterId) {
     return engine;
   }
-  if (enginePromise !== undefined) {
+  if (enginePromise !== undefined && enginePromiseAdapterId === adapterId) {
     return enginePromise;
+  }
+  if (enginePromise !== undefined) {
+    try {
+      await enginePromise;
+    } catch {
+      // A subsequent request can still start the adapter it selected.
+    }
+    return ensureEngine(adapter);
+  }
+  if (engine !== undefined) {
+    await discardEngine(engine);
   }
 
   const generation = engineGeneration;
+  // Engine adapter allow-lists are immutable. Keeping only the selected
+  // adapter also grants it the full bounded runtime pool instead of dividing
+  // that pool among formats which are not active in the Playground.
   const pending = createEngine({
-    adapters: [delimitedAdapter, arrowIpcAdapter, parquetAdapter, excelAdapter],
+    adapters: [adapter],
   }).then(async (created) => {
     if (generation !== engineGeneration) {
       await safelyClose(created);
       throw cancellationError("Engine startup was cancelled because the page was hidden");
     }
     engine = created;
+    engineAdapterId = adapterId;
     return created;
   });
   enginePromise = pending;
+  enginePromiseAdapterId = adapterId;
   try {
     return await pending;
   } finally {
     if (enginePromise === pending) {
       enginePromise = undefined;
+      enginePromiseAdapterId = undefined;
     }
   }
 }
@@ -475,6 +497,7 @@ async function discardEngine(candidate = engine) {
   }
   if (engine === candidate) {
     engine = undefined;
+    engineAdapterId = undefined;
   }
   try {
     await candidate.close();

@@ -61,7 +61,7 @@
       "resources": {
         "sourceAccess": "range",
         "supportsPresentation": false,
-        "runtimeWeight": 2
+        "runtimeWeight": 4
       }
     },
     {

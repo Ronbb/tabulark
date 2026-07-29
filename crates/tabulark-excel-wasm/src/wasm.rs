@@ -666,7 +666,7 @@ impl WasmRuntime {
         let operation = state.allocate_operation()?;
         let mut cursor = AdapterOperationCursor::new();
         let revision = cursor.complete_revision().map_err(error_to_js)?;
-        complete_batch(operation, revision, &batch)
+        complete_batch(operation, revision, batch)
     }
 
     /// Cancels and releases a pending range-backed operation.
@@ -1478,7 +1478,7 @@ fn read_ranges_step(
 fn complete_batch(
     operation_handle: u32,
     operation_revision: u64,
-    batch: &TypedTableBatch,
+    batch: TypedTableBatch,
 ) -> std::result::Result<JsValue, JsValue> {
     let result = Object::new();
     set(&result, "kind", JsValue::from_str("complete"))?;
@@ -1729,7 +1729,8 @@ fn visibility_name(visibility: ExcelSheetVisibility) -> &'static str {
     }
 }
 
-fn batch_to_js(batch: &TypedTableBatch) -> std::result::Result<JsValue, JsValue> {
+fn batch_to_js(batch: TypedTableBatch) -> std::result::Result<JsValue, JsValue> {
+    let columns = to_js(batch.columns())?;
     let result = Object::new();
     set(
         &result,
@@ -1750,11 +1751,12 @@ fn batch_to_js(batch: &TypedTableBatch) -> std::result::Result<JsValue, JsValue>
     set(&result, "range", to_js(&batch.range())?)?;
     set(&result, "complete", JsValue::from_bool(batch.complete()))?;
     let buffers = Array::new();
-    for buffer in batch.buffers() {
-        buffers.push(&Uint8Array::from(buffer.data()));
+    for buffer in batch.into_buffers() {
+        let data = buffer.into_data();
+        buffers.push(&Uint8Array::from(data.as_slice()));
     }
     set(&result, "buffers", buffers.into())?;
-    set(&result, "columns", to_js(batch.columns())?)?;
+    set(&result, "columns", columns)?;
     Ok(result.into())
 }
 

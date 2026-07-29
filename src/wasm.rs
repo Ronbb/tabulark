@@ -517,7 +517,7 @@ impl WasmRuntime {
                     FeedRangeResult::Complete { batch, warnings } => {
                         let batch = batch.into_typed().map_err(error_to_js)?;
                         let operation_revision = cursor.complete_revision().map_err(error_to_js)?;
-                        complete_batch(operation_handle, operation_revision, &batch, &warnings)
+                        complete_batch(operation_handle, operation_revision, batch, &warnings)
                     }
                 }
             }
@@ -664,7 +664,7 @@ impl WasmRuntime {
             let mut cursor = AdapterOperationCursor::new();
             let operation_revision = cursor.complete_revision().map_err(error_to_js)?;
             let batch = batch.into_typed().map_err(error_to_js)?;
-            return complete_batch(operation, operation_revision, &batch, &[]);
+            return complete_batch(operation, operation_revision, batch, &[]);
         }
         let operation = match state.allocate_operation() {
             Ok(operation) => operation,
@@ -987,7 +987,7 @@ fn progress_value(
 fn complete_batch(
     operation_handle: u32,
     operation_revision: u64,
-    batch: &TypedTableBatch,
+    batch: TypedTableBatch,
     warnings: &[CsvDiagnostic],
 ) -> std::result::Result<JsValue, JsValue> {
     let result = Object::new();
@@ -1126,7 +1126,8 @@ const fn current_wasm_memory_pages() -> u64 {
     0
 }
 
-fn batch_to_js(batch: &TypedTableBatch) -> std::result::Result<JsValue, JsValue> {
+fn batch_to_js(batch: TypedTableBatch) -> std::result::Result<JsValue, JsValue> {
+    let columns = to_js(batch.columns())?;
     let object = Object::new();
     set(
         &object,
@@ -1147,11 +1148,12 @@ fn batch_to_js(batch: &TypedTableBatch) -> std::result::Result<JsValue, JsValue>
     set(&object, "range", to_js(&batch.range())?)?;
     set(&object, "complete", JsValue::from_bool(batch.complete()))?;
     let buffers = Array::new();
-    for buffer in batch.buffers() {
-        buffers.push(&Uint8Array::from(buffer.data()));
+    for buffer in batch.into_buffers() {
+        let data = buffer.into_data();
+        buffers.push(&Uint8Array::from(data.as_slice()));
     }
     set(&object, "buffers", buffers.into())?;
-    set(&object, "columns", to_js(batch.columns())?)?;
+    set(&object, "columns", columns)?;
     Ok(object.into())
 }
 

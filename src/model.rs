@@ -1386,6 +1386,15 @@ impl TypedTableBatch {
         &self.buffers
     }
 
+    /// Consumes the batch and transfers ownership of its buffer pool.
+    ///
+    /// Thin WASM wrappers use this after serializing the descriptors so each
+    /// Rust buffer can be released immediately after its boundary copy.
+    #[must_use]
+    pub fn into_buffers(self) -> Vec<BatchBuffer> {
+        self.buffers
+    }
+
     /// Returns typed columns in logical order.
     #[must_use]
     pub fn columns(&self) -> &[TypedColumnBatch] {

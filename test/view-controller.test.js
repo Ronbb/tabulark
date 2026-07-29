@@ -101,12 +101,105 @@ test("controller requests only the viewport and overscan window", async () => {
   assert.ok(snapshot.layout.columns.visible.end < 5);
   assert.ok(table.calls.length >= 1);
   assert.ok(table.calls.length <= 2);
+  assert.ok(table.readOptions.every(
+    (options) => options[Symbol.for("tabulark.internal.display-only-read.v1")] === true,
+  ));
   for (const request of table.calls) {
     assert.ok(request.rowCount < 40);
     assert.ok(request.columnCount < 8);
   }
   assert.deepEqual(controller.getCell(0, 0), { status: "loaded", value: "R0C0" });
 
+  controller.dispose();
+});
+
+test("controller adaptively splits typed batches that exceed their byte budget", async () => {
+  const table = createMockTable({
+    rows: 10_000,
+    columns: 3,
+    errorFor(request) {
+      return request.rowCount > 4 ? rangeByteLimitError() : undefined;
+    },
+  });
+  const controller = createTableController(table);
+
+  controller.updateViewport({ width: 520, height: 260, scrollLeft: 0, scrollTop: 0 });
+  await waitFor(() => controller.getSnapshot().status === "ready");
+  const initialLayout = controller.getSnapshot().layout;
+  await waitFor(() => controller.getCell(
+    initialLayout.rows.overscan.end - 1,
+    initialLayout.columns.overscan.end - 1,
+  ).status === "loaded");
+  assert.ok(table.calls.some((request) => request.rowCount > 4));
+  assert.deepEqual(controller.getCell(0, 0), { status: "loaded", value: "R0C0" });
+
+  table.calls.length = 0;
+  controller.updateViewport({ width: 520, height: 260, scrollLeft: 0, scrollTop: 5_600 });
+  await waitFor(() => controller.getSnapshot().layout.rows.visible.start >= 190);
+  const scrolledLayout = controller.getSnapshot().layout;
+  await waitFor(() => controller.getCell(
+    scrolledLayout.rows.overscan.end - 1,
+    scrolledLayout.columns.overscan.end - 1,
+  ).status === "loaded");
+
+  assert.equal(controller.getSnapshot().status, "ready");
+  assert.ok(table.calls.length > 0);
+  assert.ok(table.calls.every((request) => request.rowCount <= 4));
+  const visibleRow = scrolledLayout.rows.visible.start;
+  assert.deepEqual(controller.getCell(visibleRow, 0), {
+    status: "loaded",
+    value: `R${visibleRow}C0`,
+  });
+
+  controller.dispose();
+});
+
+test("controller contains an irreducibly oversized cell to an explicit preview placeholder", async () => {
+  const table = createMockTable({
+    rows: 20,
+    columns: 2,
+    errorFor(request) {
+      const containsFirstCell = request.rowStart === 0
+        && request.rowCount > 0
+        && request.columnStart === 0
+        && request.columnCount > 0;
+      return containsFirstCell ? rangeByteLimitError("compressed-pages") : undefined;
+    },
+  });
+  const controller = createTableController(table);
+
+  controller.updateViewport({ width: 400, height: 180, scrollLeft: 0, scrollTop: 0 });
+  await waitFor(() => controller.getSnapshot().status === "ready");
+  await waitFor(() => controller.getCell(0, 1).status === "loaded");
+
+  assert.deepEqual(controller.getCell(0, 0), {
+    status: "loaded",
+    value: "[Value exceeds the preview byte limit]",
+  });
+  assert.deepEqual(controller.getCell(0, 1), { status: "loaded", value: "R0C1" });
+  assert.deepEqual(controller.getCell(1, 0), { status: "loaded", value: "R1C0" });
+  assert.equal(controller.getSnapshot().status, "ready");
+
+  controller.dispose();
+});
+
+test("controller still surfaces resource failures that cannot be repaired by range sharding", async () => {
+  const failure = rangeByteLimitError("decompression");
+  const table = createMockTable({
+    rows: 20,
+    columns: 2,
+    errorFor() {
+      return failure;
+    },
+  });
+  const controller = createTableController(table);
+
+  controller.updateViewport({ width: 400, height: 180, scrollLeft: 0, scrollTop: 0 });
+  await waitFor(() => controller.getSnapshot().status === "error");
+
+  assert.equal(controller.getSnapshot().error, failure);
+  assert.equal(table.calls.length, 1);
+  assert.deepEqual(controller.getCell(0, 0), { status: "unavailable" });
   controller.dispose();
 });
 
@@ -418,9 +511,11 @@ function createMockTable({
   rows,
   columns,
   delayFor = () => 0,
+  errorFor = () => undefined,
   valueAt = (rowIndex, columnIndex) => `R${rowIndex}C${columnIndex}`,
 }) {
   const calls = [];
+  const readOptions = [];
   const listeners = new Set();
   const metadata = Object.freeze({
     tableId: "mock-table",
@@ -453,11 +548,17 @@ function createMockTable({
   return {
     metadata,
     calls,
-    async readRange(request) {
+    readOptions,
+    async readRange(request, options = {}) {
       calls.push({ ...request });
+      readOptions.push(options);
       const delay = delayFor(request);
       if (delay > 0) {
         await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+      const error = errorFor(request);
+      if (error !== undefined) {
+        throw error;
       }
       return createBatch(metadata, request, valueAt);
     },
@@ -472,6 +573,13 @@ function createMockTable({
       listeners.clear();
     },
   };
+}
+
+function rangeByteLimitError(resource = "typed-batch-output") {
+  return Object.assign(new Error(`${resource} exceeds the configured byte limit`), {
+    code: "RESOURCE_LIMIT",
+    details: Object.freeze({ resource, requiredBytes: 2, availableBytes: 1 }),
+  });
 }
 
 function createBatch(metadata, request, valueAt) {
