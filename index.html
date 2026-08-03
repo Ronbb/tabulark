@@ -1106,9 +1106,9 @@
             </p>
             <form id="open-form" class="toolbar" data-testid="open-form">
               <p id="supported-formats" class="supported-formats" data-testid="supported-formats">
-                <strong>Supported table files:</strong> CSV, TSV, Arrow IPC (.arrow, .arrows, .feather),
-                Parquet, Excel XLS, and Excel XLSX. PDF, DOC, and DOCX are detected only to prevent
-                them from being opened as table data.
+                <strong>Supported local files:</strong> CSV, TSV, Arrow IPC (.arrow, .arrows, .feather),
+                Parquet, Excel XLS/XLSX, and PDF. DOC and DOCX are detected safely but their preview
+                provider is not yet published.
               </p>
               <label id="file-picker" data-testid="file-picker" class="file-label">
                 <span class="file-name" id="file-name" data-testid="file-name">Choose a file</span>
@@ -1129,6 +1129,7 @@
                   <option value="parquet">Parquet</option>
                   <option value="xls">Excel XLS</option>
                   <option value="xlsx">Excel XLSX</option>
+                  <option value="pdf">PDF document</option>
                 </select>
               </label>
               <button id="open" data-testid="open-button" class="primary" type="submit">Open preview</button>

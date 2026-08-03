@@ -78,6 +78,10 @@ let enginePromiseAdapterId;
 let dataset;
 let table;
 let view;
+let documentEngine;
+let documentEnginePromise;
+let documentSession;
+let documentView;
 let unsubscribeDataset;
 let activeAbort;
 let activeOperation = 0;
@@ -193,13 +197,17 @@ window.addEventListener("pagehide", () => {
   activeAbort?.abort();
   activeAbort = undefined;
   const closingEngine = engine;
+  const closingDocumentEngine = documentEngine;
   engine = undefined;
   engineAdapterId = undefined;
   enginePromise = undefined;
   enginePromiseAdapterId = undefined;
+  documentEngine = undefined;
+  documentEnginePromise = undefined;
   activeSource = undefined;
   void closeCurrentSession();
   void safelyClose(closingEngine);
+  void safelyClose(closingDocumentEngine);
 });
 
 window.addEventListener("pageshow", (event) => {
@@ -265,7 +273,11 @@ async function openArrowSample() {
 }
 
 async function openSource(source, displayName) {
-  if (detectedRoute === "pdf" || detectedRoute === "docx" || detectedRoute === "doc" || detectedRoute === "unknown-binary") {
+  if (detectedRoute === "pdf") {
+    await openPdfSource(source, displayName);
+    return;
+  }
+  if (detectedRoute === "docx" || detectedRoute === "doc" || detectedRoute === "unknown-binary") {
     showRoutedFormat(detectedRoute, displayName);
     return;
   }
@@ -425,6 +437,83 @@ async function openSource(source, displayName) {
     if (isCurrent(operation) && activeAbort === abort) {
       activeAbort = undefined;
     }
+  }
+}
+
+async function openPdfSource(source, displayName) {
+  rememberSource(source, displayName);
+  const sourceSnapshot = Object.freeze({ source, displayName, size: source.size });
+  retrySource = sourceSnapshot;
+  activeSource = sourceSnapshot;
+  const operation = ++activeOperation;
+  const abort = new AbortController();
+  activeAbort = abort;
+  resetWarnings();
+  transition("opening", `Opening ${displayName} (${formatBytes(source.size)}) locally…`, {
+    focus: cancelButton,
+  });
+  showEmptyState("Opening PDF", "PDFium WebAssembly is starting in a dedicated local Worker.");
+  await closeCurrentSession();
+  if (!isCurrent(operation)) return;
+
+  try {
+    const runtime = await import("../../packages/document-preview/dist/index.js");
+    documentEngine ??= await ensureDocumentEngine(runtime);
+    if (!isCurrent(operation)) return;
+    const opened = await documentEngine.open(source, {
+      sourceName: displayName,
+      signal: abort.signal,
+    });
+    if (!isCurrent(operation)) {
+      await safelyClose(opened);
+      return;
+    }
+    documentSession = opened;
+    documentView = runtime.createPagedDocumentView({
+      container: preview,
+      document: opened,
+      ariaLabel: `${displayName} page preview`,
+      onError: (error) => {
+        if (isCurrent(operation)) setStatus(presentError(error), "error");
+      },
+    });
+    emptyState.hidden = true;
+    workspace.setAttribute("aria-label", "Document preview");
+    transition(
+      "ready",
+      `${displayName}: ${opened.pageCount} ${opened.pageCount === 1 ? "page" : "pages"} ready.`,
+    );
+    activeAbort = undefined;
+    documentView.focus({ preventScroll: true });
+  } catch (error) {
+    if (!isCurrent(operation)) return;
+    await closeCurrentSession();
+    activeAbort = undefined;
+    transition("error", presentError(error), { focus: status });
+    showEmptyState(
+      "PDF could not open",
+      errorCode(error) === "PASSWORD_REQUIRED" || errorCode(error) === "UNSUPPORTED_ENCRYPTION"
+        ? "Remove encryption from a copy of the PDF and try that local copy."
+        : "Verify that the file is an unencrypted PDF within the 64 MiB preview limit, then retry.",
+    );
+  }
+}
+
+async function ensureDocumentEngine(runtime) {
+  if (documentEngine !== undefined) return documentEngine;
+  documentEnginePromise ??= runtime.createDocumentEngine({
+    providers: [runtime.pdfProvider],
+    assetBaseUrl: new URL("../../packages/document-preview/dist/", import.meta.url),
+    memoryBudgetBytes: 256 * 1024 * 1024,
+    maxInputBytes: 64 * 1024 * 1024,
+    pageCacheBytes: 64 * 1024 * 1024,
+    maxPagePixels: 8_000_000,
+  });
+  try {
+    documentEngine = await documentEnginePromise;
+    return documentEngine;
+  } finally {
+    documentEnginePromise = undefined;
   }
 }
 
@@ -695,11 +784,8 @@ function showRoutedFormat(format, displayName) {
   activeAbort = undefined;
   void closeCurrentSession();
   if (format === "pdf") {
-    transition("error", `${displayName} is a PDF document, not tabular data.`, { focus: status });
-    showEmptyState(
-      "Use document preview",
-      "Open the separate experimental document preview and choose this PDF there. The table playground will not treat it as CSV.",
-    );
+    transition("error", `${displayName} is a PDF document. Choose Open preview to render it locally.`, { focus: status });
+    showEmptyState("PDF ready to open", "Choose Open preview to render this PDF in the Playground.");
     return;
   }
   if (format === "docx") {
@@ -962,15 +1048,22 @@ async function closeCurrentSession() {
   const closingView = view;
   const closingTable = table;
   const closingDataset = dataset;
+  const closingDocumentView = documentView;
+  const closingDocumentSession = documentSession;
   view = undefined;
   table = undefined;
   dataset = undefined;
+  documentView = undefined;
+  documentSession = undefined;
   mountedViewOperation = 0;
 
   closingView?.destroy();
+  await safelyClose(closingDocumentView);
   preview.replaceChildren();
   await safelyClose(closingTable);
   await safelyClose(closingDataset);
+  await safelyClose(closingDocumentSession);
+  workspace.setAttribute("aria-label", "Table preview");
 }
 
 async function safelyClose(resource) {

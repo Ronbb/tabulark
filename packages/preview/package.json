@@ -1,0 +1,24 @@
+{
+  "name": "@tabulark/preview",
+  "version": "0.1.0-alpha.0",
+  "description": "Local-first, resource-bounded multi-format preview engine for Tabulark",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE-MIT"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --project tsconfig.json",
+    "test": "npm run build && node --test test/*.test.js"
+  },
+  "engines": { "node": ">=20" },
+  "license": "MIT OR Apache-2.0",
+  "publishConfig": { "access": "public" }
+}

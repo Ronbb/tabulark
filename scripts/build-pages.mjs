@@ -36,6 +36,16 @@ await Promise.all([
   ),
   cp(resolve(repositoryRoot, "dist"), resolve(pagesRoot, "dist"), { recursive: true }),
   cp(
+    resolve(repositoryRoot, "packages", "document-preview", "dist"),
+    resolve(pagesRoot, "packages", "document-preview", "dist"),
+    { recursive: true },
+  ),
+  cp(
+    resolve(repositoryRoot, "packages", "preview", "dist"),
+    resolve(pagesRoot, "packages", "preview", "dist"),
+    { recursive: true },
+  ),
+  cp(
     resolve(repositoryRoot, "examples", "csv-preview"),
     resolve(pagesRoot, "examples", "csv-preview"),
     { recursive: true },
@@ -70,6 +80,11 @@ const requiredFiles = [
   "THIRD_PARTY_NOTICES.md",
   "examples/csv-preview/index.html",
   "examples/csv-preview/main.js",
+  "packages/document-preview/dist/index.js",
+  "packages/document-preview/dist/pdf-worker.js",
+  "packages/document-preview/dist/pdfium.wasm",
+  "packages/preview/dist/index.js",
+  "packages/preview/dist/worker.js",
   ...publicBundles.flatMap((name) => [
     `dist/${name}.js`,
     `dist/${name}.js.map`,

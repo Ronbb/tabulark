@@ -9,7 +9,7 @@ async function expectLandingReady(page) {
   ).toBeVisible();
   await expect(page.getByTestId("app")).toHaveAttribute("data-state", "idle");
   await expect(page.getByTestId("supported-formats")).toContainText(
-    "CSV, TSV, Arrow IPC (.arrow, .arrows, .feather), Parquet, Excel XLS, and Excel XLSX",
+    "CSV, TSV, Arrow IPC (.arrow, .arrows, .feather), Parquet, Excel XLS/XLSX, and PDF",
   );
   await expect(page.getByTestId("source-input")).toHaveAttribute(
     "aria-describedby",
@@ -46,6 +46,23 @@ test("serves the introduction and interactive playground from the site root", as
     "aria-busy",
     "false",
   );
+});
+
+test("opens and renders a local PDF in the main playground", async ({ page }) => {
+  await page.goto("/target/pages/index.html#playground");
+  await page.getByTestId("source-input").setInputFiles({
+    name: "playground.pdf",
+    mimeType: "application/pdf",
+    buffer: makePdf(),
+  });
+  await expect(page.getByTestId("file-summary")).toContainText("PDF");
+  await page.getByTestId("open-button").click();
+  await expect(page.getByTestId("app")).toHaveAttribute("data-state", "ready", {
+    timeout: 15_000,
+  });
+  await expect(page.getByTestId("status")).toContainText("playground.pdf: 1 page ready");
+  await expect(page.getByRole("group", { name: "Document pages" })).toBeVisible();
+  await expect.poll(() => page.locator(".tdp-page canvas").evaluate((canvas) => canvas.width)).toBeGreaterThan(100);
 });
 
 test("assembled Pages artifact keeps both adapter artifacts lazy and single-load", async ({ page }) => {
@@ -240,6 +257,30 @@ test.describe("mobile landscape landing page", () => {
 
 async function navigatorText(page) {
   return readClipboardText(page);
+}
+
+function makePdf() {
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+    "<< /Length 44 >>\nstream\nBT /F1 24 Tf 50 330 Td (Tabulark PDF) Tj ET\nendstream",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+  ];
+  const chunks = [Buffer.from("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n", "binary")];
+  const offsets = [0];
+  let length = chunks[0].length;
+  for (let index = 0; index < objects.length; index += 1) {
+    offsets.push(length);
+    const chunk = Buffer.from(`${index + 1} 0 obj\n${objects[index]}\nendobj\n`, "binary");
+    chunks.push(chunk);
+    length += chunk.length;
+  }
+  const rows = offsets.map((offset, index) => index === 0
+    ? "0000000000 65535 f \n"
+    : `${String(offset).padStart(10, "0")} 00000 n \n`).join("");
+  chunks.push(Buffer.from(`xref\n0 ${offsets.length}\n${rows}trailer\n<< /Size ${offsets.length} /Root 1 0 R >>\nstartxref\n${length}\n%%EOF\n`, "binary"));
+  return Buffer.concat(chunks);
 }
 
 async function expectFocusedOutline(page, selector) {
