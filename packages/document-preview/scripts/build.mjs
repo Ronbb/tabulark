@@ -5,11 +5,12 @@ import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 
 const root = resolve(fileURLToPath(new URL("../", import.meta.url)));
+const repositoryRoot = resolve(root, "../..");
 const dist = resolve(root, "dist");
 await rm(dist, { recursive: true, force: true });
 await mkdir(dist, { recursive: true });
 
-const tsc = spawnSync(process.execPath, [resolve(root, "node_modules/typescript/bin/tsc"), "--project", resolve(root, "tsconfig.build.json")], {
+const tsc = spawnSync(process.execPath, [resolve(repositoryRoot, "node_modules/typescript/bin/tsc"), "--project", resolve(root, "tsconfig.build.json")], {
   cwd: root,
   stdio: "inherit",
 });
@@ -29,5 +30,5 @@ const common = {
 await Promise.all([
   build({ ...common, entryPoints: [resolve(root, "src/index.ts")], outfile: resolve(dist, "index.js"), external: ["./pdf-worker.js"] }),
   build({ ...common, entryPoints: [resolve(root, "src/pdf-worker.ts")], outfile: resolve(dist, "pdf-worker.js") }),
-  copyFile(resolve(root, "node_modules/@hyzyla/pdfium/dist/pdfium.wasm"), resolve(dist, "pdfium.wasm")),
+  copyFile(resolve(repositoryRoot, "node_modules/@hyzyla/pdfium/dist/pdfium.wasm"), resolve(dist, "pdfium.wasm")),
 ]);
