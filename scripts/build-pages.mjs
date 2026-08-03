@@ -41,11 +41,6 @@ await Promise.all([
     { recursive: true },
   ),
   cp(
-    resolve(repositoryRoot, "packages", "preview", "dist"),
-    resolve(pagesRoot, "packages", "preview", "dist"),
-    { recursive: true },
-  ),
-  cp(
     resolve(repositoryRoot, "examples", "csv-preview"),
     resolve(pagesRoot, "examples", "csv-preview"),
     { recursive: true },
@@ -83,8 +78,6 @@ const requiredFiles = [
   "packages/document-preview/dist/index.js",
   "packages/document-preview/dist/pdf-worker.js",
   "packages/document-preview/dist/pdfium.wasm",
-  "packages/preview/dist/index.js",
-  "packages/preview/dist/worker.js",
   ...publicBundles.flatMap((name) => [
     `dist/${name}.js`,
     `dist/${name}.js.map`,
